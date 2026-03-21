@@ -1,0 +1,24 @@
+pub const App = @import("app/app.zig").App;
+pub const StateStore = @import("app/state_store.zig").StateStore;
+
+pub const AudioCore = @import("core/audio/routing.zig").AudioCore;
+pub const Source = @import("core/audio/sources.zig").Source;
+pub const Destination = @import("core/audio/destinations.zig").Destination;
+pub const PipewireContext = @import("core/pipewire.zig").PipewireContext;
+pub const PulseContext = @import("core/pulse.zig").PulseContext;
+pub const Binder = @import("core/binder.zig");
+pub const IconResolver = @import("core/icon_resolver.zig");
+pub const SdlPlatform = @import("platform/sdl.zig").SdlPlatform;
+pub const WindowConfig = @import("platform/window.zig").WindowConfig;
+pub const UiShell = @import("ui/shell.zig").UiShell;
+pub const ImGuiBridge = @import("native/imgui_bridge.zig");
+pub const ConfigStore = @import("persistence/config.zig").ConfigStore;
+pub const PluginHost = @import("plugins/root.zig").PluginHost;
+pub const PluginDescriptor = @import("plugins/root.zig").PluginDescriptor;
+pub const PluginBackend = @import("plugins/root.zig").PluginBackend;
+pub const ChannelPlugin = @import("plugins/root.zig").ChannelPlugin;
+pub const ChannelPluginParam = @import("plugins/root.zig").ChannelPluginParam;
+pub const Lv2Support = @import("plugins/root.zig").Lv2Support;
+pub const Lv2UiManager = @import("plugins/root.zig").Lv2UiManager;
+pub const Lv2Runtime = @import("plugins/root.zig").Lv2Runtime;
+pub const FxRuntime = @import("plugins/root.zig").FxRuntime;

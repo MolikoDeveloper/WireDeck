@@ -1,0 +1,173 @@
+@prefix doap: <http://usefulinc.com/ns/doap#> .
+@prefix foaf: <http://xmlns.com/foaf/0.1/> .
+@prefix lv2: <http://lv2plug.in/ns/lv2core#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix ui: <http://lv2plug.in/ns/extensions/ui#> .
+
+<https://wiredeck.dev/plugins/cuda-denoiser>
+    a lv2:Plugin ;
+    doap:name "WireDeck CUDA Denoiser" ;
+    doap:license <https://opensource.org/license/mit> ;
+    doap:maintainer [
+        foaf:name "WireDeck"
+    ] ;
+    lv2:optionalFeature lv2:hardRTCapable ;
+    ui:ui <https://wiredeck.dev/plugins/cuda-denoiser#ui> ;
+    lv2:port [
+        a lv2:InputPort , lv2:ControlPort ;
+        lv2:index 0 ;
+        lv2:symbol "enabled" ;
+        lv2:name "Enabled" ;
+        lv2:default 1.0 ;
+        lv2:minimum 0.0 ;
+        lv2:maximum 1.0 ;
+        lv2:designation lv2:enabled ;
+        lv2:portProperty lv2:toggled
+    ] , [
+        a lv2:InputPort , lv2:ControlPort ;
+        lv2:index 1 ;
+        lv2:symbol "threshold" ;
+        lv2:name "Reduction" ;
+        lv2:default 0.8 ;
+        lv2:minimum 0.0 ;
+        lv2:maximum 1.0
+    ] , [
+        a lv2:InputPort , lv2:ControlPort ;
+        lv2:index 2 ;
+        lv2:symbol "buffer_ms" ;
+        lv2:name "Buffer Size (ms)" ;
+        lv2:default 12.0 ;
+        lv2:minimum 0.0 ;
+        lv2:maximum 80.0
+    ] , [
+        a lv2:InputPort , lv2:ControlPort ;
+        lv2:index 3 ;
+        lv2:symbol "mix" ;
+        lv2:name "Mix" ;
+        lv2:default 1.0 ;
+        lv2:minimum 0.0 ;
+        lv2:maximum 1.0
+    ] , [
+        a lv2:InputPort , lv2:ControlPort ;
+        lv2:index 4 ;
+        lv2:symbol "output_gain_db" ;
+        lv2:name "Output Gain (dB)" ;
+        lv2:default 0.0 ;
+        lv2:minimum -18.0 ;
+        lv2:maximum 18.0
+    ] , [
+        a lv2:InputPort , lv2:ControlPort ;
+        lv2:index 5 ;
+        lv2:symbol "gpu_index" ;
+        lv2:name "GPU Index" ;
+        lv2:default 0 ;
+        lv2:minimum 0 ;
+        lv2:maximum 15 ;
+        lv2:portProperty lv2:integer
+    ] , [
+        a lv2:InputPort , lv2:ControlPort ;
+        lv2:index 6 ;
+        lv2:symbol "model_index" ;
+        lv2:name "Model Index" ;
+        lv2:default 0 ;
+        lv2:minimum 0 ;
+        lv2:maximum 255 ;
+        lv2:portProperty lv2:integer
+    ] , [
+        a lv2:OutputPort , lv2:ControlPort ;
+        lv2:index 7 ;
+        lv2:symbol "cuda_available" ;
+        lv2:name "CUDA Available" ;
+        lv2:default 0 ;
+        lv2:minimum 0 ;
+        lv2:maximum 1 ;
+        lv2:portProperty lv2:toggled
+    ] , [
+        a lv2:OutputPort , lv2:ControlPort ;
+        lv2:index 8 ;
+        lv2:symbol "gpu_count" ;
+        lv2:name "GPU Count" ;
+        lv2:default 0 ;
+        lv2:minimum 0 ;
+        lv2:maximum 16 ;
+        lv2:portProperty lv2:integer
+    ] , [
+        a lv2:OutputPort , lv2:ControlPort ;
+        lv2:index 9 ;
+        lv2:symbol "model_count" ;
+        lv2:name "Model Count" ;
+        lv2:default 0 ;
+        lv2:minimum 0 ;
+        lv2:maximum 255 ;
+        lv2:portProperty lv2:integer
+    ] , [
+        a lv2:OutputPort , lv2:ControlPort ;
+        lv2:index 10 ;
+        lv2:symbol "status_code" ;
+        lv2:name "Status Code" ;
+        lv2:default 0 ;
+        lv2:minimum 0 ;
+        lv2:maximum 16 ;
+        lv2:portProperty lv2:integer
+    ] , [
+        a lv2:OutputPort , lv2:ControlPort ;
+        lv2:index 11 ;
+        lv2:symbol "input_level" ;
+        lv2:name "Input Level" ;
+        lv2:default 0 ;
+        lv2:minimum 0 ;
+        lv2:maximum 1
+    ] , [
+        a lv2:OutputPort , lv2:ControlPort ;
+        lv2:index 12 ;
+        lv2:symbol "output_level" ;
+        lv2:name "Output Level" ;
+        lv2:default 0 ;
+        lv2:minimum 0 ;
+        lv2:maximum 1
+    ] , [
+        a lv2:OutputPort , lv2:ControlPort ;
+        lv2:index 13 ;
+        lv2:symbol "model_loaded" ;
+        lv2:name "Model Loaded" ;
+        lv2:default 0 ;
+        lv2:minimum 0 ;
+        lv2:maximum 1 ;
+        lv2:portProperty lv2:toggled
+    ] , [
+        a lv2:OutputPort , lv2:ControlPort ;
+        lv2:index 14 ;
+        lv2:symbol "runtime_phase" ;
+        lv2:name "Runtime Phase" ;
+        lv2:default 0 ;
+        lv2:minimum 0 ;
+        lv2:maximum 4 ;
+        lv2:portProperty lv2:integer
+    ] , [
+        a lv2:InputPort , lv2:AudioPort ;
+        lv2:index 15 ;
+        lv2:symbol "input_l" ;
+        lv2:name "Input L"
+    ] , [
+        a lv2:InputPort , lv2:AudioPort ;
+        lv2:index 16 ;
+        lv2:symbol "input_r" ;
+        lv2:name "Input R"
+    ] , [
+        a lv2:OutputPort , lv2:AudioPort ;
+        lv2:index 17 ;
+        lv2:symbol "output_l" ;
+        lv2:name "Output L"
+    ] , [
+        a lv2:OutputPort , lv2:AudioPort ;
+        lv2:index 18 ;
+        lv2:symbol "output_r" ;
+        lv2:name "Output R"
+    ] .
+
+<https://wiredeck.dev/plugins/cuda-denoiser#ui>
+    a ui:GtkUI ;
+    lv2:requiredFeature ui:parent ;
+    ui:binary <libwiredeck_cuda_denoiser_ui.so> ;
+    rdfs:label "WireDeck CUDA Denoiser UI" .
