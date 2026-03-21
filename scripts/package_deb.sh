@@ -66,6 +66,7 @@ OUTPUT_DEB="$BUILD_ROOT/${PACKAGE_NAME}_${PACKAGE_VERSION}_${PACKAGE_ARCH}.deb"
 LV2_DST_DIR="$PKG_ROOT/usr/lib/lv2/wiredeck-cuda-denoiser.lv2"
 ICON_THEME_DIR_REL="usr/share/icons/hicolor/256x256/apps"
 ICON_THEME_DIR="$PKG_ROOT/$ICON_THEME_DIR_REL"
+APP_SHARE_DIR="$PKG_ROOT/usr/share/wiredeck"
 
 mkdir -p "$BUILD_ROOT"
 rm -rf "$PKG_ROOT"
@@ -80,12 +81,14 @@ mkdir -p \
     "$PKG_ROOT/usr/share/applications" \
     "$ICON_THEME_DIR" \
     "$PKG_ROOT/usr/share/pixmaps" \
+    "$APP_SHARE_DIR" \
     "$PKG_ROOT/usr/share/doc/$PACKAGE_NAME"
 
 install -m 0755 "$ROOT_DIR/zig-out/bin/wiredeck" "$PKG_ROOT/usr/bin/wiredeck"
 install -m 0644 "$ROOT_DIR/packaging/linux/wiredeck.desktop" "$PKG_ROOT/usr/share/applications/wiredeck.desktop"
 install -m 0644 "$ROOT_DIR/src/assets/icons/wiredeck.png" "$PKG_ROOT/usr/share/pixmaps/wiredeck.png"
 install -m 0644 "$ROOT_DIR/src/assets/icons/wiredeck.png" "$ICON_THEME_DIR/wiredeck.png"
+cp -a "$ROOT_DIR/src/assets" "$APP_SHARE_DIR/"
 
 if [ -f "$ROOT_DIR/zig-out/bin/wiredeck-lv2-ui-host" ]; then
     install -m 0755 "$ROOT_DIR/zig-out/bin/wiredeck-lv2-ui-host" "$PKG_ROOT/usr/bin/wiredeck-lv2-ui-host"

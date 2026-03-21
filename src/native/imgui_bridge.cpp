@@ -290,15 +290,38 @@ std::filesystem::path executable_dir() {
     return exe_path.parent_path();
 }
 
-std::string find_wiredeck_icon_path() {
+std::string find_wiredeck_asset_path(const std::filesystem::path& relative_path) {
     const auto exe_dir = executable_dir();
-    const std::array<std::filesystem::path, 6> candidates = {
+    const std::array<std::filesystem::path, 4> candidates = {
+        exe_dir.empty() ? std::filesystem::path{} : (exe_dir / "../share/wiredeck" / relative_path),
+        exe_dir.empty() ? std::filesystem::path{} : (exe_dir / "../share" / relative_path),
+        relative_path,
+        std::filesystem::path("src") / relative_path,
+    };
+
+    for (const auto& candidate : candidates) {
+        if (candidate.empty()) continue;
+
+        std::error_code ec{};
+        if (std::filesystem::is_regular_file(candidate, ec) && !ec) {
+            return candidate.string();
+        }
+    }
+
+    return {};
+}
+
+std::string find_wiredeck_icon_path() {
+    if (const auto asset_icon = find_wiredeck_asset_path("assets/icons/wiredeck.png"); !asset_icon.empty()) {
+        return asset_icon;
+    }
+
+    const auto exe_dir = executable_dir();
+    const std::array<std::filesystem::path, 4> candidates = {
         exe_dir.empty() ? std::filesystem::path{} : (exe_dir / "../share/pixmaps/wiredeck.png"),
         exe_dir.empty() ? std::filesystem::path{} : (exe_dir / "../share/icons/hicolor/256x256/apps/wiredeck.png"),
         "/usr/local/share/pixmaps/wiredeck.png",
         "/usr/share/pixmaps/wiredeck.png",
-        "/usr/local/share/icons/hicolor/256x256/apps/wiredeck.png",
-        "src/assets/icons/wiredeck.png",
     };
 
     for (const auto& candidate : candidates) {
@@ -788,15 +811,25 @@ bool load_icon_texture(WireDeckImGuiBridge* bridge, const char* path, WireDeckIc
 }
 
 bool load_icon_textures(WireDeckImGuiBridge* bridge) {
-    const bool loaded_volume = load_icon_texture(bridge, "src/assets/icons/volume.png", &bridge->volume_icon);
-    const bool loaded_volume_off = load_icon_texture(bridge, "src/assets/icons/volume-off.png", &bridge->volume_off_icon);
-    const bool loaded_fx = load_icon_texture(bridge, "src/assets/icons/wave-saw-tool.png", &bridge->fx_icon);
-    const bool loaded_mic = load_icon_texture(bridge, "src/assets/icons/mic.png", &bridge->mic_icon);
-    const bool loaded_mic_off = load_icon_texture(bridge, "src/assets/icons/mic-off.png", &bridge->mic_off_icon);
-    const bool loaded_world = load_icon_texture(bridge, "src/assets/icons/world.png", &bridge->world_icon);
-    const bool loaded_world_off = load_icon_texture(bridge, "src/assets/icons/world-off.png", &bridge->world_off_icon);
-    const bool loaded_headset = load_icon_texture(bridge, "src/assets/icons/headset.png", &bridge->headset_icon);
-    const bool loaded_generic_app = load_icon_texture(bridge, "src/assets/icons/generic-app.png", &bridge->generic_app_icon);
+    const auto volume_path = find_wiredeck_asset_path("assets/icons/volume.png");
+    const auto volume_off_path = find_wiredeck_asset_path("assets/icons/volume-off.png");
+    const auto fx_path = find_wiredeck_asset_path("assets/icons/wave-saw-tool.png");
+    const auto mic_path = find_wiredeck_asset_path("assets/icons/mic.png");
+    const auto mic_off_path = find_wiredeck_asset_path("assets/icons/mic-off.png");
+    const auto world_path = find_wiredeck_asset_path("assets/icons/world.png");
+    const auto world_off_path = find_wiredeck_asset_path("assets/icons/world-off.png");
+    const auto headset_path = find_wiredeck_asset_path("assets/icons/headset.png");
+    const auto generic_app_path = find_wiredeck_asset_path("assets/icons/generic-app.png");
+
+    const bool loaded_volume = !volume_path.empty() && load_icon_texture(bridge, volume_path.c_str(), &bridge->volume_icon);
+    const bool loaded_volume_off = !volume_off_path.empty() && load_icon_texture(bridge, volume_off_path.c_str(), &bridge->volume_off_icon);
+    const bool loaded_fx = !fx_path.empty() && load_icon_texture(bridge, fx_path.c_str(), &bridge->fx_icon);
+    const bool loaded_mic = !mic_path.empty() && load_icon_texture(bridge, mic_path.c_str(), &bridge->mic_icon);
+    const bool loaded_mic_off = !mic_off_path.empty() && load_icon_texture(bridge, mic_off_path.c_str(), &bridge->mic_off_icon);
+    const bool loaded_world = !world_path.empty() && load_icon_texture(bridge, world_path.c_str(), &bridge->world_icon);
+    const bool loaded_world_off = !world_off_path.empty() && load_icon_texture(bridge, world_off_path.c_str(), &bridge->world_off_icon);
+    const bool loaded_headset = !headset_path.empty() && load_icon_texture(bridge, headset_path.c_str(), &bridge->headset_icon);
+    const bool loaded_generic_app = !generic_app_path.empty() && load_icon_texture(bridge, generic_app_path.c_str(), &bridge->generic_app_icon);
     return loaded_volume && loaded_volume_off && loaded_fx && loaded_mic && loaded_mic_off && loaded_world && loaded_world_off && loaded_headset && loaded_generic_app;
 }
 
