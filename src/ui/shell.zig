@@ -1,4 +1,5 @@
 const std = @import("std");
+const c = @import("../c.zig").c;
 const StateStore = @import("../app/state_store.zig").StateStore;
 const App = @import("../app/app.zig").App;
 const channels_mod = @import("../core/audio/channels.zig");
@@ -34,6 +35,8 @@ pub const UiShell = struct {
             return error.UiBootstrapFailed;
         };
         defer imgui.wiredeck_imgui_destroy(bridge);
+        const autostart_enabled = isAutostartEnabled(allocator) catch false;
+        imgui.wiredeck_imgui_set_tray_autostart_enabled(bridge, @intFromBool(autostart_enabled));
 
         var lv2_ui_manager = Lv2UiManager.init(allocator);
         defer lv2_ui_manager.deinit();
@@ -123,6 +126,7 @@ pub const UiShell = struct {
                 app.pumpLiveAudio() catch {};
                 app.maybeRefreshAudioInventory();
                 _ = lv2_ui_manager.pump(app, state_store);
+                try syncTrayAutostartPreference(allocator, bridge);
                 app.reconcileOutputRoutingIfNeeded();
                 platform.nextFrame();
                 if (config.max_frames) |max_frames| {
@@ -182,6 +186,7 @@ pub const UiShell = struct {
                     };
                 }
             }
+            try syncTrayAutostartPreference(allocator, bridge);
             app.reconcileOutputRoutingIfNeeded();
 
             platform.nextFrame();
@@ -189,6 +194,85 @@ pub const UiShell = struct {
                 if (platform.frame_count >= max_frames) break;
             }
         }
+    }
+
+    fn syncTrayAutostartPreference(allocator: std.mem.Allocator, bridge: *imgui.Bridge) !void {
+        var enabled: c_int = 0;
+        if (imgui.wiredeck_imgui_take_tray_autostart_request(bridge, &enabled) == 0) return;
+        if (enabled != 0) {
+            try enableAutostart(allocator);
+        } else {
+            disableAutostart(allocator) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+        }
+    }
+
+    fn autostartDesktopPath(allocator: std.mem.Allocator) ![]u8 {
+        const config_home = std.process.getEnvVarOwned(allocator, "XDG_CONFIG_HOME") catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => blk: {
+                const home = try std.process.getEnvVarOwned(allocator, "HOME");
+                defer allocator.free(home);
+                break :blk try std.fs.path.join(allocator, &.{ home, ".config" });
+            },
+            else => return err,
+        };
+        defer allocator.free(config_home);
+
+        return std.fs.path.join(allocator, &.{ config_home, "autostart", "wiredeck.desktop" });
+    }
+
+    fn isAutostartEnabled(allocator: std.mem.Allocator) !bool {
+        const desktop_path = try autostartDesktopPath(allocator);
+        defer allocator.free(desktop_path);
+
+        std.fs.accessAbsolute(desktop_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        return true;
+    }
+
+    fn enableAutostart(allocator: std.mem.Allocator) !void {
+        const desktop_path = try autostartDesktopPath(allocator);
+        defer allocator.free(desktop_path);
+
+        const desktop_dir = std.fs.path.dirname(desktop_path) orelse return error.InvalidPath;
+        std.fs.makeDirAbsolute(desktop_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+
+        const exe_path = try std.fs.selfExePathAlloc(allocator);
+        defer allocator.free(exe_path);
+
+        const desktop_entry = try std.fmt.allocPrint(
+            allocator,
+            \\[Desktop Entry]
+            \\Type=Application
+            \\Version=1.0
+            \\Name=WireDeck
+            \\Comment=WireDeck audio router
+            \\Exec={s} --start-hidden
+            \\Terminal=false
+            \\Categories=AudioVideo;Audio;
+            \\X-GNOME-Autostart-enabled=true
+            \\
+        ,
+            .{exe_path},
+        );
+        defer allocator.free(desktop_entry);
+
+        const file = try std.fs.createFileAbsolute(desktop_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(desktop_entry);
+    }
+
+    fn disableAutostart(allocator: std.mem.Allocator) !void {
+        const desktop_path = try autostartDesktopPath(allocator);
+        defer allocator.free(desktop_path);
+        try std.fs.deleteFileAbsolute(desktop_path);
     }
 
     fn ensureSnapshotCapacity(
