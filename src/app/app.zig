@@ -71,6 +71,11 @@ pub const App = struct {
         original_sink_index: u32,
     };
 
+    const RoutedSourceOutput = struct {
+        source_output_index: u32,
+        original_source_index: u32,
+    };
+
     const RoutedCombineModule = struct {
         channel_id: []u8,
         module_index: u32,
@@ -115,6 +120,8 @@ pub const App = struct {
     routing_retry_requested: std.atomic.Value(bool),
     route_dirty: bool,
     routed_sink_inputs: std.ArrayList(RoutedSinkInput),
+    routed_source_outputs: std.ArrayList(RoutedSourceOutput),
+    blocked_source_outputs: std.ArrayList(u32),
     routed_combine_modules: std.ArrayList(RoutedCombineModule),
     routed_loopback_modules: std.ArrayList(RoutedLoopbackModule),
     routed_fx_output_loopbacks: std.ArrayList(RoutedFxOutputLoopbackModule),
@@ -145,6 +152,8 @@ pub const App = struct {
             .routing_retry_requested = std.atomic.Value(bool).init(false),
             .route_dirty = false,
             .routed_sink_inputs = .empty,
+            .routed_source_outputs = .empty,
+            .blocked_source_outputs = .empty,
             .routed_combine_modules = .empty,
             .routed_loopback_modules = .empty,
             .routed_fx_output_loopbacks = .empty,
@@ -167,6 +176,8 @@ pub const App = struct {
             self.allocator.free(item.channel_id);
         }
         self.routed_sink_inputs.deinit(self.allocator);
+        self.routed_source_outputs.deinit(self.allocator);
+        self.blocked_source_outputs.deinit(self.allocator);
         for (self.routed_combine_modules.items) |module| {
             self.allocator.free(module.channel_id);
             self.allocator.free(module.sink_name);
@@ -194,7 +205,7 @@ pub const App = struct {
         self.pipewire_live.deinit();
     }
 
-    pub fn bootstrap(self: *App) !void {
+    pub fn prepareBootstrapState(self: *App) !void {
         try self.seedDefaultRouting();
         try self.seedPluginCatalog();
         self.pipewire_live.connect() catch |err| {
@@ -207,6 +218,9 @@ pub const App = struct {
             std.log.warn("audio inventory refresh failed during bootstrap: {s}", .{@errorName(err)});
         };
         self.last_inventory_refresh_ns = std.time.nanoTimestamp();
+    }
+
+    pub fn startBackgroundServices(self: *App) void {
         self.startRefreshWorker() catch |err| {
             std.log.warn("audio inventory worker unavailable: {s}", .{@errorName(err)});
         };
@@ -216,6 +230,15 @@ pub const App = struct {
         self.startRoutingWorker() catch |err| {
             std.log.warn("routing worker unavailable: {s}", .{@errorName(err)});
         };
+    }
+
+    pub fn bootstrap(self: *App) !void {
+        try self.prepareBootstrapState();
+        self.startBackgroundServices();
+    }
+
+    pub fn reconcileCurrentRoutingNow(self: *App) !void {
+        try self.reconcileOutputRouting(self.state_store);
     }
 
     pub fn cleanupStartupBindings(self: *App) !void {
@@ -602,17 +625,20 @@ pub const App = struct {
         try self.collectDesiredSinkMoves(state_store, &desired, owners, refreshed_pulse_snapshot, pulsectx, fx_channels.items);
 
         for (desired.items) |move| {
+            const sink_input = findPulseSinkInput(refreshed_pulse_snapshot.sink_inputs, move.sink_input_index) orelse continue;
+            const original_sink_index = sink_input.sink_index orelse continue;
+            const keep_routed = try self.moveSinkInputWithRecheck(pulsectx, move.sink_input_index, move.target_sink_index);
+            if (!keep_routed) continue;
             if (!hasRecordedOriginal(self.routed_sink_inputs.items, move.sink_input_index)) {
-                const sink_input = findPulseSinkInput(refreshed_pulse_snapshot.sink_inputs, move.sink_input_index) orelse continue;
-                const original_sink_index = sink_input.sink_index orelse continue;
                 try self.routed_sink_inputs.append(self.allocator, .{
                     .channel_id = try self.allocator.dupe(u8, move.channel_id),
                     .sink_input_index = move.sink_input_index,
                     .original_sink_index = original_sink_index,
                 });
             }
-            try pulsectx.moveSinkInputToSink(move.sink_input_index, move.target_sink_index);
         }
+
+        try self.reconcileVirtualMicCaptureRouting(state_store, owners, refreshed_pulse_snapshot, pulsectx);
 
         var index: usize = 0;
         while (index < self.routed_sink_inputs.items.len) {
@@ -682,6 +708,11 @@ pub const App = struct {
         }
         self.routed_sink_inputs.clearRetainingCapacity();
 
+        for (self.routed_source_outputs.items) |routed| {
+            pulsectx.moveSourceOutputToSource(routed.source_output_index, routed.original_source_index) catch {};
+        }
+        self.routed_source_outputs.clearRetainingCapacity();
+
         for (self.routed_combine_modules.items) |module| {
             pulsectx.unloadModule(module.module_index) catch {};
             self.allocator.free(module.channel_id);
@@ -707,6 +738,71 @@ pub const App = struct {
         self.routed_fx_output_loopbacks.clearRetainingCapacity();
 
         self.output_exposure.resetAudioState() catch {};
+    }
+
+    fn moveSinkInputWithRecheck(
+        self: *App,
+        pulsectx: *pulse.PulseContext,
+        sink_input_index: u32,
+        target_sink_index: u32,
+    ) !bool {
+        pulsectx.moveSinkInputToSink(sink_input_index, target_sink_index) catch |err| switch (err) {
+            error.PulseMoveSinkInputFailed, error.PulseOperationTimedOut => {
+                const latest_snapshot = pulsectx.snapshot(self.allocator) catch return err;
+                defer pulse.freeSnapshot(self.allocator, latest_snapshot);
+
+                const latest_input = findPulseSinkInput(latest_snapshot.sink_inputs, sink_input_index) orelse return false;
+                const current_sink_index = latest_input.sink_index orelse return false;
+                if (current_sink_index == target_sink_index) return true;
+                return err;
+            },
+            else => return err,
+        };
+        return true;
+    }
+
+    fn moveSourceOutputWithRecheck(
+        self: *App,
+        pulsectx: *pulse.PulseContext,
+        source_output_index: u32,
+        target_source_index: u32,
+    ) !bool {
+        pulsectx.moveSourceOutputToSource(source_output_index, target_source_index) catch |err| switch (err) {
+            error.PulseMoveSourceOutputFailed, error.PulseOperationTimedOut => {
+                const latest_snapshot = pulsectx.snapshot(self.allocator) catch return err;
+                defer pulse.freeSnapshot(self.allocator, latest_snapshot);
+
+                const latest_output = findPulseSourceOutput(latest_snapshot.source_outputs, source_output_index) orelse return false;
+                const current_source_index = latest_output.source_index orelse return false;
+                if (current_source_index == target_source_index) return true;
+                return err;
+            },
+            else => return err,
+        };
+        return true;
+    }
+
+    fn reconcileVirtualMicCaptureRouting(
+        self: *App,
+        state_store: *const StateStore,
+        owners: []const binder.BoundOwner,
+        pulse_snapshot: pulse.PulseSnapshot,
+        pulsectx: *pulse.PulseContext,
+    ) !void {
+        _ = state_store;
+        _ = owners;
+
+        const restore_index: usize = 0;
+        while (restore_index < self.routed_source_outputs.items.len) {
+            const routed = self.routed_source_outputs.items[restore_index];
+            if (findPulseSourceOutput(pulse_snapshot.source_outputs, routed.source_output_index) == null) {
+                _ = self.routed_source_outputs.orderedRemove(restore_index);
+                continue;
+            }
+            pulsectx.moveSourceOutputToSource(routed.source_output_index, routed.original_source_index) catch {};
+            _ = self.routed_source_outputs.orderedRemove(restore_index);
+        }
+        self.blocked_source_outputs.clearRetainingCapacity();
     }
 
     fn collectDesiredSinkMoves(
@@ -1273,7 +1369,9 @@ fn routingWorkerMain(app: *App) void {
         }
 
         app.reconcileOutputRouting(&snapshot_ptr.state_store) catch |err| {
-            std.log.warn("routing worker reconcile failed: {s}", .{@errorName(err)});
+            if (err != error.CaptureSinkPending) {
+                std.log.warn("routing worker reconcile failed: {s}", .{@errorName(err)});
+            }
             app.routing_retry_requested.store(true, .release);
         };
     }
@@ -1694,9 +1792,24 @@ fn findPulseSinkInput(items: []const pulse.PulseSinkInput, index: u32) ?pulse.Pu
     return null;
 }
 
+fn findPulseSourceOutput(items: []const pulse.PulseSourceOutput, index: u32) ?pulse.PulseSourceOutput {
+    for (items) |item| {
+        if (item.index == index) return item;
+    }
+    return null;
+}
+
 fn findPulseSink(items: []const pulse.PulseSink, index: u32) ?pulse.PulseSink {
     for (items) |item| {
         if (item.index == index) return item;
+    }
+    return null;
+}
+
+fn findPulseSourceIndexByName(snapshot: pulse.PulseSnapshot, source_name: []const u8) ?u32 {
+    for (snapshot.sources) |source| {
+        const current_name = source.name orelse continue;
+        if (std.mem.eql(u8, current_name, source_name)) return source.index;
     }
     return null;
 }
@@ -1741,6 +1854,42 @@ fn findPulseSinkByName(snapshot: pulse.PulseSnapshot, sink_name: []const u8) ?pu
     return null;
 }
 
+fn resolvePreferredVirtualMicSourceIndex(
+    allocator: std.mem.Allocator,
+    state_store: *const StateStore,
+    snapshot: pulse.PulseSnapshot,
+) !?u32 {
+    for (state_store.buses.items) |bus| {
+        if (!bus.expose_as_microphone) continue;
+        const source_name = try output_exposure_mod.allocVirtualMicSourceName(allocator, bus.id);
+        defer allocator.free(source_name);
+        return findPulseSourceIndexByName(snapshot, source_name);
+    }
+    return null;
+}
+
+fn hasRecordedSourceOutputOriginal(items: []const App.RoutedSourceOutput, source_output_index: u32) bool {
+    for (items) |item| {
+        if (item.source_output_index == source_output_index) return true;
+    }
+    return false;
+}
+
+fn containsBlockedSourceOutput(items: []const u32, source_output_index: u32) bool {
+    for (items) |item| {
+        if (item == source_output_index) return true;
+    }
+    return false;
+}
+
+fn removeBlockedSourceOutput(items: *std.ArrayList(u32), source_output_index: u32) void {
+    for (items.items, 0..) |item, index| {
+        if (item != source_output_index) continue;
+        _ = items.orderedRemove(index);
+        return;
+    }
+}
+
 fn allocFxMonitorSourceName(allocator: std.mem.Allocator, channel_id: []const u8) ![]u8 {
     const sink_name = try virtual_inputs.allocSinkName(allocator, "wiredeck_fx_", channel_id);
     defer allocator.free(sink_name);
@@ -1757,10 +1906,13 @@ fn resolveCaptureSinkForChannel(
 ) !?App.ChannelTargetSink {
     if (!uses_fx) return try self.resolveTargetSinkForChannel(state_store, channel_id, pulse_snapshot, pulsectx);
 
+    const target_sink = try self.resolveTargetSinkForChannel(state_store, channel_id, pulse_snapshot, pulsectx);
+    if (target_sink == null) return null;
+
     const sink_name = try virtual_inputs.allocSinkName(self.allocator, "wiredeck_input_", channel_id);
     defer self.allocator.free(sink_name);
 
-    const sink = findPulseSinkByName(pulse_snapshot, sink_name) orelse return null;
+    const sink = findPulseSinkByName(pulse_snapshot, sink_name) orelse return error.CaptureSinkPending;
     return .{
         .sink_index = sink.index,
         .sink_name = sink.name.?,
@@ -2119,6 +2271,21 @@ fn looksLikeDiscordSource(source: sources_mod.Source) bool {
         containsIgnoreCase(source.subtitle, "discord") or
         containsIgnoreCase(source.process_binary, "discord") or
         containsIgnoreCase(source.id, "discord");
+}
+
+fn looksLikeDiscordCaptureOwner(owner: binder.BoundOwner) bool {
+    return containsIgnoreCase(owner.app_name orelse "", "discord") or
+        containsIgnoreCase(owner.process_binary orelse "", "discord") or
+        containsIgnoreCase(owner.app_name orelse "", "webrtc") or
+        containsIgnoreCase(owner.process_binary orelse "", "webrtc") or
+        containsIgnoreCase(owner.app_name orelse "", "voiceengine") or
+        containsIgnoreCase(owner.process_binary orelse "", "voiceengine");
+}
+
+fn shouldSkipVirtualMicCaptureOwner(owner: binder.BoundOwner) bool {
+    if (owner.pulse_source_output_indexes.len == 0) return true;
+    return containsIgnoreCase(owner.app_name orelse "", "wiredeck") or
+        containsIgnoreCase(owner.process_binary orelse "", "wiredeck");
 }
 
 fn sanitizeId(value: []const u8) []const u8 {
