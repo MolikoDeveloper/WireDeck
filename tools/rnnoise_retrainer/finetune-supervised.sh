@@ -6,10 +6,10 @@ PYTHONPATH=src python3 -m wiredeck_rnnoise_trainer.cli train-gpu \
   --initial-checkpoint /home/moliko/projects/wiredeck_2.0/tools/rnnoise_retrainer/artifacts/gpu-run-finetune-single-noise/checkpoints/wiredeck_gpu_epoch_115.pt \
   --epochs 8 \
   --samples-per-epoch 4096 \
-  --batch-size 16 \
+  --batch-size 6 \
   --lr 2e-5 \
-  --channels 40 \
-  --hidden-channels 80 \
+  --channels 48 \
+  --hidden-channels 86 \
   --residual-blocks 4 \
   --kernel-time 5 \
   --kernel-freq 3 \
@@ -32,4 +32,6 @@ PYTHONPATH=src python3 -m wiredeck_rnnoise_trainer.cli train-gpu \
   --vad-positive-snr-db 3 \
   --vad-negative-snr-db -6 \
   --vad-energy-threshold 0.02 \
-  --vad-loss-weight 0.35
+  --vad-loss-weight 0.35 \
+  --clip-seconds 6
+

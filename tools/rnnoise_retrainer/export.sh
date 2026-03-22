@@ -1,3 +1,3 @@
 wiredeck-rnnoise export-gpu-model \
-  ~/.config/wiredeck/models/Wiredeck-101.bin \
-  --checkpoint ./artifacts/gpu-run-finetune-single-noise/checkpoints/wiredeck_gpu_epoch_115.pt
+  ~/.config/wiredeck/models/supervised.bin \
+  --checkpoint /home/moliko/projects/wiredeck_2.0/tools/rnnoise_retrainer/artifacts/gpu-finetune-rt-medium/checkpoints/wiredeck_gpu_epoch_123.pt

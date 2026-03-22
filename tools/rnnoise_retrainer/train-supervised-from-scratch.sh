@@ -1,13 +1,16 @@
-PYTHONPATH=src python3 -m wiredeck_rnnoise_trainer.cli train-gpu \
+#!/bin/sh
+set -eu
+
+PYTHONPATH=src python3 -m wiredeck_rnnoise_trainer.cli train-gpu-supervised \
   /home/moliko/projects/wiredeck_2.0/tools/rnnoise_retrainer/data/normalized_speec/audio \
   /home/moliko/projects/wiredeck_2.0/tools/rnnoise_retrainer/data/normalized_noise/audio \
-  /home/moliko/projects/wiredeck_2.0/tools/rnnoise_retrainer/artifacts/gpu-finetune-rt-medium \
+  /home/moliko/projects/wiredeck_2.0/tools/rnnoise_retrainer/artifacts/gpu-supervised-from-scratch \
   --device cuda \
-  --initial-checkpoint /home/moliko/projects/wiredeck_2.0/tools/rnnoise_retrainer/artifacts/gpu-run-finetune-single-noise/checkpoints/wiredeck_gpu_epoch_115.pt \
-  --epochs 8 \
+  --epochs 40 \
   --samples-per-epoch 4096 \
   --batch-size 16 \
-  --lr 2e-5 \
+  --lr 1e-4 \
+  --clip-seconds 4 \
   --channels 40 \
   --hidden-channels 80 \
   --residual-blocks 4 \
@@ -20,16 +23,20 @@ PYTHONPATH=src python3 -m wiredeck_rnnoise_trainer.cli train-gpu \
   --background-repeat 1 \
   --musan-repeat 1 \
   --speech-noise-repeat 2 \
-  --clean-probability 0.10 \
+  --clean-probability 0.15 \
   --noise-only-probability 0.10 \
-  --snr-min-db -10 \
+  --snr-min-db -8 \
   --snr-max-db 12 \
   --speech-gain-min-db -18 \
   --speech-gain-max-db 3 \
-  --low-speech-probability 0.30 \
+  --low-speech-probability 0.25 \
   --low-speech-extra-min-db -12 \
   --low-speech-extra-max-db -4 \
   --vad-positive-snr-db 3 \
   --vad-negative-snr-db -6 \
   --vad-energy-threshold 0.02 \
-  --vad-loss-weight 0.35
+  --vad-loss-weight 0.30 \
+  --state-loss-weight 0.10 \
+  --state-noise-energy-threshold 0.01 \
+  --state-speech-dominant-snr-db 6 \
+  --state-noise-dominant-snr-db -3
