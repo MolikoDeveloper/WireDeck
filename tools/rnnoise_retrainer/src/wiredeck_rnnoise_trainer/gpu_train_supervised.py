@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import json
-import math
 import random
-import wave
 from dataclasses import asdict
 from pathlib import Path
 
@@ -13,120 +11,21 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
+from wiredeck_rnnoise_trainer.gpu_infer import write_audio_mono_48k
 from wiredeck_rnnoise_trainer.gpu_model import WireDeckVoiceDenoiser, WireDeckVoiceDenoiserConfig
+from wiredeck_rnnoise_trainer.gpu_train import (
+    _compress_to_bands,
+    _load_existing_history,
+    _read_segment,
+    build_weighted_noise_file_list,
+    choose_training_device,
+    load_compatible_state_dict,
+    list_wav_files,
+    save_checkpoint,
+)
 
 
-def choose_training_device(force_device: str | None = None, allow_cpu: bool = False) -> torch.device:
-    if force_device:
-        device = torch.device(force_device)
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif allow_cpu:
-        device = torch.device("cpu")
-    else:
-        raise RuntimeError("no GPU backend available; use --device or --allow-cpu for development")
-    return device
-
-
-def list_wav_files(root: Path) -> list[Path]:
-    return sorted(path for path in root.rglob("*.wav") if path.is_file())
-
-
-def build_weighted_noise_file_list(
-    noise_root: Path,
-    *,
-    contrib_repeat: int,
-    synthetic_repeat: int,
-    foreground_repeat: int,
-    background_repeat: int,
-    musan_repeat: int,
-    speech_noise_repeat: int,
-) -> list[Path]:
-    weighted: list[Path] = []
-    all_files = list_wav_files(noise_root)
-    for path in all_files:
-        name = path.name.lower()
-        repeat = 1
-        speech_like_noise = any(
-            keyword in name
-            for keyword in (
-                "people",
-                "talk",
-                "speech",
-                "voice",
-                "crowd",
-                "conversation",
-                "office",
-                "cafe",
-                "tv",
-                "radio",
-            )
-        )
-        if "contrib_noise" in name:
-            repeat = max(1, contrib_repeat)
-        elif "synthetic_noise" in name:
-            repeat = max(1, synthetic_repeat)
-        elif "foreground_noise" in name:
-            repeat = max(1, foreground_repeat)
-        elif "background_noise" in name:
-            repeat = max(1, background_repeat)
-        elif "musan" in name:
-            repeat = max(1, musan_repeat)
-        elif speech_like_noise:
-            repeat = max(1, speech_noise_repeat)
-        weighted.extend([path] * repeat)
-    return weighted
-
-
-def _read_segment(path: Path, target_samples: int, rng: random.Random) -> np.ndarray:
-    with wave.open(str(path), "rb") as handle:
-        channels = handle.getnchannels()
-        width = handle.getsampwidth()
-        sample_rate = handle.getframerate()
-        total_frames = handle.getnframes()
-        if channels != 1:
-            raise ValueError(f"{path} is not mono")
-        if width != 2:
-            raise ValueError(f"{path} is not 16-bit PCM")
-        if sample_rate != 48_000:
-            raise ValueError(f"{path} is not 48 kHz")
-
-        if total_frames <= target_samples:
-            start = 0
-            frames_to_read = total_frames
-        else:
-            start = rng.randint(0, total_frames - target_samples)
-            frames_to_read = target_samples
-        handle.setpos(start)
-        raw = handle.readframes(frames_to_read)
-
-    audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-    if audio.shape[0] < target_samples:
-        padded = np.zeros(target_samples, dtype=np.float32)
-        if audio.shape[0] > 0:
-            repeats = math.ceil(target_samples / audio.shape[0])
-            tiled = np.tile(audio, repeats)[:target_samples]
-            padded[:] = tiled
-        audio = padded
-    return audio[:target_samples]
-
-
-def _compress_to_bands(magnitude: torch.Tensor, bands: int) -> torch.Tensor:
-    # Input: [batch, frames, freq_bins] -> output: [batch, frames, bands]
-    if magnitude.shape[-1] == bands:
-        return magnitude
-    resized = F.interpolate(
-        magnitude.unsqueeze(1),
-        size=(magnitude.shape[1], bands),
-        mode="bilinear",
-        align_corners=False,
-    )
-    return resized.squeeze(1)
-
-
-class NoisySpeechDataset(Dataset):
+class SupervisedNoisySpeechDataset(Dataset):
     def __init__(
         self,
         speech_files: list[Path],
@@ -148,6 +47,9 @@ class NoisySpeechDataset(Dataset):
         vad_positive_snr_db: float,
         vad_negative_snr_db: float,
         vad_energy_threshold: float,
+        state_noise_energy_threshold: float,
+        state_speech_dominant_snr_db: float,
+        state_noise_dominant_snr_db: float,
         seed: int = 0,
     ) -> None:
         self.speech_files = speech_files
@@ -169,14 +71,16 @@ class NoisySpeechDataset(Dataset):
         self.vad_positive_snr_db = vad_positive_snr_db
         self.vad_negative_snr_db = vad_negative_snr_db
         self.vad_energy_threshold = vad_energy_threshold
+        self.state_noise_energy_threshold = state_noise_energy_threshold
+        self.state_speech_dominant_snr_db = state_speech_dominant_snr_db
+        self.state_noise_dominant_snr_db = state_noise_dominant_snr_db
         self.seed = seed
         self.window = torch.hann_window(stft_size)
 
     def __len__(self) -> int:
         return self.samples_per_epoch
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        rng = random.Random(self.seed + index)
+    def _build_example(self, rng: random.Random) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         speech_path = self.speech_files[rng.randrange(len(self.speech_files))]
         noise_path = self.noise_files[rng.randrange(len(self.noise_files))]
 
@@ -188,6 +92,7 @@ class NoisySpeechDataset(Dataset):
             speech_gain_db += rng.uniform(self.low_speech_extra_min_db, self.low_speech_extra_max_db)
         speech_gain = 10.0 ** (speech_gain_db / 20.0)
         clean = clean * speech_gain
+
         scenario_draw = rng.random()
         if scenario_draw < self.noise_only_probability:
             clean = torch.zeros_like(clean)
@@ -204,6 +109,7 @@ class NoisySpeechDataset(Dataset):
         clean_mag, noise_mag, noisy_mag = self._spectrogram_triplet(clean, noise, noisy)
         features = torch.log1p(noisy_mag)
         mask_target = (clean_mag / (clean_mag + noise_mag).clamp_min(1.0e-4)).clamp(0.0, 1.0)
+
         speech_energy = clean_mag.mean(dim=1, keepdim=True)
         noise_energy = noise_mag.mean(dim=1, keepdim=True)
         frame_snr_db = 20.0 * torch.log10(speech_energy.clamp_min(1.0e-4) / noise_energy.clamp_min(1.0e-4))
@@ -211,7 +117,17 @@ class NoisySpeechDataset(Dataset):
         vad_snr_score = ((frame_snr_db - self.vad_negative_snr_db) / snr_span).clamp(0.0, 1.0)
         vad_energy_gate = (speech_energy > self.vad_energy_threshold).to(dtype=torch.float32)
         vad_target = vad_energy_gate * vad_snr_score
-        return features, mask_target, vad_target
+        state_target = self._build_state_target(speech_energy.squeeze(1), noise_energy.squeeze(1), frame_snr_db.squeeze(1))
+        return features, mask_target, vad_target, state_target, clean, noise, noisy
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        rng = random.Random(self.seed + index)
+        features, mask_target, vad_target, state_target, _, _, _ = self._build_example(rng)
+        return features, mask_target, vad_target, state_target
+
+    def build_preview(self, epoch: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        rng = random.Random((self.seed * 100_003) + epoch)
+        return self._build_example(rng)
 
     def _spectrogram_triplet(
         self,
@@ -252,63 +168,242 @@ class NoisySpeechDataset(Dataset):
         noisy_mag = _compress_to_bands(noisy_spec.abs().unsqueeze(0), self.bands).squeeze(0)
         return clean_mag, noise_mag, noisy_mag
 
+    def _build_state_target(self, speech_energy: torch.Tensor, noise_energy: torch.Tensor, frame_snr_db: torch.Tensor) -> torch.Tensor:
+        speech_present = speech_energy > self.vad_energy_threshold
+        noise_present = noise_energy > self.state_noise_energy_threshold
+        state_target = torch.zeros_like(speech_energy, dtype=torch.long)
 
-def save_checkpoint(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
+        speech_only = speech_present & (~noise_present | (frame_snr_db >= self.state_speech_dominant_snr_db))
+        noise_only = (~speech_present) | (noise_present & (frame_snr_db <= self.state_noise_dominant_snr_db))
+        mixed = speech_present & noise_present & (~speech_only) & (~noise_only)
+
+        state_target = torch.where(speech_only, torch.ones_like(state_target), state_target)
+        state_target = torch.where(mixed, torch.full_like(state_target, 2), state_target)
+        return state_target
+
+
+class WireDeckSupervisedVoiceDenoiser(nn.Module):
+    def __init__(self, config: WireDeckVoiceDenoiserConfig | None = None, state_hidden_channels: int | None = None) -> None:
+        super().__init__()
+        self.base_model = WireDeckVoiceDenoiser(config)
+        self.config = self.base_model.config
+        state_hidden = state_hidden_channels or self.config.hidden_channels
+        self.state_head = nn.Sequential(
+            nn.Conv1d(
+                self.config.channels,
+                state_hidden,
+                kernel_size=self.config.kernel_time,
+                padding=self.config.kernel_time // 2,
+            ),
+            nn.SiLU(),
+            nn.Conv1d(state_hidden, 3, kernel_size=1),
+        )
+
+    def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x = features.unsqueeze(1)
+        x = self.base_model.input_proj(x)
+        x = self.base_model.blocks(x)
+        x = x + self.base_model.bottleneck(x)
+        mask = self.base_model.mask_head(x).squeeze(1)
+        vad_features = x.mean(dim=3)
+        vad = self.base_model.vad_head(vad_features).transpose(1, 2)
+        state_logits = self.state_head(vad_features).transpose(1, 2)
+        return mask, vad, state_logits
+
+
+def _tensor_rms(value: torch.Tensor) -> float:
+    return float(value.square().mean().sqrt().item())
+
+
+def _render_preview(
+    model: WireDeckSupervisedVoiceDenoiser,
+    config: WireDeckVoiceDenoiserConfig,
+    device: torch.device,
     output_dir: Path,
     epoch: int,
-    config: WireDeckVoiceDenoiserConfig,
-    metrics: dict[str, float],
-) -> Path:
-    checkpoint_dir = output_dir / "checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint = checkpoint_dir / f"wiredeck_gpu_epoch_{epoch:03d}.pt"
-    torch.save(
-        {
-            "epoch": epoch,
-            "state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "config": asdict(config),
-            "metrics": metrics,
-        },
-        checkpoint,
+    preview: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    stft_size: int,
+    hop_size: int,
+) -> dict[str, float | str]:
+    features, _, _, state_target, clean, noise, noisy = preview
+    preview_dir = output_dir / "epoch_audio"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+
+    clean_cpu = clean.to(dtype=torch.float32).cpu()
+    noise_cpu = noise.to(dtype=torch.float32).cpu()
+    noisy_cpu = noisy.to(dtype=torch.float32).cpu()
+    features_batch = _build_centered_features(noisy_cpu, config.bands, stft_size, hop_size).unsqueeze(0).to(device=device, dtype=torch.float32)
+    window = torch.hann_window(stft_size)
+
+    with torch.no_grad():
+        mask_pred, vad_pred, state_logits = model(features_batch)
+        mask_pred_cpu = mask_pred.squeeze(0).cpu()
+        vad_pred_cpu = vad_pred.squeeze(0).squeeze(-1).cpu()
+        state_probs = torch.softmax(state_logits.squeeze(0), dim=-1).cpu()
+
+    noisy_spec = torch.stft(
+        noisy_cpu,
+        n_fft=stft_size,
+        hop_length=hop_size,
+        win_length=stft_size,
+        window=window,
+        center=True,
+        return_complex=True,
+    ).transpose(0, 1)
+    freq_bins = noisy_spec.shape[1]
+    mask_full = _compress_to_freq_bins(mask_pred_cpu, freq_bins)
+    enhanced_spec = noisy_spec * mask_full.to(dtype=noisy_spec.dtype)
+    enhanced = torch.istft(
+        enhanced_spec.transpose(0, 1),
+        n_fft=stft_size,
+        hop_length=hop_size,
+        win_length=stft_size,
+        window=window,
+        center=True,
+        length=int(noisy_cpu.shape[0]),
+    ).cpu()
+
+    sample_path = preview_dir / f"epoch-{epoch:03d}-sample.wav"
+    noise_path = preview_dir / f"epoch-{epoch:03d}-noise.wav"
+    voice_path = preview_dir / f"epoch-{epoch:03d}-voice.wav"
+    output_path = preview_dir / f"epoch-{epoch:03d}-output.wav"
+    write_audio_mono_48k(sample_path, noisy_cpu.numpy())
+    write_audio_mono_48k(noise_path, noise_cpu.numpy())
+    write_audio_mono_48k(voice_path, clean_cpu.numpy())
+    write_audio_mono_48k(output_path, enhanced.numpy())
+
+    residual = enhanced - clean_cpu
+    noise_rms = max(_tensor_rms(noise_cpu), 1.0e-6)
+    residual_rms = _tensor_rms(residual)
+    cancellation_pct = max(0.0, min(100.0, 100.0 * (1.0 - (residual_rms / noise_rms))))
+    noise_detected_pct = float(state_probs[:, 0].mean().item() * 100.0)
+    speech_detected_pct = float(state_probs[:, 1].mean().item() * 100.0)
+    mixed_detected_pct = float(state_probs[:, 2].mean().item() * 100.0)
+    vad_mean_pct = float(vad_pred_cpu.mean().item() * 100.0)
+    output_rms = _tensor_rms(enhanced)
+    input_rms = _tensor_rms(noisy_cpu)
+
+    enhanced_spec_for_metrics = torch.stft(
+        enhanced,
+        n_fft=stft_size,
+        hop_length=hop_size,
+        win_length=stft_size,
+        window=window,
+        center=True,
+        return_complex=True,
+    ).transpose(0, 1)
+    enhanced_mag = _compress_to_bands(enhanced_spec_for_metrics.abs().unsqueeze(0), config.bands).squeeze(0)
+    clean_spec_for_metrics = torch.stft(
+        clean_cpu,
+        n_fft=stft_size,
+        hop_length=hop_size,
+        win_length=stft_size,
+        window=window,
+        center=True,
+        return_complex=True,
+    ).transpose(0, 1)
+    clean_mag = _compress_to_bands(clean_spec_for_metrics.abs().unsqueeze(0), config.bands).squeeze(0)
+    noise_spec_for_metrics = torch.stft(
+        noise_cpu,
+        n_fft=stft_size,
+        hop_length=hop_size,
+        win_length=stft_size,
+        window=window,
+        center=True,
+        return_complex=True,
+    ).transpose(0, 1)
+    noise_mag = _compress_to_bands(noise_spec_for_metrics.abs().unsqueeze(0), config.bands).squeeze(0)
+
+    frame_output_energy = enhanced_mag.mean(dim=1)
+    frame_clean_energy = clean_mag.mean(dim=1)
+    frame_noise_energy = noise_mag.mean(dim=1)
+
+    # Preview metrics mix frame labels from the training example with a
+    # centered STFT render for WAV export, so lengths can differ slightly.
+    metric_frames = min(
+        int(frame_output_energy.shape[0]),
+        int(frame_clean_energy.shape[0]),
+        int(frame_noise_energy.shape[0]),
+        int(state_target.shape[0]),
     )
-    return checkpoint
+    frame_output_energy = frame_output_energy[:metric_frames]
+    frame_clean_energy = frame_clean_energy[:metric_frames]
+    frame_noise_energy = frame_noise_energy[:metric_frames]
+    state_target = state_target[:metric_frames]
+
+    voice_frames = state_target == 1
+    noise_frames = state_target == 0
+    mixed_frames = state_target == 2
+
+    def _mean_ratio(numerator: torch.Tensor, denominator: torch.Tensor, mask: torch.Tensor) -> float:
+        if int(mask.sum().item()) <= 0:
+            return 0.0
+        values = (numerator[mask] / denominator[mask].clamp_min(1.0e-6)).clamp(0.0, 4.0)
+        return float(values.mean().item())
+
+    def _noise_reduction(mask: torch.Tensor) -> float:
+        if int(mask.sum().item()) <= 0:
+            return 0.0
+        values = 1.0 - (frame_output_energy[mask] / frame_noise_energy[mask].clamp_min(1.0e-6))
+        values = values.clamp(-1.0, 1.0)
+        return float(values.mean().item() * 100.0)
+
+    voice_preservation_pct = _mean_ratio(frame_output_energy, frame_clean_energy, voice_frames) * 100.0
+    mixed_voice_preservation_pct = _mean_ratio(frame_output_energy, frame_clean_energy, mixed_frames) * 100.0
+    noise_only_reduction_pct = _noise_reduction(noise_frames)
+    mixed_noise_reduction_pct = _noise_reduction(mixed_frames)
+
+    return {
+        "preview_sample_path": str(sample_path.resolve()),
+        "preview_noise_path": str(noise_path.resolve()),
+        "preview_voice_path": str(voice_path.resolve()),
+        "preview_output_path": str(output_path.resolve()),
+        "preview_mask_mean": float(mask_pred_cpu.mean().item()),
+        "preview_vad_mean_pct": vad_mean_pct,
+        "preview_cancellation_pct": cancellation_pct,
+        "preview_noise_detected_pct": noise_detected_pct,
+        "preview_speech_detected_pct": speech_detected_pct,
+        "preview_mixed_detected_pct": mixed_detected_pct,
+        "preview_voice_preservation_pct": voice_preservation_pct,
+        "preview_mixed_voice_preservation_pct": mixed_voice_preservation_pct,
+        "preview_noise_only_reduction_pct": noise_only_reduction_pct,
+        "preview_mixed_noise_reduction_pct": mixed_noise_reduction_pct,
+        "preview_input_rms": input_rms,
+        "preview_output_rms": output_rms,
+        "preview_noise_rms": noise_rms,
+        "preview_residual_rms": residual_rms,
+    }
 
 
-def _load_existing_history(summary_path: Path) -> list[dict[str, float]]:
-    if not summary_path.exists():
-        return []
-    try:
-        summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
-    history = summary.get("history")
-    return history if isinstance(history, list) else []
+def _compress_to_freq_bins(mask: torch.Tensor, freq_bins: int) -> torch.Tensor:
+    if mask.shape[-1] == freq_bins:
+        return mask
+    resized = F.interpolate(
+        mask.unsqueeze(0).unsqueeze(0),
+        size=(mask.shape[0], freq_bins),
+        mode="bilinear",
+        align_corners=False,
+    )
+    return resized.squeeze(0).squeeze(0)
 
 
-def load_compatible_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) -> tuple[list[str], list[str]]:
-    model_state = model.state_dict()
-    compatible: dict[str, torch.Tensor] = {}
-    skipped_missing: list[str] = []
-    skipped_shape: list[str] = []
-
-    for key, value in state_dict.items():
-        if key not in model_state:
-            skipped_missing.append(key)
-            continue
-        if model_state[key].shape != value.shape:
-            skipped_shape.append(key)
-            continue
-        compatible[key] = value
-
-    model_state.update(compatible)
-    model.load_state_dict(model_state)
-    return skipped_missing, skipped_shape
+def _build_centered_features(waveform: torch.Tensor, bands: int, stft_size: int, hop_size: int) -> torch.Tensor:
+    window = torch.hann_window(stft_size)
+    noisy_spec = torch.stft(
+        waveform,
+        n_fft=stft_size,
+        hop_length=hop_size,
+        win_length=stft_size,
+        window=window,
+        center=True,
+        return_complex=True,
+    ).transpose(0, 1)
+    noisy_mag = noisy_spec.abs().unsqueeze(0)
+    return torch.log1p(_compress_to_bands(noisy_mag, bands)).squeeze(0)
 
 
-def train_gpu_model(
+def train_gpu_supervised_model(
     speech_dir: Path,
     noise_dir: Path,
     output_dir: Path,
@@ -346,6 +441,11 @@ def train_gpu_model(
     vad_negative_snr_db: float,
     vad_energy_threshold: float,
     vad_loss_weight: float,
+    state_loss_weight: float,
+    state_noise_energy_threshold: float,
+    state_speech_dominant_snr_db: float,
+    state_noise_dominant_snr_db: float,
+    state_hidden_channels: int | None,
 ) -> dict[str, object]:
     if sample_rate_hz != 48_000:
         raise ValueError("the current trainer expects 48 kHz normalized WAV files")
@@ -361,6 +461,8 @@ def train_gpu_model(
         raise ValueError("low_speech_extra_max_db must be >= low_speech_extra_min_db")
     if vad_positive_snr_db <= vad_negative_snr_db:
         raise ValueError("vad_positive_snr_db must be greater than vad_negative_snr_db")
+    if state_speech_dominant_snr_db <= state_noise_dominant_snr_db:
+        raise ValueError("state_speech_dominant_snr_db must be greater than state_noise_dominant_snr_db")
 
     speech_files = list_wav_files(speech_dir)
     base_noise_files = list_wav_files(noise_dir)
@@ -382,7 +484,7 @@ def train_gpu_model(
     device = choose_training_device(force_device=device_name, allow_cpu=allow_cpu)
     segment_samples = int(sample_rate_hz * clip_seconds)
 
-    dataset = NoisySpeechDataset(
+    dataset = SupervisedNoisySpeechDataset(
         speech_files=speech_files,
         noise_files=noise_files,
         segment_samples=segment_samples,
@@ -402,6 +504,9 @@ def train_gpu_model(
         vad_positive_snr_db=vad_positive_snr_db,
         vad_negative_snr_db=vad_negative_snr_db,
         vad_energy_threshold=vad_energy_threshold,
+        state_noise_energy_threshold=state_noise_energy_threshold,
+        state_speech_dominant_snr_db=state_speech_dominant_snr_db,
+        state_noise_dominant_snr_db=state_noise_dominant_snr_db,
         seed=seed,
     )
     dataloader = DataLoader(
@@ -414,7 +519,7 @@ def train_gpu_model(
     )
 
     torch.manual_seed(seed)
-    model = WireDeckVoiceDenoiser(config).to(device)
+    model = WireDeckSupervisedVoiceDenoiser(config, state_hidden_channels=state_hidden_channels).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     start_epoch = 0
     summary_path = output_dir / "training_summary.json"
@@ -451,7 +556,6 @@ def train_gpu_model(
                 )
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
-
     best_mask_loss = float("inf")
     best_checkpoint: Path | None = None
 
@@ -460,24 +564,28 @@ def train_gpu_model(
         total_loss = 0.0
         total_mask_loss = 0.0
         total_vad_loss = 0.0
+        total_state_loss = 0.0
         batches = 0
 
-        for features, mask_target, vad_target in dataloader:
+        for features, mask_target, vad_target, state_target in dataloader:
             features = features.to(device=device, dtype=torch.float32, non_blocking=True)
             mask_target = mask_target.to(device=device, dtype=torch.float32, non_blocking=True)
             vad_target = vad_target.to(device=device, dtype=torch.float32, non_blocking=True)
+            state_target = state_target.to(device=device, dtype=torch.long, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            mask_pred, vad_pred = model(features)
+            mask_pred, vad_pred, state_logits = model(features)
             mask_loss = F.l1_loss(mask_pred, mask_target)
             vad_loss = F.binary_cross_entropy(vad_pred.clamp(1.0e-4, 1.0 - 1.0e-4), vad_target)
-            loss = mask_loss + vad_loss_weight * vad_loss
+            state_loss = F.cross_entropy(state_logits.reshape(-1, 3), state_target.reshape(-1))
+            loss = mask_loss + vad_loss_weight * vad_loss + state_loss_weight * state_loss
             loss.backward()
             optimizer.step()
 
             total_loss += float(loss.detach().cpu())
             total_mask_loss += float(mask_loss.detach().cpu())
             total_vad_loss += float(vad_loss.detach().cpu())
+            total_state_loss += float(state_loss.detach().cpu())
             batches += 1
 
         scheduler.step()
@@ -485,26 +593,57 @@ def train_gpu_model(
             "loss": total_loss / max(1, batches),
             "mask_loss": total_mask_loss / max(1, batches),
             "vad_loss": total_vad_loss / max(1, batches),
+            "state_loss": total_state_loss / max(1, batches),
             "learning_rate": float(scheduler.get_last_lr()[0]),
         }
+        model.eval()
+        preview_metrics = _render_preview(
+            model,
+            config,
+            device,
+            output_dir,
+            epoch,
+            dataset.build_preview(epoch),
+            stft_size=stft_size,
+            hop_size=hop_size,
+        )
+        metrics.update(preview_metrics)
         history.append(metrics)
         checkpoint = save_checkpoint(model, optimizer, output_dir, epoch, config, metrics)
         if metrics["mask_loss"] < best_mask_loss:
             best_mask_loss = metrics["mask_loss"]
             best_checkpoint = checkpoint
         print(
-            "[wiredeck-rnnoise] epoch {epoch:03d}/{epochs:03d} loss={loss:.5f} mask={mask:.5f} vad={vad:.5f} lr={lr:.6f}".format(
+            "[wiredeck-rnnoise] epoch {epoch:03d}/{epochs:03d} loss={loss:.5f} mask={mask:.5f} vad={vad:.5f} state={state:.5f} lr={lr:.6f} cancel={cancel:.2f}% noise_detected={noise_detected:.2f}%".format(
                 epoch=epoch,
                 epochs=start_epoch + epochs,
                 loss=metrics["loss"],
                 mask=metrics["mask_loss"],
                 vad=metrics["vad_loss"],
+                state=metrics["state_loss"],
                 lr=metrics["learning_rate"],
+                cancel=metrics["preview_cancellation_pct"],
+                noise_detected=metrics["preview_noise_detected_pct"],
+            )
+        )
+        print(
+            "[wiredeck-rnnoise] preview epoch {epoch:03d} vad={vad:.2f}% speech={speech:.2f}% mixed={mixed:.2f}% voice_preserve={voice_preserve:.2f}% noise_only_reduction={noise_reduction:.2f}% mixed_voice_preserve={mixed_voice:.2f}% mixed_noise_reduction={mixed_noise:.2f}% input_rms={input_rms:.6f} output_rms={output_rms:.6f}".format(
+                epoch=epoch,
+                vad=metrics["preview_vad_mean_pct"],
+                speech=metrics["preview_speech_detected_pct"],
+                mixed=metrics["preview_mixed_detected_pct"],
+                voice_preserve=metrics["preview_voice_preservation_pct"],
+                noise_reduction=metrics["preview_noise_only_reduction_pct"],
+                mixed_voice=metrics["preview_mixed_voice_preservation_pct"],
+                mixed_noise=metrics["preview_mixed_noise_reduction_pct"],
+                input_rms=metrics["preview_input_rms"],
+                output_rms=metrics["preview_output_rms"],
             )
         )
 
     summary = {
         "device": str(device),
+        "trainer": "train-gpu-supervised",
         "speech_files": len(speech_files),
         "noise_files": len(base_noise_files),
         "weighted_noise_files": len(noise_files),
@@ -539,7 +678,13 @@ def train_gpu_model(
         "vad_negative_snr_db": vad_negative_snr_db,
         "vad_energy_threshold": vad_energy_threshold,
         "vad_loss_weight": vad_loss_weight,
+        "state_loss_weight": state_loss_weight,
+        "state_noise_energy_threshold": state_noise_energy_threshold,
+        "state_speech_dominant_snr_db": state_speech_dominant_snr_db,
+        "state_noise_dominant_snr_db": state_noise_dominant_snr_db,
+        "state_hidden_channels": state_hidden_channels or config.hidden_channels,
         "initial_checkpoint": str(initial_checkpoint.resolve()) if initial_checkpoint is not None else None,
+        "preview_audio_dir": str((output_dir / "epoch_audio").resolve()),
         "history": history,
     }
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")

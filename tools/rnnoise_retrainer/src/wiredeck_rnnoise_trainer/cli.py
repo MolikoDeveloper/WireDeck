@@ -753,6 +753,80 @@ def cmd_train_gpu(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_train_gpu_supervised(args: argparse.Namespace) -> int:
+    try:
+        from wiredeck_rnnoise_trainer.gpu_model import WireDeckVoiceDenoiserConfig
+        from wiredeck_rnnoise_trainer.gpu_train_supervised import train_gpu_supervised_model
+    except ModuleNotFoundError as exc:
+        raise SystemExit("torch is required for GPU training commands; install project dependencies first") from exc
+
+    speech_dir = Path(args.speech_dir).resolve()
+    noise_dir = Path(args.noise_dir).resolve()
+    output_dir = Path(args.output).resolve()
+    initial_checkpoint = Path(args.initial_checkpoint).resolve() if args.initial_checkpoint else None
+    speech_dir = ensure_exists(speech_dir, "normalized speech directory")
+    noise_dir = ensure_exists(noise_dir, "normalized noise directory")
+    if initial_checkpoint is not None:
+        initial_checkpoint = ensure_exists(initial_checkpoint, "initial gpu checkpoint")
+
+    config = WireDeckVoiceDenoiserConfig(
+        bands=args.bands,
+        channels=args.channels,
+        hidden_channels=args.hidden_channels,
+        residual_blocks=args.residual_blocks,
+        kernel_time=args.kernel_time,
+        kernel_freq=args.kernel_freq,
+        lookahead_frames=args.lookahead_frames,
+    )
+    summary = train_gpu_supervised_model(
+        speech_dir=speech_dir,
+        noise_dir=noise_dir,
+        output_dir=output_dir,
+        config=config,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.lr,
+        samples_per_epoch=args.samples_per_epoch,
+        sample_rate_hz=args.sample_rate_hz,
+        clip_seconds=args.clip_seconds,
+        stft_size=args.stft_size,
+        hop_size=args.hop_size,
+        num_workers=args.num_workers,
+        device_name=args.device,
+        allow_cpu=args.allow_cpu,
+        initial_checkpoint=initial_checkpoint,
+        seed=args.seed,
+        contrib_repeat=args.contrib_repeat,
+        synthetic_repeat=args.synthetic_repeat,
+        foreground_repeat=args.foreground_repeat,
+        background_repeat=args.background_repeat,
+        musan_repeat=args.musan_repeat,
+        speech_noise_repeat=args.speech_noise_repeat,
+        clean_probability=args.clean_probability,
+        noise_only_probability=args.noise_only_probability,
+        snr_min_db=args.snr_min_db,
+        snr_max_db=args.snr_max_db,
+        speech_gain_min_db=args.speech_gain_min_db,
+        speech_gain_max_db=args.speech_gain_max_db,
+        low_speech_probability=args.low_speech_probability,
+        low_speech_extra_min_db=args.low_speech_extra_min_db,
+        low_speech_extra_max_db=args.low_speech_extra_max_db,
+        vad_positive_snr_db=args.vad_positive_snr_db,
+        vad_negative_snr_db=args.vad_negative_snr_db,
+        vad_energy_threshold=args.vad_energy_threshold,
+        vad_loss_weight=args.vad_loss_weight,
+        state_loss_weight=args.state_loss_weight,
+        state_noise_energy_threshold=args.state_noise_energy_threshold,
+        state_speech_dominant_snr_db=args.state_speech_dominant_snr_db,
+        state_noise_dominant_snr_db=args.state_noise_dominant_snr_db,
+        state_hidden_channels=args.state_hidden_channels,
+    )
+    print(f"[wiredeck-rnnoise] device: {summary['device']}")
+    print(f"[wiredeck-rnnoise] best checkpoint: {summary['best_checkpoint']}")
+    print(f"[wiredeck-rnnoise] summary: {output_dir / 'training_summary.json'}")
+    return 0
+
+
 def cmd_denoise_audio(args: argparse.Namespace) -> int:
     try:
         from wiredeck_rnnoise_trainer.gpu_infer import denoise_audio_file
@@ -995,6 +1069,56 @@ def build_parser() -> argparse.ArgumentParser:
     train_gpu_parser.add_argument("--vad-energy-threshold", type=float, default=0.02, help="minimum clean speech band energy for VAD supervision")
     train_gpu_parser.add_argument("--vad-loss-weight", type=float, default=0.5, help="relative weight of the VAD loss during training")
     train_gpu_parser.set_defaults(func=cmd_train_gpu)
+
+    train_gpu_supervised_parser = subparsers.add_parser("train-gpu-supervised", help="train the GPU denoiser with extra frame-state supervision")
+    train_gpu_supervised_parser.add_argument("speech_dir", help="directory with normalized speech WAV files")
+    train_gpu_supervised_parser.add_argument("noise_dir", help="directory with normalized noise WAV files")
+    train_gpu_supervised_parser.add_argument("output", help="training output directory")
+    train_gpu_supervised_parser.add_argument("--epochs", type=int, default=20)
+    train_gpu_supervised_parser.add_argument("--batch-size", type=int, default=16)
+    train_gpu_supervised_parser.add_argument("--samples-per-epoch", type=int, default=2048)
+    train_gpu_supervised_parser.add_argument("--clip-seconds", type=float, default=2.0)
+    train_gpu_supervised_parser.add_argument("--lr", type=float, default=2e-4)
+    train_gpu_supervised_parser.add_argument("--num-workers", type=int, default=2)
+    train_gpu_supervised_parser.add_argument("--device", help="explicit torch device, e.g. cuda, cuda:0, mps")
+    train_gpu_supervised_parser.add_argument("--allow-cpu", action="store_true", help="allow CPU fallback if no GPU backend is available")
+    train_gpu_supervised_parser.add_argument("--initial-checkpoint", help="resume GPU training from an existing .pt checkpoint")
+    train_gpu_supervised_parser.add_argument("--seed", type=int, default=0)
+    train_gpu_supervised_parser.add_argument("--bands", type=int, default=64)
+    train_gpu_supervised_parser.add_argument("--channels", type=int, default=48)
+    train_gpu_supervised_parser.add_argument("--hidden-channels", type=int, default=96)
+    train_gpu_supervised_parser.add_argument("--residual-blocks", type=int, default=6)
+    train_gpu_supervised_parser.add_argument("--kernel-time", type=int, default=5)
+    train_gpu_supervised_parser.add_argument("--kernel-freq", type=int, default=3)
+    train_gpu_supervised_parser.add_argument("--lookahead-frames", type=int, default=2)
+    train_gpu_supervised_parser.add_argument("--sample-rate-hz", type=int, default=48_000)
+    train_gpu_supervised_parser.add_argument("--stft-size", type=int, default=512)
+    train_gpu_supervised_parser.add_argument("--hop-size", type=int, default=128)
+    train_gpu_supervised_parser.add_argument("--contrib-repeat", type=int, default=5)
+    train_gpu_supervised_parser.add_argument("--synthetic-repeat", type=int, default=5)
+    train_gpu_supervised_parser.add_argument("--foreground-repeat", type=int, default=2)
+    train_gpu_supervised_parser.add_argument("--background-repeat", type=int, default=1)
+    train_gpu_supervised_parser.add_argument("--musan-repeat", type=int, default=1)
+    train_gpu_supervised_parser.add_argument("--speech-noise-repeat", type=int, default=4)
+    train_gpu_supervised_parser.add_argument("--clean-probability", type=float, default=0.0)
+    train_gpu_supervised_parser.add_argument("--noise-only-probability", type=float, default=0.15)
+    train_gpu_supervised_parser.add_argument("--snr-min-db", type=float, default=-5.0)
+    train_gpu_supervised_parser.add_argument("--snr-max-db", type=float, default=20.0)
+    train_gpu_supervised_parser.add_argument("--speech-gain-min-db", type=float, default=-18.0)
+    train_gpu_supervised_parser.add_argument("--speech-gain-max-db", type=float, default=3.0)
+    train_gpu_supervised_parser.add_argument("--low-speech-probability", type=float, default=0.35)
+    train_gpu_supervised_parser.add_argument("--low-speech-extra-min-db", type=float, default=-18.0)
+    train_gpu_supervised_parser.add_argument("--low-speech-extra-max-db", type=float, default=-6.0)
+    train_gpu_supervised_parser.add_argument("--vad-positive-snr-db", type=float, default=3.0)
+    train_gpu_supervised_parser.add_argument("--vad-negative-snr-db", type=float, default=-6.0)
+    train_gpu_supervised_parser.add_argument("--vad-energy-threshold", type=float, default=0.02)
+    train_gpu_supervised_parser.add_argument("--vad-loss-weight", type=float, default=0.5)
+    train_gpu_supervised_parser.add_argument("--state-loss-weight", type=float, default=0.2, help="relative weight of the auxiliary frame-state loss")
+    train_gpu_supervised_parser.add_argument("--state-noise-energy-threshold", type=float, default=0.01, help="minimum per-frame noise band energy used to label a frame as noise-present")
+    train_gpu_supervised_parser.add_argument("--state-speech-dominant-snr-db", type=float, default=6.0, help="per-frame SNR threshold above which speech-dominant frames become the speech class")
+    train_gpu_supervised_parser.add_argument("--state-noise-dominant-snr-db", type=float, default=-3.0, help="per-frame SNR threshold below which frames become the noise class")
+    train_gpu_supervised_parser.add_argument("--state-hidden-channels", type=int, help="hidden width for the auxiliary supervision head; defaults to hidden-channels")
+    train_gpu_supervised_parser.set_defaults(func=cmd_train_gpu_supervised)
 
     denoise_audio_parser = subparsers.add_parser("denoise-audio", help="run offline denoise on a noisy audio file using a GPU checkpoint")
     denoise_audio_parser.add_argument("checkpoint", help="path to a trained .pt checkpoint")
