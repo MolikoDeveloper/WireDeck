@@ -665,7 +665,6 @@ wd_cuda_backend_run_model(
   float mask_mean = 0.0f;
   int band_index;
   float* mask_values;
-  float* vad_values;
 
   if (!backend || !session || !model || !features) {
     wd_backend_error(error_message, error_message_size, "invalid CUDA model run state", NULL);
@@ -725,25 +724,18 @@ wd_cuda_backend_run_model(
   if (!wd_launch_conv2d(backend, session, "mask_head.2.weight", "mask_head.2.bias", backend->a_device_ptr, backend->mask_device_ptr, channels, one, frames, bands, 1, 1, error_message, error_message_size)) return 0;
   if (!wd_launch_sigmoid(backend, session, backend->mask_device_ptr, backend->mask_device_ptr, total_mask_values, error_message, error_message_size)) return 0;
 
-  if (!wd_launch_groupnorm_silu(backend, session, "vad_head.0.weight", "vad_head.0.bias", backend->x_device_ptr, backend->a_device_ptr, channels, frames, bands, error_message, error_message_size)) return 0;
-  if (!wd_launch_conv2d(backend, session, "vad_head.2.weight", "vad_head.2.bias", backend->a_device_ptr, backend->vad_map_device_ptr, channels, one, frames, bands, 1, 1, error_message, error_message_size)) return 0;
-  if (!wd_launch_sigmoid(backend, session, backend->vad_map_device_ptr, backend->vad_map_device_ptr, total_mask_values, error_message, error_message_size)) return 0;
-  if (!wd_launch_mean_over_bands(backend, session, backend->vad_map_device_ptr, backend->vad_scalar_device_ptr, one, frames, bands, error_message, error_message_size)) return 0;
-
   cu_memcpy_dtoh = (WdCuMemcpyDtoHFn)dlsym(session->libcuda_handle, "cuMemcpyDtoH_v2");
   if (!cu_memcpy_dtoh) cu_memcpy_dtoh = (WdCuMemcpyDtoHFn)dlsym(session->libcuda_handle, "cuMemcpyDtoH");
   if (!cu_memcpy_dtoh) {
     wd_backend_error(error_message, error_message_size, "missing cuMemcpyDtoH", NULL);
     return 0;
   }
-  if (cu_memcpy_dtoh((void*)(uintptr_t)backend->mask_host_ptr, (CUdeviceptr)backend->mask_device_ptr, backend->mask_size_bytes) != CUDA_SUCCESS ||
-      cu_memcpy_dtoh((void*)(uintptr_t)backend->vad_host_ptr, (CUdeviceptr)backend->vad_scalar_device_ptr, backend->vad_size_bytes) != CUDA_SUCCESS) {
+  if (cu_memcpy_dtoh((void*)(uintptr_t)backend->mask_host_ptr, (CUdeviceptr)backend->mask_device_ptr, backend->mask_size_bytes) != CUDA_SUCCESS) {
     wd_backend_error(error_message, error_message_size, "could not download model outputs", NULL);
     return 0;
   }
 
   mask_values = (float*)(uintptr_t)backend->mask_host_ptr;
-  vad_values = (float*)(uintptr_t)backend->vad_host_ptr;
   if (out_mask_mean || out_mask) {
     size_t target_offset = (size_t)backend->target_frame_index * (size_t)bands;
     for (band_index = 0; band_index < (int)bands; ++band_index) mask_mean += mask_values[target_offset + (size_t)band_index];
@@ -755,7 +747,7 @@ wd_cuda_backend_run_model(
     *out_mask_mean = mask_mean / (float)bands;
   }
   if (out_vad) {
-    *out_vad = vad_values[backend->target_frame_index];
+    *out_vad = mask_mean / (float)bands;
   }
   if (error_message && error_message_size > 0) error_message[0] = '\0';
   return 1;

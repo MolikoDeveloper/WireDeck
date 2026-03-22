@@ -186,6 +186,7 @@ wd_frontend_deinit(WireDeckInferenceFrontend* frontend)
   free(frontend->spectrum_imag_history);
   free(frontend->synthesis_frame);
   free(frontend->ola_buffer);
+  free(frontend->ola_norm_buffer);
   free(frontend->shaped_mask);
   free(frontend->expanded_mask);
   memset(frontend, 0, sizeof(*frontend));
@@ -223,9 +224,10 @@ wd_frontend_prepare(WireDeckInferenceFrontend* frontend, const WireDeckWdgpMetad
   frontend->spectrum_imag_history = (float*)calloc(temporal_spectrum_count, sizeof(float));
   frontend->synthesis_frame = (float*)calloc((size_t)frontend->stft_size, sizeof(float));
   frontend->ola_buffer = (float*)calloc((size_t)(frontend->stft_size * 4), sizeof(float));
+  frontend->ola_norm_buffer = (float*)calloc((size_t)(frontend->stft_size * 4), sizeof(float));
   frontend->shaped_mask = (float*)calloc((size_t)frontend->bands, sizeof(float));
   frontend->expanded_mask = (float*)calloc((size_t)frontend->fft_bins, sizeof(float));
-  if (!frontend->window || !frontend->ring_buffer || !frontend->fft_magnitude || !frontend->fft_real || !frontend->fft_imag || !frontend->feature_history || !frontend->spectrum_real_history || !frontend->spectrum_imag_history || !frontend->synthesis_frame || !frontend->ola_buffer || !frontend->shaped_mask || !frontend->expanded_mask) {
+  if (!frontend->window || !frontend->ring_buffer || !frontend->fft_magnitude || !frontend->fft_real || !frontend->fft_imag || !frontend->feature_history || !frontend->spectrum_real_history || !frontend->spectrum_imag_history || !frontend->synthesis_frame || !frontend->ola_buffer || !frontend->ola_norm_buffer || !frontend->shaped_mask || !frontend->expanded_mask) {
     wd_frontend_deinit(frontend);
     return 0;
   }
@@ -349,11 +351,13 @@ wd_frontend_apply_mask_and_synthesize(WireDeckInferenceFrontend* frontend, const
   ola_size = frontend->stft_size * 4;
   {
     int write_base = frontend->ola_read_index;
-  for (n = 0; n < frontend->stft_size; ++n) {
-    int dst = (write_base + n) % ola_size;
-    frontend->ola_buffer[dst] += frontend->synthesis_frame[n];
-  }
-  frontend->ola_write_index = (write_base + frontend->hop_size) % ola_size;
+    for (n = 0; n < frontend->stft_size; ++n) {
+      int dst = (write_base + n) % ola_size;
+      float window_value = frontend->window[n];
+      frontend->ola_buffer[dst] += frontend->synthesis_frame[n];
+      frontend->ola_norm_buffer[dst] += window_value * window_value;
+    }
+    frontend->ola_write_index = (write_base + frontend->hop_size) % ola_size;
   }
 
   if (frontend->temporal_frame_count > 0) {
@@ -377,13 +381,21 @@ float
 wd_frontend_take_output_sample(WireDeckInferenceFrontend* frontend)
 {
   float sample;
+  float norm;
   int ola_size;
   if (!frontend || !frontend->ola_buffer || frontend->stft_size <= 0) {
     return 0.0f;
   }
   ola_size = frontend->stft_size * 4;
   sample = frontend->ola_buffer[frontend->ola_read_index];
+  norm = frontend->ola_norm_buffer ? frontend->ola_norm_buffer[frontend->ola_read_index] : 0.0f;
+  if (norm > 1.0e-6f) {
+    sample /= norm;
+  }
   frontend->ola_buffer[frontend->ola_read_index] = 0.0f;
+  if (frontend->ola_norm_buffer) {
+    frontend->ola_norm_buffer[frontend->ola_read_index] = 0.0f;
+  }
   frontend->ola_read_index = (frontend->ola_read_index + 1) % ola_size;
   return sample;
 }

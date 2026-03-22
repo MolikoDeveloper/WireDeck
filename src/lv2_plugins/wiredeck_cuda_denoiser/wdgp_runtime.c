@@ -212,6 +212,10 @@ wd_wdgp_validate_architecture(const WireDeckWdgpModel* model, char* error_messag
 {
   char tensor_name[96];
   int block_index;
+  const WireDeckWdgpTensorInfo* vad_head0_weight;
+  const WireDeckWdgpTensorInfo* vad_head0_bias;
+  const WireDeckWdgpTensorInfo* vad_head2_weight;
+  const WireDeckWdgpTensorInfo* vad_head2_bias;
 
   if (!model) {
     wd_runtime_error(error_message, error_message_size, "missing model", NULL);
@@ -238,9 +242,21 @@ wd_wdgp_validate_architecture(const WireDeckWdgpModel* model, char* error_messag
 
   if (!wd_wdgp_find_tensor(model, "bottleneck.2.weight") ||
       !wd_wdgp_find_tensor(model, "bottleneck.4.weight") ||
-      !wd_wdgp_find_tensor(model, "mask_head.2.weight") ||
-      !wd_wdgp_find_tensor(model, "vad_head.2.weight")) {
+      !wd_wdgp_find_tensor(model, "mask_head.2.weight")) {
     wd_runtime_error(error_message, error_message_size, "missing head or bottleneck tensors", NULL);
+    return 0;
+  }
+
+  vad_head0_weight = wd_wdgp_find_tensor(model, "vad_head.0.weight");
+  vad_head0_bias = wd_wdgp_find_tensor(model, "vad_head.0.bias");
+  vad_head2_weight = wd_wdgp_find_tensor(model, "vad_head.2.weight");
+  vad_head2_bias = wd_wdgp_find_tensor(model, "vad_head.2.bias");
+  if (!vad_head0_weight || !vad_head0_bias || !vad_head2_weight || !vad_head2_bias) {
+    wd_runtime_error(error_message, error_message_size, "missing latest VAD head tensors", NULL);
+    return 0;
+  }
+  if (vad_head0_weight->rank != 3 || vad_head0_bias->rank != 1 || vad_head2_weight->rank != 3 || vad_head2_bias->rank != 1) {
+    wd_runtime_error(error_message, error_message_size, "unsupported WDGP architecture: legacy VAD head is no longer supported", NULL);
     return 0;
   }
 

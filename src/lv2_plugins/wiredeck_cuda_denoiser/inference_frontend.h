@@ -29,6 +29,7 @@ typedef struct WireDeckInferenceFrontend {
   float* spectrum_imag_history;
   float* synthesis_frame;
   float* ola_buffer;
+  float* ola_norm_buffer;
   float* shaped_mask;
   float* expanded_mask;
 } WireDeckInferenceFrontend;

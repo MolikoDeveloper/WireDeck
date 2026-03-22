@@ -1,0 +1,291 @@
+Metadata-Version: 2.4
+Name: wiredeck-rnnoise-retrainer
+Version: 0.1.0
+Summary: Standalone RNNoise retraining and binary export pipeline for WireDeck
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.26
+Requires-Dist: torch>=2.2
+Requires-Dist: tqdm>=4.66
+
+# WireDeck RNNoise Retrainer
+
+Standalone tooling for retraining RNNoise-style denoisers in Python and exporting binary model artifacts that WireDeck can consume from Zig/Vulkan.
+
+This folder supports two related workflows:
+
+- Classic RNNoise retraining and export to `weights_blob.bin` using the upstream RNNoise PyTorch scripts shipped in `vendor/rnnoise`.
+- A WireDeck GPU-first denoiser that trains directly on normalized speech/noise corpora and exports a custom `.bin` model with `export-gpu-model`.
+
+## What This Tool Does
+
+- Lists and downloads curated speech datasets from `vendor/rnnoise/datasets.txt`.
+- Lists and downloads a curated noise set for denoiser training.
+- Normalizes archives or loose audio files into 48 kHz mono PCM WAV training corpora.
+- Trains the GPU-first WireDeck denoiser on speech and noise corpora.
+- Runs offline denoising for listening tests and VAD inspection.
+- Exports either:
+  - a classic RNNoise `weights_blob.bin`, or
+  - a WireDeck GPU `.bin` model.
+
+## Requirements
+
+- Python 3.10+
+- `pip`
+- `ffmpeg`
+- A C compiler such as `cc`, `gcc`, or `clang` for the classic RNNoise export path
+- PyTorch-compatible GPU backend for practical training speed (`cuda` or `mps`)
+
+## Installation
+
+```sh
+cd tools/rnnoise_retrainer
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -U pip
+pip install -e .
+```
+
+After installation, the CLI entrypoint is:
+
+```sh
+wiredeck-rnnoise -h
+```
+
+If you are running directly from the source tree during development, use:
+
+```sh
+PYTHONPATH=src python3 -m wiredeck_rnnoise_trainer.cli -h
+```
+
+## Recommended GPU-First Workflow
+
+### 1. Download clean speech datasets
+
+```sh
+wiredeck-rnnoise list-datasets
+wiredeck-rnnoise download-datasets ./data/speech_datasets
+```
+
+To download only a subset:
+
+```sh
+wiredeck-rnnoise download-datasets ./data/speech_datasets --limit 5
+```
+
+### 2. Download curated noise datasets
+
+```sh
+wiredeck-rnnoise list-noise-datasets
+wiredeck-rnnoise download-noise-datasets ./data/noise_datasets
+```
+
+The curated noise list includes:
+
+- `background_noise_v2.sw`
+- `foreground_noise_v2.sw`
+- `contrib_noise.sw`
+- `synthetic_noise.sw`
+- `musan.tar.gz`
+
+For better real-world robustness, include a mix of:
+
+- steady background noise: fans, HVAC, distant traffic, room hum
+- transient noise: keyboard hits, knocks, doors, clicks
+- human interference: crowd, office chatter, cafe ambience, TV, radio
+- hard distractors: music, streams, ads, other speakers
+
+### 3. Normalize the corpora
+
+Normalize speech archives or directories:
+
+```sh
+wiredeck-rnnoise prepare-speech-corpus \
+  ./data/speech_datasets \
+  ./data/normalized_speech
+```
+
+Normalize the noise side:
+
+```sh
+wiredeck-rnnoise prepare-audio-corpus \
+  ./data/noise_datasets \
+  ./data/normalized_noise
+```
+
+Both commands produce:
+
+- `audio/` with normalized `48 kHz`, mono, PCM WAV files
+- `manifest.json`
+
+### 4. Train the GPU-first denoiser
+
+Basic example:
+
+```sh
+wiredeck-rnnoise train-gpu \
+  ./data/normalized_speech/audio \
+  ./data/normalized_noise/audio \
+  ./artifacts/gpu-run-001 \
+  --device cuda \
+  --epochs 20 \
+  --batch-size 16
+```
+
+This writes:
+
+- `./artifacts/gpu-run-001/checkpoints/wiredeck_gpu_epoch_XXX.pt`
+- `./artifacts/gpu-run-001/training_summary.json`
+
+### 5. Export the trained model to `.bin`
+
+Export the best or chosen checkpoint to a WireDeck GPU binary:
+
+```sh
+wiredeck-rnnoise export-gpu-model \
+  ./artifacts/gpu-run-001/wiredeck_gpu_model.bin \
+  --checkpoint ./artifacts/gpu-run-001/checkpoints/wiredeck_gpu_epoch_020.pt
+```
+
+That `.bin` is the binary artifact consumed by the WireDeck GPU runtime.
+
+### 6. Run an offline listening test
+
+```sh
+wiredeck-rnnoise denoise-audio \
+  ./artifacts/gpu-run-001/checkpoints/wiredeck_gpu_epoch_020.pt \
+  /path/to/noisy_input.wav \
+  ./artifacts/gpu-run-001/noisy_input_denoised.wav \
+  --device cuda
+```
+
+To save the frame-by-frame VAD summary:
+
+```sh
+wiredeck-rnnoise denoise-audio \
+  ./artifacts/gpu-run-001/checkpoints/wiredeck_gpu_epoch_020.pt \
+  /path/to/noisy_input.wav \
+  ./artifacts/gpu-run-001/noisy_input_denoised.wav \
+  --device cuda \
+  --vad-json ./artifacts/gpu-run-001/noisy_input_vad.json
+```
+
+## Improving Speech Detection Against Loud Non-Speech
+
+If loud noise is still being treated as speech, train with more aggressive VAD supervision and more speech-like noise:
+
+```sh
+wiredeck-rnnoise train-gpu \
+  ./data/normalized_speech/audio \
+  ./data/normalized_noise/audio \
+  ./artifacts/gpu-run-robust-vad \
+  --device cuda \
+  --epochs 30 \
+  --batch-size 16 \
+  --speech-noise-repeat 4 \
+  --noise-only-probability 0.15 \
+  --snr-min-db -8 \
+  --snr-max-db 18 \
+  --vad-negative-snr-db -6 \
+  --vad-positive-snr-db 3 \
+  --vad-loss-weight 0.5
+```
+
+Important knobs:
+
+- `--speech-noise-repeat`: oversamples noise clips that look like background speech, crowd, office, TV, or radio.
+- `--noise-only-probability`: forces some batches to contain no target speech at all, which teaches the VAD that loud noise alone is not speech.
+- `--vad-negative-snr-db` and `--vad-positive-snr-db`: make the VAD depend on speech dominance over noise, not just amplitude.
+- `--clean-probability`: keeps some clean-speech examples so the model preserves voice identity.
+
+Practical advice:
+
+- Add more negative examples that are loud but non-speech.
+- Add more competing human audio in the noise corpus if false positives come from background voices.
+- Listen to short offline denoise results before doing full retrains.
+- Inspect `vad_json` outputs on difficult clips instead of judging only by `vad_mean`.
+
+## Model Sweep for Low-Latency Variants
+
+To compare several lightweight presets:
+
+```sh
+python3 tools/rnnoise_retrainer/scripts/train_model_sweep.py \
+  tools/rnnoise_retrainer/data/normalized_speech/audio \
+  tools/rnnoise_retrainer/data/normalized_noise/audio \
+  tools/rnnoise_retrainer/artifacts/sweeps/low_latency_v1 \
+  --device cuda:0 \
+  --epochs 20 \
+  --batch-size 16 \
+  --samples-per-epoch 2048 \
+  --num-workers 2
+```
+
+Included presets:
+
+- `tiny_rt`
+- `small_rt`
+- `balanced_rt`
+- `baseline_full`
+
+Outputs:
+
+- `sweep_summary.json`
+- `sweep_summary.md`
+- one directory per preset with checkpoint, export, and metrics
+
+## Classic RNNoise Workflow
+
+The legacy RNNoise-compatible path is still available when you need upstream-style `weights_blob.bin`.
+
+### Generate features
+
+```sh
+wiredeck-rnnoise generate-features \
+  /path/to/speech.wav \
+  /path/to/noise.wav \
+  ./artifacts/run-001/features.f32 \
+  --count 2000
+```
+
+### Train the classic RNNoise model
+
+```sh
+wiredeck-rnnoise train \
+  ./artifacts/run-001/features.f32 \
+  ./artifacts/run-001 \
+  --epochs 50 \
+  --batch-size 128
+```
+
+### Export to `weights_blob.bin`
+
+```sh
+wiredeck-rnnoise export-blob \
+  ./artifacts/run-001/checkpoints/rnnoise_50.pth \
+  ./artifacts/run-001/export
+```
+
+This produces:
+
+- `rnnoise_data.c`
+- `rnnoise_data.h`
+- `weights_blob.bin`
+- `manifest.json`
+
+If needed, install the exported blob into another directory:
+
+```sh
+wiredeck-rnnoise install-blob \
+  ./artifacts/run-001/export/weights_blob.bin \
+  ./artifacts/run-001/export/manifest.json \
+  ../../generated/rnnoise
+```
+
+## Notes
+
+- The classic trainer uses the upstream scripts in `vendor/rnnoise/torch/rnnoise`.
+- The classic feature extractor uses `vendor/rnnoise/src/dump_features.c`.
+- Speech dataset URLs come from `vendor/rnnoise/datasets.txt`.
+- The GPU-first model definition lives in `src/wiredeck_rnnoise_trainer/gpu_model.py`.
+- The GPU binary export path lives in `src/wiredeck_rnnoise_trainer/gpu_export.py`.

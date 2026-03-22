@@ -18,3 +18,8 @@
 # OS cruft
 .DS_Store
 Thumbs.db
+
+#python
+tools/rnnoise_retrainer/data/
+tools/rnnoise_retrainer/.venv/
+tools/rnnoise_retrainer/artifacts/
