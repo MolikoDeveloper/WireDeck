@@ -113,6 +113,24 @@ pub const UiShell = struct {
         };
 
         while (true) {
+            const ui_state = imgui.wiredeck_imgui_pump_events(bridge);
+            if (ui_state < 0) {
+                std.debug.print("UI event pump failed: {s}\n", .{imgui.wiredeck_imgui_last_error() orelse "unknown error"});
+                return error.UiFrameFailed;
+            }
+            if (ui_state == 0) break;
+            if (ui_state == 1) {
+                app.pumpLiveAudio() catch {};
+                app.maybeRefreshAudioInventory();
+                _ = lv2_ui_manager.pump(app, state_store);
+                app.reconcileOutputRoutingIfNeeded();
+                platform.nextFrame();
+                if (config.max_frames) |max_frames| {
+                    if (platform.frame_count >= max_frames) break;
+                }
+                continue;
+            }
+
             app.pumpLiveAudio() catch {};
             app.maybeRefreshAudioInventory();
             const lv2_ui_changed = lv2_ui_manager.pump(app, state_store);

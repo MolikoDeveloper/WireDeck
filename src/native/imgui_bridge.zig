@@ -163,6 +163,7 @@ pub const UiSnapshot = extern struct {
 pub const Bridge = opaque {};
 
 pub extern fn wiredeck_imgui_create(window: *c.SDL_Window) ?*Bridge;
+pub extern fn wiredeck_imgui_pump_events(bridge: *Bridge) c_int;
 pub extern fn wiredeck_imgui_render_frame(bridge: *Bridge, snapshot: *UiSnapshot) c_int;
 pub extern fn wiredeck_imgui_set_tray_autostart_enabled(bridge: *Bridge, enabled: c_int) void;
 pub extern fn wiredeck_imgui_take_tray_autostart_request(bridge: *Bridge, enabled: *c_int) c_int;

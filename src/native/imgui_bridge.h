@@ -171,6 +171,7 @@ typedef struct WireDeckImGuiBridge WireDeckImGuiBridge;
 
 WireDeckImGuiBridge* wiredeck_imgui_create(SDL_Window* window);
 int wiredeck_imgui_render_frame(WireDeckImGuiBridge* bridge, WireDeckUiSnapshot* snapshot);
+int wiredeck_imgui_pump_events(WireDeckImGuiBridge* bridge);
 void wiredeck_imgui_set_tray_autostart_enabled(WireDeckImGuiBridge* bridge, int enabled);
 int wiredeck_imgui_take_tray_autostart_request(WireDeckImGuiBridge* bridge, int* enabled);
 int wiredeck_imgui_convert_icon_path(const char* source_path, char* out_path, size_t out_path_len);

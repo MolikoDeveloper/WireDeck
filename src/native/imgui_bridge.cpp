@@ -2794,30 +2794,6 @@ extern "C" int wiredeck_imgui_render_frame(WireDeckImGuiBridge* bridge, WireDeck
         return -1;
     }
 
-    SDL_Event event;
-    while (SDL_PollEvent(&event)) {
-        ImGui_ImplSDL3_ProcessEvent(&event);
-        if (event.type == SDL_EVENT_QUIT) {
-            return 0;
-        }
-        if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED && event.window.windowID == SDL_GetWindowID(bridge->window)) {
-            if (bridge->tray != nullptr) {
-                set_window_visible(bridge, false);
-                continue;
-            }
-            return 0;
-        }
-    }
-
-    if (bridge->pending_quit) {
-        return 0;
-    }
-
-    if (is_window_hidden(bridge->window) || (SDL_GetWindowFlags(bridge->window) & SDL_WINDOW_MINIMIZED) != 0) {
-        SDL_Delay(50);
-        return 1;
-    }
-
     int fb_width = 0;
     int fb_height = 0;
     SDL_GetWindowSize(bridge->window, &fb_width, &fb_height);
@@ -2863,6 +2839,38 @@ extern "C" int wiredeck_imgui_render_frame(WireDeckImGuiBridge* bridge, WireDeck
 
     bridge->frame_index += 1;
     return 1;
+}
+
+extern "C" int wiredeck_imgui_pump_events(WireDeckImGuiBridge* bridge) {
+    if (bridge == nullptr) {
+        set_error("wiredeck_imgui_pump_events received invalid arguments");
+        return -1;
+    }
+
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+        ImGui_ImplSDL3_ProcessEvent(&event);
+        if (event.type == SDL_EVENT_QUIT) {
+            return 0;
+        }
+        if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED && event.window.windowID == SDL_GetWindowID(bridge->window)) {
+            if (bridge->tray != nullptr) {
+                set_window_visible(bridge, false);
+                continue;
+            }
+            return 0;
+        }
+    }
+
+    if (bridge->pending_quit) {
+        return 0;
+    }
+
+    if (is_window_hidden(bridge->window) || (SDL_GetWindowFlags(bridge->window) & SDL_WINDOW_MINIMIZED) != 0) {
+        return 1;
+    }
+
+    return 2;
 }
 
 extern "C" void wiredeck_imgui_set_tray_autostart_enabled(WireDeckImGuiBridge* bridge, int enabled) {
