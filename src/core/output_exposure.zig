@@ -117,6 +117,7 @@ pub const OutputExposureManager = struct {
     output_buses: std.ArrayList(ManagedOutputBus),
     bus_destination_loopbacks: std.ArrayList(ManagedBusDestinationLoopback),
     virtual_mics: std.ArrayList(ManagedVirtualMic),
+    default_virtual_mic_source_name: ?[]u8,
     did_initial_recovery_cleanup: bool,
 
     pub fn init(allocator: std.mem.Allocator) OutputExposureManager {
@@ -130,6 +131,7 @@ pub const OutputExposureManager = struct {
             .output_buses = .empty,
             .bus_destination_loopbacks = .empty,
             .virtual_mics = .empty,
+            .default_virtual_mic_source_name = null,
             .did_initial_recovery_cleanup = false,
         };
     }
@@ -147,6 +149,7 @@ pub const OutputExposureManager = struct {
         for (self.virtual_mics.items) |*mic| mic.deinit(self.allocator);
         self.virtual_mics.deinit(self.allocator);
         self.routes.deinit(self.allocator);
+        if (self.default_virtual_mic_source_name) |value| self.allocator.free(value);
     }
 
     pub fn start(self: *OutputExposureManager) !void {
@@ -223,6 +226,9 @@ pub const OutputExposureManager = struct {
         try self.syncBusDestinationLoopbacks(desired_bus_destination_loopbacks.items, pulsectx);
         try self.replaceRoutes(desired_routes.items);
         try self.syncVirtualMics(desired_mics.items, pulsectx);
+        self.syncDefaultVirtualMicSource() catch |err| {
+            std.log.warn("virtual mic default source sync failed: {s}", .{@errorName(err)});
+        };
     }
 
     fn recoverFromStaleModules(self: *OutputExposureManager, pulsectx: *pulse.PulseContext) !void {
@@ -338,6 +344,26 @@ pub const OutputExposureManager = struct {
         }
     }
 
+    fn syncDefaultVirtualMicSource(self: *OutputExposureManager) !void {
+        const preferred_source_name = if (self.virtual_mics.items.len > 0) self.virtual_mics.items[0].source_name else null;
+        if (preferred_source_name == null) {
+            if (self.default_virtual_mic_source_name) |value| {
+                self.allocator.free(value);
+                self.default_virtual_mic_source_name = null;
+            }
+            return;
+        }
+
+        if (self.default_virtual_mic_source_name) |value| {
+            if (std.mem.eql(u8, value, preferred_source_name.?)) return;
+            self.allocator.free(value);
+            self.default_virtual_mic_source_name = null;
+        }
+
+        try setPipeWireDefaultAudioSource(self.allocator, preferred_source_name.?);
+        self.default_virtual_mic_source_name = try self.allocator.dupe(u8, preferred_source_name.?);
+    }
+
     fn unloadAllOutputBuses(self: *OutputExposureManager) !void {
         const pulsectx = try pulse.PulseContext.init(self.allocator);
         defer pulsectx.deinit();
@@ -357,6 +383,31 @@ pub const OutputExposureManager = struct {
 
 pub fn allocOutputSinkName(allocator: std.mem.Allocator, bus_id: []const u8) ![]u8 {
     return allocSafeName(allocator, output_sink_prefix, bus_id);
+}
+
+pub fn allocVirtualMicSourceName(allocator: std.mem.Allocator, bus_id: []const u8) ![]u8 {
+    return allocSafeName(allocator, remap_source_prefix, bus_id);
+}
+
+pub fn cleanupDefaultAudioSource(allocator: std.mem.Allocator) !void {
+    const current = (try currentDefaultAudioSourceName(allocator)) orelse return;
+    defer allocator.free(current);
+
+    if (!std.mem.startsWith(u8, current, remap_source_prefix)) return;
+
+    const pulsectx = try pulse.PulseContext.init(allocator);
+    defer pulsectx.deinit();
+
+    const snapshot = try pulsectx.snapshot(allocator);
+    defer pulse.freeSnapshot(allocator, snapshot);
+
+    for (snapshot.sources) |source| {
+        const source_name = source.name orelse continue;
+        if (source.monitor_of_sink != null) continue;
+        if (std.mem.startsWith(u8, source_name, remap_source_prefix)) continue;
+        try setPipeWireDefaultAudioSource(allocator, source_name);
+        return;
+    }
 }
 
 fn serverMain(manager: *OutputExposureManager) void {
@@ -1022,7 +1073,7 @@ fn loadOutputBus(
         .{ description, description },
     );
     defer manager.allocator.free(sink_props);
-    const sink_args = try std.fmt.allocPrint(manager.allocator, "sink_name={s} sink_properties={s}", .{ sink_name, sink_props });
+    const sink_args = try std.fmt.allocPrint(manager.allocator, "sink_name={s} sink_properties={s} rate=48000 channels=2", .{ sink_name, sink_props });
     defer manager.allocator.free(sink_args);
     const module_id = try pulsectx.loadModule("module-null-sink", sink_args);
 
@@ -1042,7 +1093,7 @@ fn loadBusDestinationLoopback(
     defer manager.allocator.free(source_name);
     const loopback_args = try std.fmt.allocPrint(
         manager.allocator,
-        "source={s} sink={s} source_dont_move=true sink_dont_move=true",
+        "source={s} sink={s} source_dont_move=true sink_dont_move=true latency_msec=10 adjust_time=0",
         .{ source_name, desired.target_sink_name },
     );
     defer manager.allocator.free(loopback_args);
@@ -1090,8 +1141,8 @@ fn loadVirtualMic(
     defer manager.allocator.free(source_props);
     const remap_args = try std.fmt.allocPrint(
         manager.allocator,
-        "source_name={s} master={s}.monitor source_properties={s}",
-        .{ source_name, sink_name, source_props },
+        "source_name={s} master={s} source_properties={s}",
+        .{ source_name, desired.target_monitor_source_name, source_props },
     );
     defer manager.allocator.free(remap_args);
     const remap_source_module_id = try pulsectx.loadModule("module-remap-source", remap_args);
@@ -1145,6 +1196,75 @@ fn escapePactlValue(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
         try out.append(allocator, char);
     }
     return out.toOwnedSlice(allocator);
+}
+
+fn setPipeWireDefaultAudioSource(allocator: std.mem.Allocator, source_name: []const u8) !void {
+    const configured_value = try std.fmt.allocPrint(allocator, "{{ \"name\": \"{s}\" }}", .{source_name});
+    defer allocator.free(configured_value);
+    const effective_value = try std.fmt.allocPrint(allocator, "{{\"name\":\"{s}\"}}", .{source_name});
+    defer allocator.free(effective_value);
+
+    try runHostCommand(allocator, &.{ "pw-metadata", "-n", "default", "0", "default.configured.audio.source", configured_value });
+    try runHostCommand(allocator, &.{ "pw-metadata", "-n", "default", "0", "default.audio.source", effective_value });
+}
+
+fn currentDefaultAudioSourceName(allocator: std.mem.Allocator) !?[]u8 {
+    const output = try runHostCommandCapture(allocator, &.{ "pw-metadata", "-n", "default" });
+    defer allocator.free(output);
+
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "key:'default.audio.source'") == null) continue;
+        const marker = "value:'";
+        const start = std.mem.indexOf(u8, line, marker) orelse continue;
+        const value_start = start + marker.len;
+        const value_end = std.mem.lastIndexOfScalar(u8, line, '\'') orelse continue;
+        if (value_end <= value_start) continue;
+        const json = line[value_start..value_end];
+        const name_marker = "\"name\":\"";
+        const name_start = std.mem.indexOf(u8, json, name_marker) orelse continue;
+        const source_start = name_start + name_marker.len;
+        const source_end_rel = std.mem.indexOfScalarPos(u8, json, source_start, '"') orelse continue;
+        const value = try allocator.dupe(u8, json[source_start..source_end_rel]);
+        return value;
+    }
+    return null;
+}
+
+fn runHostCommand(allocator: std.mem.Allocator, argv: []const []const u8) !void {
+    const output = try runHostCommandCapture(allocator, argv);
+    allocator.free(output);
+}
+
+fn runHostCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
+    const use_flatpak_host = std.process.hasEnvVarConstant("FLATPAK_ID");
+    const command_argv = if (use_flatpak_host) blk: {
+        const host_argv = try allocator.alloc([]const u8, argv.len + 2);
+        host_argv[0] = "flatpak-spawn";
+        host_argv[1] = "--host";
+        @memcpy(host_argv[2..], argv);
+        break :blk host_argv;
+    } else argv;
+    defer if (use_flatpak_host) allocator.free(command_argv);
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = command_argv,
+        .max_output_bytes = 64 * 1024,
+    });
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| if (code != 0) {
+            allocator.free(result.stdout);
+            return error.HostCommandFailed;
+        },
+        else => {
+            allocator.free(result.stdout);
+            return error.HostCommandFailed;
+        },
+    }
+    return result.stdout;
 }
 
 fn wakeServer(port: u16) void {
