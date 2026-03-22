@@ -8,6 +8,7 @@ pub const PipewireContext = @import("core/pipewire.zig").PipewireContext;
 pub const PulseContext = @import("core/pulse.zig").PulseContext;
 pub const Binder = @import("core/binder.zig");
 pub const IconResolver = @import("core/icon_resolver.zig");
+pub const OutputExposure = @import("core/output_exposure.zig");
 pub const SdlPlatform = @import("platform/sdl.zig").SdlPlatform;
 pub const WindowConfig = @import("platform/window.zig").WindowConfig;
 pub const UiShell = @import("ui/shell.zig").UiShell;
