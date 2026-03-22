@@ -132,7 +132,13 @@ pub const PeakMonitor = struct {
         if (self.matchesSpecs(specs)) return;
         self.clearMetersLocked();
         for (specs) |spec| {
-            const meter = try self.createMeterLocked(spec);
+            const meter = self.createMeterLocked(spec) catch |err| switch (err) {
+                error.PulsePeakConnectFailed,
+                error.PulsePeakMonitorStreamFailed,
+                error.PulsePeakStreamCreateFailed,
+                => continue,
+                else => return err,
+            };
             try self.meters.append(self.allocator, meter);
         }
     }

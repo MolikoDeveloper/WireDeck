@@ -113,6 +113,9 @@ pub const UiShell = struct {
         };
 
         while (true) {
+            app.pumpLiveAudio() catch {};
+            app.maybeRefreshAudioInventory();
+            const lv2_ui_changed = lv2_ui_manager.pump(app, state_store);
             try ensureSnapshotCapacity(
                 allocator,
                 state_store,
@@ -129,9 +132,6 @@ pub const UiShell = struct {
                 &plugin_descriptors,
                 &snapshot,
             );
-            app.pumpLiveAudio() catch {};
-            app.maybeRefreshAudioInventory();
-            const lv2_ui_changed = lv2_ui_manager.pump(app, state_store);
             try rebuildUiSnapshot(state_store, &snapshot, &recent_event_labels, &ui_strings);
 
             const keep_running = imgui.wiredeck_imgui_render_frame(bridge, &snapshot);

@@ -156,6 +156,21 @@ pub const PulseContext = struct {
         if (self.failed or !request.success) return error.PulseMoveSinkInputFailed;
     }
 
+    pub fn moveSourceOutputToSource(self: *PulseContext, source_output_index: u32, source_index: u32) !void {
+        var request = OperationRequest{};
+        const start_ns = std.time.nanoTimestamp();
+        const op = c.pa_context_move_source_output_by_index(self.context, source_output_index, source_index, successCb, &request);
+        if (op == null) return error.PulseMoveSourceOutputFailed;
+        defer c.pa_operation_unref(op);
+
+        while (!request.done and !self.failed) {
+            if (deadlineReached(start_ns, operation_timeout_ns)) return error.PulseOperationTimedOut;
+            try self.iterateOnce();
+            std.Thread.sleep(poll_interval_ns);
+        }
+        if (self.failed or !request.success) return error.PulseMoveSourceOutputFailed;
+    }
+
     pub fn loadModule(self: *PulseContext, name: []const u8, argument: []const u8) !u32 {
         const name_z = try self.allocator.dupeZ(u8, name);
         defer self.allocator.free(name_z);
