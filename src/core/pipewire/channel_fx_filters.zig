@@ -49,7 +49,7 @@ pub const ChannelFxFilterManager = struct {
         manager: *ChannelFxFilterManager,
         runtime: *fx_runtime_mod.FxRuntime,
         thread_loop: *c.struct_pw_thread_loop,
-        filter: *c.struct_pw_filter,
+        filter: ?*c.struct_pw_filter = null,
         listener: c.struct_spa_hook = std.mem.zeroes(c.struct_spa_hook),
         registry: ?*c.struct_pw_registry = null,
         registry_listener: c.struct_spa_hook = std.mem.zeroes(c.struct_spa_hook),
@@ -70,28 +70,40 @@ pub const ChannelFxFilterManager = struct {
         out_right: ?*anyopaque = null,
 
         fn deinit(self: *ManagedFilter, allocator: std.mem.Allocator) void {
-            c.pw_thread_loop_lock(self.thread_loop);
-            destroyLinkProxy(&self.link_in_left);
-            destroyLinkProxy(&self.link_in_right);
-            destroyLinkProxy(&self.link_out_left);
-            destroyLinkProxy(&self.link_out_right);
-            if (self.registry) |registry| c.pw_proxy_destroy(@ptrCast(registry));
-            _ = c.pw_filter_disconnect(self.filter);
-            c.pw_filter_destroy(self.filter);
-            c.pw_thread_loop_unlock(self.thread_loop);
-            c.pw_thread_loop_stop(self.thread_loop);
-            c.pw_thread_loop_destroy(self.thread_loop);
-            for (self.registry_nodes.items) |node| allocator.free(node.name);
-            self.registry_nodes.deinit(allocator);
-            for (self.registry_ports.items) |port| allocator.free(port.name);
-            self.registry_ports.deinit(allocator);
-            allocator.free(self.channel_id);
-            allocator.free(self.name_z);
-            allocator.free(self.raw_monitor_z);
-            allocator.free(self.processed_sink_z);
-            allocator.destroy(self);
+            cleanupManagedFilter(self, allocator, true);
         }
     };
+
+    fn cleanupManagedFilter(filter: *ManagedFilter, allocator: std.mem.Allocator, destroy_self: bool) void {
+        c.pw_thread_loop_lock(filter.thread_loop);
+        destroyLinkProxy(&filter.link_in_left);
+        destroyLinkProxy(&filter.link_in_right);
+        destroyLinkProxy(&filter.link_out_left);
+        destroyLinkProxy(&filter.link_out_right);
+        c.spa_hook_remove(&filter.registry_listener);
+        c.spa_hook_remove(&filter.listener);
+        if (filter.registry) |registry| {
+            c.pw_proxy_destroy(@ptrCast(registry));
+            filter.registry = null;
+        }
+        if (filter.filter) |pw_filter| {
+            _ = c.pw_filter_disconnect(pw_filter);
+            c.pw_filter_destroy(pw_filter);
+            filter.filter = null;
+        }
+        c.pw_thread_loop_unlock(filter.thread_loop);
+        c.pw_thread_loop_stop(filter.thread_loop);
+        c.pw_thread_loop_destroy(filter.thread_loop);
+        for (filter.registry_nodes.items) |node| allocator.free(node.name);
+        filter.registry_nodes.deinit(allocator);
+        for (filter.registry_ports.items) |port| allocator.free(port.name);
+        filter.registry_ports.deinit(allocator);
+        allocator.free(filter.channel_id);
+        allocator.free(filter.name_z);
+        allocator.free(filter.raw_monitor_z);
+        allocator.free(filter.processed_sink_z);
+        if (destroy_self) allocator.destroy(filter);
+    }
 
     allocator: std.mem.Allocator,
     filters: std.ArrayList(*ManagedFilter),
@@ -199,7 +211,6 @@ pub const ChannelFxFilterManager = struct {
             .manager = self,
             .runtime = runtime,
             .thread_loop = thread_loop,
-            .filter = undefined,
             .channel_id = try self.allocator.dupe(u8, spec.channel_id),
             .name_z = filter_name_z,
             .raw_monitor_z = raw_input_sink_z,
@@ -207,7 +218,7 @@ pub const ChannelFxFilterManager = struct {
             .registry_nodes = .empty,
             .registry_ports = .empty,
         };
-        errdefer self.allocator.free(managed.channel_id);
+        errdefer cleanupManagedFilter(managed, self.allocator, true);
 
         c.pw_thread_loop_lock(thread_loop);
         defer c.pw_thread_loop_unlock(thread_loop);
@@ -460,7 +471,8 @@ fn createLinkProxy(
     input_node_id: u32,
     input_port_id: u32,
 ) !void {
-    const core = c.pw_filter_get_core(filter.filter) orelse return error.PipeWireCoreUnavailable;
+    const pw_filter = filter.filter orelse return error.PipeWireFilterCreateFailed;
+    const core = c.pw_filter_get_core(pw_filter) orelse return error.PipeWireCoreUnavailable;
     const props = c.pw_properties_new(null) orelse return error.OutOfMemory;
     errdefer c.pw_properties_free(props);
     _ = c.pw_properties_setf(props, c.PW_KEY_LINK_OUTPUT_NODE, "%u", output_node_id);
@@ -484,6 +496,7 @@ fn createLinkProxy(
 }
 
 fn destroyLinkProxy(link: *ChannelFxFilterManager.LinkProxy) void {
+    c.spa_hook_remove(&link.listener);
     if (link.proxy) |value| c.pw_proxy_destroy(value);
     link.proxy = null;
     link.bound = false;
