@@ -139,6 +139,31 @@ wd_clamp_index(int requested, int upper_bound)
 }
 
 static int
+wd_effective_gpu_index(const WireDeckCudaDenoiser* self)
+{
+  int requested = 0;
+  if (!self) {
+    return 0;
+  }
+  if (self->gpu_index) {
+    requested = (int)(*self->gpu_index + 0.5f);
+  }
+  if (requested < 0) {
+    return 0;
+  }
+  if (requested > 0) {
+    requested = 0;
+  }
+  if (self->cuda_info.device_count <= 0) {
+    return 0;
+  }
+  if (requested >= self->cuda_info.device_count) {
+    return self->cuda_info.device_count - 1;
+  }
+  return requested;
+}
+
+static int
 wd_compute_status(const WireDeckCudaDenoiser* self, int current_model_index)
 {
   if (self->runtime_status_code != 0) {
@@ -268,8 +293,7 @@ wd_reload_environment(WireDeckCudaDenoiser* self, int refresh_runtime)
     wd_load_wdgp_metadata(self->config.models_dir, self->models.names[model_index], &self->selected_model_metadata, error_message, sizeof(error_message));
   }
   if (refresh_runtime) {
-    int gpu_index = 0;
-    if (self->gpu_index) gpu_index = (int)(*self->gpu_index + 0.5f);
+    int gpu_index = wd_effective_gpu_index(self);
     wd_refresh_runtime_state(self, model_index, gpu_index);
   }
 }
@@ -427,8 +451,7 @@ wd_run(LV2_Handle instance, uint32_t sample_count)
     model_index = wd_clamp_index((int)(*self->model_index + 0.5f), self->models.count);
   }
   {
-    int gpu_index = 0;
-    if (self->gpu_index) gpu_index = (int)(*self->gpu_index + 0.5f);
+    int gpu_index = wd_effective_gpu_index(self);
     if (!self->shared_runtime || model_index != self->active_model_index || gpu_index != self->active_gpu_index) {
       self->selected_model_index_from_config = model_index;
       wd_refresh_runtime_state(self, model_index, gpu_index);

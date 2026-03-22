@@ -47,7 +47,36 @@ typedef struct WireDeckCudaDenoiserUI {
   int gpu_index_value;
   int model_index_value;
   int updating;
+  int widgets_alive;
 } WireDeckCudaDenoiserUI;
+
+static void
+wd_ui_on_root_destroy(GtkWidget* widget, gpointer data)
+{
+  WireDeckCudaDenoiserUI* ui = (WireDeckCudaDenoiserUI*)data;
+  (void)widget;
+
+  if (!ui) {
+    return;
+  }
+
+  ui->widgets_alive = 0;
+  ui->root = NULL;
+  ui->folder_button = NULL;
+  ui->model_combo = NULL;
+  ui->gpu_combo = NULL;
+  ui->threshold_scale = NULL;
+  ui->buffer_ms_scale = NULL;
+  ui->mix_scale = NULL;
+  ui->output_gain_scale = NULL;
+  ui->status_label = NULL;
+  ui->cuda_label = NULL;
+  ui->model_info_label = NULL;
+  ui->input_level_label = NULL;
+  ui->output_level_label = NULL;
+  ui->model_loaded_label = NULL;
+  ui->runtime_phase_label = NULL;
+}
 
 static const char*
 wd_ui_runtime_phase_label(int phase)
@@ -95,7 +124,7 @@ wd_ui_refresh_status(WireDeckCudaDenoiserUI* ui, int status_code)
 {
   char status_text[512];
 
-  if (!ui || !ui->status_label || !ui->cuda_label) {
+  if (!ui || !ui->widgets_alive || !ui->status_label || !ui->cuda_label) {
     return;
   }
 
@@ -117,7 +146,7 @@ wd_ui_refresh_model_info(WireDeckCudaDenoiserUI* ui)
   char info[512];
   char error_message[256];
 
-  if (!ui || !ui->model_info_label) {
+  if (!ui || !ui->widgets_alive || !ui->model_info_label) {
     return;
   }
 
@@ -152,7 +181,7 @@ wd_ui_refresh_runtime_debug(WireDeckCudaDenoiserUI* ui)
 {
   char text[256];
 
-  if (!ui) {
+  if (!ui || !ui->widgets_alive) {
     return;
   }
 
@@ -190,7 +219,7 @@ wd_ui_populate_models(WireDeckCudaDenoiserUI* ui)
   int index;
   int resolved_index;
 
-  if (!ui || !ui->model_combo) {
+  if (!ui || !ui->widgets_alive || !ui->model_combo) {
     return;
   }
 
@@ -231,7 +260,7 @@ static void
 wd_ui_populate_gpus(WireDeckCudaDenoiserUI* ui)
 {
   int index;
-  if (!ui || !ui->gpu_combo) {
+  if (!ui || !ui->widgets_alive || !ui->gpu_combo) {
     return;
   }
 
@@ -434,6 +463,7 @@ wd_ui_instantiate(const struct LV2UI_Descriptor* descriptor,
   ui->runtime_phase_value = (float)WD_RUNTIME_IDLE;
   ui->gpu_index_value = -1;
   ui->model_index_value = -1;
+  ui->widgets_alive = 1;
 
   wd_config_init_defaults(&ui->config);
   wd_config_load(&ui->config, error_message, sizeof(error_message));
@@ -442,6 +472,7 @@ wd_ui_instantiate(const struct LV2UI_Descriptor* descriptor,
 
   ui->root = gtk_vbox_new(FALSE, 10);
   gtk_container_set_border_width(GTK_CONTAINER(ui->root), 12);
+  g_signal_connect(ui->root, "destroy", G_CALLBACK(wd_ui_on_root_destroy), ui);
 
   ui->cuda_label = gtk_label_new("");
   gtk_misc_set_alignment(GTK_MISC(ui->cuda_label), 0.0f, 0.5f);
@@ -570,6 +601,7 @@ wd_ui_cleanup(LV2UI_Handle handle)
   if (!ui) {
     return;
   }
+  ui->widgets_alive = 0;
   wd_free_model_scan_result(&ui->models);
   free(ui);
 }
@@ -581,7 +613,7 @@ wd_ui_port_event(LV2UI_Handle handle, uint32_t port_index, uint32_t buffer_size,
   float value;
   (void)buffer_size;
 
-  if (!ui || !buffer || format != 0) {
+  if (!ui || !ui->widgets_alive || !buffer || format != 0) {
     return;
   }
 
