@@ -11,6 +11,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define WD_LEVEL_HISTORY_CAPACITY 4096
+#define WD_LEVEL_HISTORY_WINDOW_SECONDS 5.0
+
+typedef struct WireDeckLevelSample {
+  double timestamp_seconds;
+  float input_level;
+  float output_level;
+} WireDeckLevelSample;
+
 typedef struct WireDeckCudaDenoiserUI {
   LV2UI_Write_Function write;
   LV2UI_Controller controller;
@@ -26,8 +35,8 @@ typedef struct WireDeckCudaDenoiserUI {
   GtkWidget* status_label;
   GtkWidget* cuda_label;
   GtkWidget* model_info_label;
-  GtkWidget* input_level_label;
-  GtkWidget* output_level_label;
+  GtkWidget* level_history_area;
+  GtkWidget* level_history_caption;
   GtkWidget* model_loaded_label;
   GtkWidget* runtime_phase_label;
 
@@ -44,6 +53,9 @@ typedef struct WireDeckCudaDenoiserUI {
   float output_level_value;
   float model_loaded_value;
   float runtime_phase_value;
+  WireDeckLevelSample level_history[WD_LEVEL_HISTORY_CAPACITY];
+  uint32_t level_history_start;
+  uint32_t level_history_count;
   int gpu_index_value;
   int model_index_value;
   int updating;
@@ -72,8 +84,8 @@ wd_ui_on_root_destroy(GtkWidget* widget, gpointer data)
   ui->status_label = NULL;
   ui->cuda_label = NULL;
   ui->model_info_label = NULL;
-  ui->input_level_label = NULL;
-  ui->output_level_label = NULL;
+  ui->level_history_area = NULL;
+  ui->level_history_caption = NULL;
   ui->model_loaded_label = NULL;
   ui->runtime_phase_label = NULL;
 }
@@ -117,6 +129,227 @@ wd_ui_write_control(WireDeckCudaDenoiserUI* ui, uint32_t port_index, float value
     return;
   }
   ui->write(ui->controller, port_index, sizeof(float), 0, &value);
+}
+
+static void
+wd_ui_trim_level_history(WireDeckCudaDenoiserUI* ui, double cutoff_seconds)
+{
+  if (!ui) {
+    return;
+  }
+
+  while (ui->level_history_count > 0) {
+    WireDeckLevelSample* sample = &ui->level_history[ui->level_history_start];
+    if (sample->timestamp_seconds >= cutoff_seconds) {
+      break;
+    }
+    ui->level_history_start = (ui->level_history_start + 1u) % WD_LEVEL_HISTORY_CAPACITY;
+    --ui->level_history_count;
+  }
+}
+
+static void
+wd_ui_clamp_level(float* value, float max_level)
+{
+  if (!value) {
+    return;
+  }
+  if (*value < 0.0f) {
+    *value = 0.0f;
+  } else if (*value > max_level) {
+    *value = max_level;
+  }
+}
+
+static void
+wd_ui_append_level_sample(WireDeckCudaDenoiserUI* ui)
+{
+  WireDeckLevelSample* sample;
+  uint32_t insert_index;
+  double now_seconds;
+
+  if (!ui) {
+    return;
+  }
+
+  now_seconds = (double)g_get_monotonic_time() / 1000000.0;
+  wd_ui_trim_level_history(ui, now_seconds - WD_LEVEL_HISTORY_WINDOW_SECONDS);
+
+  insert_index = (ui->level_history_start + ui->level_history_count) % WD_LEVEL_HISTORY_CAPACITY;
+  if (ui->level_history_count == WD_LEVEL_HISTORY_CAPACITY) {
+    ui->level_history_start = (ui->level_history_start + 1u) % WD_LEVEL_HISTORY_CAPACITY;
+    insert_index = (ui->level_history_start + ui->level_history_count - 1u) % WD_LEVEL_HISTORY_CAPACITY;
+  } else {
+    ++ui->level_history_count;
+  }
+
+  sample = &ui->level_history[insert_index];
+  sample->timestamp_seconds = now_seconds;
+  sample->input_level = ui->input_level_value;
+  sample->output_level = ui->output_level_value;
+}
+
+static gboolean
+wd_ui_render_level_history(GtkWidget* widget, cairo_t* cr, gpointer data)
+{
+  WireDeckCudaDenoiserUI* ui = (WireDeckCudaDenoiserUI*)data;
+  double now_seconds;
+  double cutoff_seconds;
+  double width;
+  double height;
+  double graph_left = 52.0;
+  double graph_right;
+  double graph_top = 14.0;
+  double graph_bottom;
+  double graph_width;
+  double graph_height;
+  double max_level = 1e-6;
+  uint32_t index;
+
+  if (!ui) {
+    return FALSE;
+  }
+
+  width = (double)widget->allocation.width;
+  height = (double)widget->allocation.height;
+  graph_right = width - 14.0;
+  graph_bottom = height - 26.0;
+  graph_width = graph_right - graph_left;
+  graph_height = graph_bottom - graph_top;
+
+  cairo_set_source_rgb(cr, 0.06, 0.07, 0.09);
+  cairo_paint(cr);
+
+  if (graph_width <= 0.0 || graph_height <= 0.0) {
+    return FALSE;
+  }
+
+  now_seconds = (double)g_get_monotonic_time() / 1000000.0;
+  cutoff_seconds = now_seconds - WD_LEVEL_HISTORY_WINDOW_SECONDS;
+  wd_ui_trim_level_history(ui, cutoff_seconds);
+
+  for (index = 0; index < ui->level_history_count; ++index) {
+    const WireDeckLevelSample* sample = &ui->level_history[(ui->level_history_start + index) % WD_LEVEL_HISTORY_CAPACITY];
+    if ((double)sample->input_level > max_level) {
+      max_level = sample->input_level;
+    }
+    if ((double)sample->output_level > max_level) {
+      max_level = sample->output_level;
+    }
+  }
+  if (max_level < 0.01) {
+    max_level = 0.01;
+  }
+
+  cairo_set_line_width(cr, 1.0);
+  cairo_set_source_rgb(cr, 0.20, 0.22, 0.25);
+  for (index = 0; index <= 6; ++index) {
+    double x = graph_left + ((double)index / 6.0) * graph_width;
+    cairo_move_to(cr, x, graph_top);
+    cairo_line_to(cr, x, graph_bottom);
+  }
+  for (index = 0; index <= 5; ++index) {
+    double y = graph_top + ((double)index / 5.0) * graph_height;
+    cairo_move_to(cr, graph_left, y);
+    cairo_line_to(cr, graph_right, y);
+  }
+  cairo_stroke(cr);
+
+  cairo_set_source_rgb(cr, 0.70, 0.72, 0.74);
+  cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+  cairo_set_font_size(cr, 11.0);
+  cairo_move_to(cr, graph_left, height - 8.0);
+  cairo_show_text(cr, "5s");
+  cairo_move_to(cr, graph_right - 22.0, height - 8.0);
+  cairo_show_text(cr, "0s");
+
+  {
+    char label[32];
+    snprintf(label, sizeof(label), "%.2f", max_level);
+    cairo_move_to(cr, 8.0, graph_top + 4.0);
+    cairo_show_text(cr, label);
+    cairo_move_to(cr, 8.0, graph_bottom + 4.0);
+    cairo_show_text(cr, "0.00");
+  }
+
+  cairo_rectangle(cr, graph_left, graph_top, graph_width, graph_height);
+  cairo_clip(cr);
+
+  if (ui->level_history_count > 0) {
+    for (index = 0; index < ui->level_history_count; ++index) {
+      const WireDeckLevelSample* sample = &ui->level_history[(ui->level_history_start + index) % WD_LEVEL_HISTORY_CAPACITY];
+      double age_seconds = now_seconds - sample->timestamp_seconds;
+      double x = graph_right - (age_seconds / WD_LEVEL_HISTORY_WINDOW_SECONDS) * graph_width;
+      float level = sample->input_level;
+      double input_y;
+      wd_ui_clamp_level(&level, (float)max_level);
+      input_y = graph_bottom - (level / max_level) * graph_height;
+      if (index == 0) {
+        cairo_move_to(cr, x, input_y);
+      } else {
+        cairo_line_to(cr, x, input_y);
+      }
+    }
+    cairo_set_source_rgb(cr, 0.16, 0.71, 0.95);
+    cairo_set_line_width(cr, 2.0);
+    cairo_stroke(cr);
+
+    for (index = 0; index < ui->level_history_count; ++index) {
+      const WireDeckLevelSample* sample = &ui->level_history[(ui->level_history_start + index) % WD_LEVEL_HISTORY_CAPACITY];
+      double age_seconds = now_seconds - sample->timestamp_seconds;
+      double x = graph_right - (age_seconds / WD_LEVEL_HISTORY_WINDOW_SECONDS) * graph_width;
+      float level = sample->output_level;
+      double output_y;
+      wd_ui_clamp_level(&level, (float)max_level);
+      output_y = graph_bottom - (level / max_level) * graph_height;
+      if (index == 0) {
+        cairo_move_to(cr, x, output_y);
+      } else {
+        cairo_line_to(cr, x, output_y);
+      }
+    }
+    cairo_set_source_rgb(cr, 0.98, 0.60, 0.20);
+    cairo_set_line_width(cr, 2.0);
+    cairo_stroke(cr);
+  }
+
+  cairo_reset_clip(cr);
+
+  cairo_set_source_rgb(cr, 0.16, 0.71, 0.95);
+  cairo_rectangle(cr, graph_left, 4.0, 14.0, 3.0);
+  cairo_fill(cr);
+  cairo_set_source_rgb(cr, 0.88, 0.89, 0.91);
+  cairo_move_to(cr, graph_left + 20.0, 9.0);
+  cairo_show_text(cr, "Input");
+
+  cairo_set_source_rgb(cr, 0.98, 0.60, 0.20);
+  cairo_rectangle(cr, graph_left + 76.0, 4.0, 14.0, 3.0);
+  cairo_fill(cr);
+  cairo_set_source_rgb(cr, 0.88, 0.89, 0.91);
+  cairo_move_to(cr, graph_left + 96.0, 9.0);
+  cairo_show_text(cr, "Output");
+
+  return FALSE;
+}
+
+static gboolean
+wd_ui_expose_level_history(GtkWidget* widget, GdkEventExpose* event, gpointer data)
+{
+  cairo_t* cr;
+  (void)event;
+
+  if (!widget || !widget->window) {
+    return FALSE;
+  }
+
+  cr = gdk_cairo_create(widget->window);
+  if (!cr) {
+    return FALSE;
+  }
+
+  wd_ui_render_level_history(widget, cr, data);
+  cairo_destroy(cr);
+  return FALSE;
 }
 
 static void
@@ -185,13 +418,17 @@ wd_ui_refresh_runtime_debug(WireDeckCudaDenoiserUI* ui)
     return;
   }
 
-  if (ui->input_level_label) {
-    snprintf(text, sizeof(text), "Input level: %.6f", ui->input_level_value);
-    gtk_label_set_text(GTK_LABEL(ui->input_level_label), text);
+  if (ui->level_history_caption) {
+    snprintf(
+      text,
+      sizeof(text),
+      "Levels (60s): input %.6f | output %.6f",
+      ui->input_level_value,
+      ui->output_level_value);
+    gtk_label_set_text(GTK_LABEL(ui->level_history_caption), text);
   }
-  if (ui->output_level_label) {
-    snprintf(text, sizeof(text), "Output level: %.6f", ui->output_level_value);
-    gtk_label_set_text(GTK_LABEL(ui->output_level_label), text);
+  if (ui->level_history_area) {
+    gtk_widget_queue_draw(ui->level_history_area);
   }
   if (ui->model_loaded_label) {
     snprintf(text, sizeof(text), "Model loaded: %s", ui->model_loaded_value >= 0.5f ? "yes" : "no");
@@ -437,6 +674,7 @@ wd_ui_instantiate(const struct LV2UI_Descriptor* descriptor,
   GtkWidget* mix_label;
   GtkWidget* output_gain_label;
   GtkWidget* diagnostics_box;
+  GtkWidget* level_frame;
   char error_message[256];
   (void)descriptor;
   (void)bundle_path;
@@ -552,13 +790,18 @@ wd_ui_instantiate(const struct LV2UI_Descriptor* descriptor,
   diagnostics_box = gtk_vbox_new(FALSE, 4);
   gtk_box_pack_start(GTK_BOX(ui->root), diagnostics_box, FALSE, FALSE, 0);
 
-  ui->input_level_label = gtk_label_new("");
-  gtk_misc_set_alignment(GTK_MISC(ui->input_level_label), 0.0f, 0.5f);
-  gtk_box_pack_start(GTK_BOX(diagnostics_box), ui->input_level_label, FALSE, FALSE, 0);
+  ui->level_history_caption = gtk_label_new("");
+  gtk_misc_set_alignment(GTK_MISC(ui->level_history_caption), 0.0f, 0.5f);
+  gtk_box_pack_start(GTK_BOX(diagnostics_box), ui->level_history_caption, FALSE, FALSE, 0);
 
-  ui->output_level_label = gtk_label_new("");
-  gtk_misc_set_alignment(GTK_MISC(ui->output_level_label), 0.0f, 0.5f);
-  gtk_box_pack_start(GTK_BOX(diagnostics_box), ui->output_level_label, FALSE, FALSE, 0);
+  level_frame = gtk_frame_new(NULL);
+  gtk_frame_set_shadow_type(GTK_FRAME(level_frame), GTK_SHADOW_IN);
+  gtk_box_pack_start(GTK_BOX(diagnostics_box), level_frame, FALSE, FALSE, 0);
+
+  ui->level_history_area = gtk_drawing_area_new();
+  gtk_widget_set_size_request(ui->level_history_area, 420, 180);
+  gtk_container_add(GTK_CONTAINER(level_frame), ui->level_history_area);
+  g_signal_connect(ui->level_history_area, "expose-event", G_CALLBACK(wd_ui_expose_level_history), ui);
 
   ui->model_loaded_label = gtk_label_new("");
   gtk_misc_set_alignment(GTK_MISC(ui->model_loaded_label), 0.0f, 0.5f);
@@ -654,10 +897,12 @@ wd_ui_port_event(LV2UI_Handle handle, uint32_t port_index, uint32_t buffer_size,
     break;
   case WD_PORT_INPUT_LEVEL:
     ui->input_level_value = value;
+    wd_ui_append_level_sample(ui);
     wd_ui_refresh_runtime_debug(ui);
     break;
   case WD_PORT_OUTPUT_LEVEL:
     ui->output_level_value = value;
+    wd_ui_append_level_sample(ui);
     wd_ui_refresh_runtime_debug(ui);
     break;
   case WD_PORT_MODEL_LOADED:

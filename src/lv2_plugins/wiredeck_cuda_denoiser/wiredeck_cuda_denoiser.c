@@ -87,6 +87,8 @@ typedef struct WireDeckCudaDenoiser {
   int snapshot_cuda_available;
   int snapshot_gpu_count;
   int snapshot_model_count;
+  int host_active;
+  int desired_enabled;
   int desired_model_index;
   int desired_gpu_index;
   unsigned int request_generation;
@@ -95,6 +97,9 @@ typedef struct WireDeckCudaDenoiser {
   WireDeckPluginRuntime* staged_runtime;
   WireDeckPluginRuntime* retired_runtime_head;
 } WireDeckCudaDenoiser;
+
+static void wd_runtime_retire(WireDeckCudaDenoiser* self, WireDeckPluginRuntime* runtime);
+static WireDeckPluginRuntime* wd_atomic_exchange_runtime(WireDeckPluginRuntime** slot, WireDeckPluginRuntime* value);
 
 static int
 wd_ensure_delay_buffers(WireDeckCudaDenoiser* self)
@@ -177,19 +182,45 @@ wd_clamp_index(int requested, int upper_bound)
 static int
 wd_effective_gpu_index_from_value(int requested, int device_count)
 {
-  if (requested < 0) {
+  if (device_count <= 0) {
     return 0;
   }
-  if (requested > 0) {
-    requested = 0;
-  }
-  if (device_count <= 0) {
+  if (requested < 0) {
     return 0;
   }
   if (requested >= device_count) {
     return device_count - 1;
   }
   return requested;
+}
+
+static int
+wd_effective_enabled(const WireDeckCudaDenoiser* self)
+{
+  if (!self || !self->enabled) {
+    return 1;
+  }
+  return *self->enabled >= 0.5f;
+}
+
+static void
+wd_release_active_runtimes(WireDeckCudaDenoiser* self)
+{
+  WireDeckPluginRuntime* runtime;
+
+  if (!self) {
+    return;
+  }
+
+  runtime = wd_atomic_exchange_runtime(&self->staged_runtime, NULL);
+  if (runtime) {
+    wd_runtime_retire(self, runtime);
+  }
+
+  runtime = wd_atomic_exchange_runtime(&self->current_runtime, NULL);
+  if (runtime) {
+    wd_runtime_retire(self, runtime);
+  }
 }
 
 static int
@@ -477,8 +508,10 @@ wd_sync_requested_runtime(WireDeckCudaDenoiser* self)
 {
   int model_index = self->model_index ? (int)(*self->model_index + 0.5f) : -1;
   int gpu_index = self->gpu_index ? (int)(*self->gpu_index + 0.5f) : 0;
+  int enabled = wd_effective_enabled(self);
   int previous_model = wd_atomic_load_int(&self->desired_model_index);
   int previous_gpu = wd_atomic_load_int(&self->desired_gpu_index);
+  int previous_enabled = wd_atomic_load_int(&self->desired_enabled);
 
   if (previous_model != model_index) {
     wd_atomic_store_int(&self->desired_model_index, model_index);
@@ -486,6 +519,10 @@ wd_sync_requested_runtime(WireDeckCudaDenoiser* self)
   }
   if (previous_gpu != gpu_index) {
     wd_atomic_store_int(&self->desired_gpu_index, gpu_index);
+    wd_request_reload(self);
+  }
+  if (previous_enabled != enabled) {
+    wd_atomic_store_int(&self->desired_enabled, enabled);
     wd_request_reload(self);
   }
 }
@@ -538,6 +575,8 @@ wd_worker_process_request(WireDeckCudaDenoiser* self, unsigned int request_gener
   char error_message[256];
   int desired_model_index;
   int desired_gpu_index;
+  int desired_enabled;
+  int host_active;
   int effective_gpu_index;
   int active_model_index;
   int status_code = WD_STATUS_NO_MODELS;
@@ -554,6 +593,8 @@ wd_worker_process_request(WireDeckCudaDenoiser* self, unsigned int request_gener
 
   desired_model_index = wd_atomic_load_int(&self->desired_model_index);
   desired_gpu_index = wd_atomic_load_int(&self->desired_gpu_index);
+  desired_enabled = wd_atomic_load_int(&self->desired_enabled);
+  host_active = wd_atomic_load_int(&self->host_active);
   effective_gpu_index = wd_effective_gpu_index_from_value(desired_gpu_index, self->cuda_info.device_count);
 
   active_model_index = desired_model_index;
@@ -572,6 +613,8 @@ wd_worker_process_request(WireDeckCudaDenoiser* self, unsigned int request_gener
     status_code = WD_STATUS_MODEL_INDEX_INVALID;
   } else if (!self->models.is_wdgp[active_model_index]) {
     status_code = WD_STATUS_MODEL_FORMAT_UNSUPPORTED;
+  } else if (!host_active || !desired_enabled) {
+    status_code = WD_STATUS_WDGP_MODEL_READY;
   } else {
     if (!wd_load_wdgp_metadata(self->config.models_dir, self->models.names[active_model_index], &self->selected_model_metadata, error_message, sizeof(error_message))) {
       memset(&self->selected_model_metadata, 0, sizeof(self->selected_model_metadata));
@@ -649,6 +692,8 @@ wd_instantiate(const LV2_Descriptor* descriptor,
   self->sample_rate_hz = rate > 1000.0 ? (unsigned int)(rate + 0.5) : 48000u;
   self->desired_model_index = -1;
   self->desired_gpu_index = 0;
+  self->host_active = 0;
+  self->desired_enabled = 1;
   self->snapshot_status_code = WD_STATUS_RUNTIME_NOT_IMPLEMENTED;
   if (!wd_ensure_delay_buffers(self)) {
     free(self);
@@ -740,6 +785,7 @@ static void
 wd_activate(LV2_Handle instance)
 {
   WireDeckCudaDenoiser* self = (WireDeckCudaDenoiser*)instance;
+  wd_atomic_store_int(&self->host_active, 1);
   wd_request_reload(self);
 }
 
@@ -774,6 +820,11 @@ wd_run(LV2_Handle instance, uint32_t sample_count)
   snapshot_status_code = wd_atomic_load_int(&self->snapshot_status_code);
   requested_model_index = self->model_index ? (int)(*self->model_index + 0.5f) : -1;
   requested_gpu_index = wd_effective_gpu_index(self);
+
+  if (!wd_atomic_load_int(&self->host_active) || !wd_effective_enabled(self)) {
+    wd_release_active_runtimes(self);
+    runtime = NULL;
+  }
 
   if (runtime) {
     runtime_matches_request = runtime->model_index == requested_model_index && runtime->gpu_index == requested_gpu_index;
@@ -938,7 +989,13 @@ wd_run(LV2_Handle instance, uint32_t sample_count)
 static void
 wd_deactivate(LV2_Handle instance)
 {
-  (void)instance;
+  WireDeckCudaDenoiser* self = (WireDeckCudaDenoiser*)instance;
+  if (!self) {
+    return;
+  }
+  wd_atomic_store_int(&self->host_active, 0);
+  wd_release_active_runtimes(self);
+  wd_request_reload(self);
 }
 
 static void
