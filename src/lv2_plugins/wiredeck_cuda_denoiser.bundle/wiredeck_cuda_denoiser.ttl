@@ -12,7 +12,6 @@
     doap:maintainer [
         foaf:name "WireDeck"
     ] ;
-    lv2:optionalFeature lv2:hardRTCapable ;
     ui:ui <https://wiredeck.dev/plugins/cuda-denoiser#ui> ;
     lv2:port [
         a lv2:InputPort , lv2:ControlPort ;

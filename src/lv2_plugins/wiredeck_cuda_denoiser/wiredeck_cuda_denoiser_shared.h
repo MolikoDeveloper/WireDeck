@@ -43,6 +43,7 @@ typedef enum WireDeckCudaDenoiserStatusCode {
   WD_STATUS_KERNELS_MISSING = 10,
   WD_STATUS_KERNEL_LOAD_FAILED = 11,
   WD_STATUS_WEIGHTS_UPLOAD_FAILED = 12,
+  WD_STATUS_SAMPLE_RATE_MISMATCH = 13,
 } WireDeckCudaDenoiserStatusCode;
 
 typedef enum WireDeckCudaDenoiserRuntimePhase {

@@ -482,6 +482,8 @@ wd_status_code_label(int status_code)
     return "Could not load CUDA kernels";
   case WD_STATUS_WEIGHTS_UPLOAD_FAILED:
     return "Could not upload model weights";
+  case WD_STATUS_SAMPLE_RATE_MISMATCH:
+    return "Host sample rate does not match model sample rate";
   default:
     return "Unknown status";
   }

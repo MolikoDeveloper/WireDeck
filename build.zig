@@ -105,6 +105,34 @@ pub fn build(b: *std.Build) void {
         plugin_ui_lib.linkSystemLibrary("gtk+-x11-2.0");
         plugin_ui_lib.linkSystemLibrary("x11");
         b.installArtifact(plugin_ui_lib);
+
+        const rt_harness = b.addExecutable(.{
+            .name = "wiredeck-cuda-rt-harness",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/lv2_plugins/wiredeck_cuda_denoiser/rt_harness_main.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        rt_harness.addIncludePath(b.path("src/lv2_plugins/wiredeck_cuda_denoiser"));
+        rt_harness.addCSourceFiles(.{
+            .files = &.{
+                "src/lv2_plugins/wiredeck_cuda_denoiser/rt_harness_exports.c",
+                "src/lv2_plugins/wiredeck_cuda_denoiser/wiredeck_cuda_denoiser.c",
+                "src/lv2_plugins/wiredeck_cuda_denoiser/cuda_probe.c",
+                "src/lv2_plugins/wiredeck_cuda_denoiser/cuda_backend.c",
+                "src/lv2_plugins/wiredeck_cuda_denoiser/cuda_session.c",
+                "src/lv2_plugins/wiredeck_cuda_denoiser/config_store.c",
+                "src/lv2_plugins/wiredeck_cuda_denoiser/inference_frontend.c",
+                "src/lv2_plugins/wiredeck_cuda_denoiser/shared_runtime_cache.c",
+                "src/lv2_plugins/wiredeck_cuda_denoiser/wdgp_runtime.c",
+            },
+            .flags = &.{ "-std=c99", "-Wno-deprecated-declarations" },
+        });
+        rt_harness.linkSystemLibrary("dl");
+        rt_harness.linkSystemLibrary("pthread");
+        b.installArtifact(rt_harness);
     }
 
     b.installArtifact(exe);
