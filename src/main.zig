@@ -1,5 +1,10 @@
 const std = @import("std");
 const wiredeck = @import("wiredeck");
+const c = @cImport({
+    @cInclude("sys/file.h");
+    @cInclude("signal.h");
+    @cInclude("unistd.h");
+});
 
 const CliOptions = struct {
     headless: bool = false,
@@ -9,6 +14,8 @@ const CliOptions = struct {
     print_source_activity: bool = false,
     source_filter: ?[]const u8 = null,
     activity_ticks: u32 = 120,
+    cleanup_audio_state: bool = false,
+    cleanup_watchdog_pid: ?u32 = null,
 };
 
 pub fn main() !void {
@@ -22,6 +29,20 @@ pub fn main() !void {
 
     const gpa = gpa_state.allocator();
 
+    if (options.cleanup_watchdog_pid) |pid| {
+        try runCleanupWatchdog(gpa, pid);
+        return;
+    }
+
+    if (options.cleanup_audio_state) {
+        try cleanupManagedAudioState(gpa);
+        return;
+    }
+
+    var instance_guard = try SingleInstanceGuard.acquire(gpa);
+    defer instance_guard.release();
+    try spawnCleanupWatchdog(gpa);
+
     var state_store = wiredeck.StateStore.init(gpa);
     defer state_store.deinit();
 
@@ -30,7 +51,7 @@ pub fn main() !void {
 
     var config_store = try wiredeck.ConfigStore.init(gpa);
     defer config_store.deinit();
-    try app.bootstrap();
+    try app.prepareBootstrapState();
     app.cleanupStartupBindings() catch |err| {
         std.log.warn("startup routing cleanup failed: {s}", .{@errorName(err)});
     };
@@ -42,9 +63,14 @@ pub fn main() !void {
         app.normalizeConfiguredBindingsToDefault() catch |err| {
             std.log.warn("startup route normalization failed: {s}", .{@errorName(err)});
         };
+        app.reconcileCurrentRoutingNow() catch |err| {
+            if (err != error.CaptureSinkPending) {
+                std.log.warn("startup routing reconcile failed: {s}", .{@errorName(err)});
+            }
+        };
         app.markRoutingDirty();
-        app.reconcileOutputRoutingIfNeeded();
     }
+    app.startBackgroundServices();
     defer {
         config_store.save(&state_store) catch |err| {
             std.log.warn("config save failed: {s}", .{@errorName(err)});
@@ -70,6 +96,62 @@ pub fn main() !void {
             .start_hidden = options.start_hidden,
         }, &app, &state_store, &config_store);
     }
+}
+
+const SingleInstanceGuard = struct {
+    allocator: std.mem.Allocator,
+    file: std.fs.File,
+    path: []u8,
+
+    fn acquire(allocator: std.mem.Allocator) !SingleInstanceGuard {
+        const path = try defaultLockPath(allocator);
+        errdefer allocator.free(path);
+
+        const parent_dir = std.fs.path.dirname(path) orelse return error.InvalidLockPath;
+        std.fs.makeDirAbsolute(parent_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+
+        const file = try std.fs.createFileAbsolute(path, .{
+            .read = true,
+            .truncate = false,
+        });
+        errdefer file.close();
+
+        if (c.flock(file.handle, c.LOCK_EX | c.LOCK_NB) != 0) {
+            return error.WireDeckAlreadyRunning;
+        }
+
+        return .{
+            .allocator = allocator,
+            .file = file,
+            .path = path,
+        };
+    }
+
+    fn release(self: *SingleInstanceGuard) void {
+        _ = c.flock(self.file.handle, c.LOCK_UN);
+        self.file.close();
+        self.allocator.free(self.path);
+    }
+};
+
+fn defaultLockPath(allocator: std.mem.Allocator) ![]u8 {
+    if (std.process.getEnvVarOwned(allocator, "XDG_RUNTIME_DIR")) |runtime_dir| {
+        defer allocator.free(runtime_dir);
+        return std.fs.path.join(allocator, &.{ runtime_dir, "wiredeck.lock" });
+    } else |err| switch (err) {
+        error.EnvironmentVariableNotFound => {},
+        else => return err,
+    }
+
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return error.NoHomeDirectory,
+        else => return err,
+    };
+    defer allocator.free(home);
+    return std.fs.path.join(allocator, &.{ home, ".config", "wiredeck", "instance.lock" });
 }
 
 fn parseArgs(allocator: std.mem.Allocator) !CliOptions {
@@ -104,6 +186,16 @@ fn parseArgs(allocator: std.mem.Allocator) !CliOptions {
             options.print_source_activity = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--cleanup-audio-state")) {
+            options.cleanup_audio_state = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--cleanup-watchdog-pid")) {
+            index += 1;
+            if (index >= args.len) return error.MissingCleanupWatchdogPidValue;
+            options.cleanup_watchdog_pid = try std.fmt.parseInt(u32, args[index], 10);
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--source-filter")) {
             index += 1;
             if (index >= args.len) return error.MissingSourceFilterValue;
@@ -119,6 +211,48 @@ fn parseArgs(allocator: std.mem.Allocator) !CliOptions {
         return error.UnknownArgument;
     }
     return options;
+}
+
+fn spawnCleanupWatchdog(allocator: std.mem.Allocator) !void {
+    const exe_path = try std.fs.selfExePathAlloc(allocator);
+    defer allocator.free(exe_path);
+
+    const pid_arg = try std.fmt.allocPrint(allocator, "{d}", .{c.getpid()});
+    defer allocator.free(pid_arg);
+
+    var child = std.process.Child.init(&.{ exe_path, "--cleanup-watchdog-pid", pid_arg }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    child.request_resource_usage_statistics = false;
+    child.spawn() catch |err| {
+        std.log.warn("cleanup watchdog spawn failed: {s}", .{@errorName(err)});
+        return;
+    };
+}
+
+fn runCleanupWatchdog(allocator: std.mem.Allocator, pid: u32) !void {
+    _ = allocator;
+    while (true) {
+        std.Thread.sleep(200 * std.time.ns_per_ms);
+        const rc = c.kill(@intCast(pid), 0);
+        if (rc == 0) continue;
+        break;
+    }
+    cleanupManagedAudioState(std.heap.page_allocator) catch {};
+}
+
+fn cleanupManagedAudioState(allocator: std.mem.Allocator) !void {
+    var state_store = wiredeck.StateStore.init(allocator);
+    defer state_store.deinit();
+
+    var app = wiredeck.App.init(allocator, &state_store);
+    defer app.deinit();
+
+    try app.cleanupStartupBindings();
+    wiredeck.OutputExposure.cleanupDefaultAudioSource(allocator) catch |err| {
+        std.log.warn("default audio source cleanup failed: {s}", .{@errorName(err)});
+    };
 }
 
 fn convertAppIcon(state_store: *const wiredeck.StateStore, app_name: []const u8) !void {
