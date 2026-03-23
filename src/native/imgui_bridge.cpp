@@ -1566,6 +1566,11 @@ void queue_remove_plugin(WireDeckUiSnapshot* snapshot, const char* plugin_id) {
     set_request_text(snapshot->request_remove_plugin_id, sizeof(snapshot->request_remove_plugin_id), plugin_id);
 }
 
+void queue_move_plugin(WireDeckUiSnapshot* snapshot, const char* plugin_id, int delta) {
+    set_request_text(snapshot->request_move_plugin_id, sizeof(snapshot->request_move_plugin_id), plugin_id);
+    snapshot->request_move_plugin_delta = delta;
+}
+
 void queue_open_plugin_ui(WireDeckUiSnapshot* snapshot, const char* plugin_id) {
     set_request_text(snapshot->request_open_plugin_ui_id, sizeof(snapshot->request_open_plugin_ui_id), plugin_id);
 }
@@ -1865,6 +1870,8 @@ void render_input_fx_popup(WireDeckUiSnapshot* snapshot, const char* channel_id)
     ImGui::Separator();
 
     bool has_plugins = false;
+    int channel_plugin_rank = 0;
+    const int channel_plugin_total = count_channel_plugins(snapshot, channel_id);
     for (int i = 0; i < snapshot->channel_plugin_count; ++i) {
         WireDeckUiChannelPlugin& channel_plugin = snapshot->channel_plugins[i];
         if (std::strcmp(channel_plugin.channel_id, channel_id) != 0) {
@@ -1877,6 +1884,20 @@ void render_input_fx_popup(WireDeckUiSnapshot* snapshot, const char* channel_id)
         if (ImGui::Checkbox("##enabled", &enabled)) {
             channel_plugin.enabled = enabled ? 1 : 0;
         }
+        ImGui::SameLine();
+        const bool can_move_up = channel_plugin_rank > 0;
+        const bool can_move_down = channel_plugin_rank + 1 < channel_plugin_total;
+        if (!can_move_up) ImGui::BeginDisabled();
+        if (ImGui::ArrowButton("##move_up", ImGuiDir_Up)) {
+            queue_move_plugin(snapshot, channel_plugin.id, -1);
+        }
+        if (!can_move_up) ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (!can_move_down) ImGui::BeginDisabled();
+        if (ImGui::ArrowButton("##move_down", ImGuiDir_Down)) {
+            queue_move_plugin(snapshot, channel_plugin.id, 1);
+        }
+        if (!can_move_down) ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::BeginGroup();
         ImGui::TextUnformatted(channel_plugin.label);
@@ -1904,6 +1925,7 @@ void render_input_fx_popup(WireDeckUiSnapshot* snapshot, const char* channel_id)
         }
         render_plugin_param_controls(snapshot, channel_plugin, descriptor);
         ImGui::PopID();
+        channel_plugin_rank += 1;
     }
 
     if (!has_plugins) {

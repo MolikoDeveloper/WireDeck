@@ -111,6 +111,8 @@ pub const UiShell = struct {
             .request_add_plugin_channel_id = zeroedBuffer(64),
             .request_add_plugin_descriptor_id = zeroedBuffer(64),
             .request_remove_plugin_id = zeroedBuffer(64),
+            .request_move_plugin_id = zeroedBuffer(64),
+            .request_move_plugin_delta = 0,
             .request_open_plugin_ui_id = zeroedBuffer(64),
             .request_select_noise_model_path = zeroedBuffer(512),
         };
@@ -621,6 +623,14 @@ pub const UiShell = struct {
             result.changed = true;
             result.routing_changed = true;
         }
+        if (snapshot.request_move_plugin_id[0] != 0 and snapshot.request_move_plugin_delta != 0) {
+            if (movePlugin(state_store, cStringSlice(&snapshot.request_move_plugin_id), snapshot.request_move_plugin_delta)) {
+                result.changed = true;
+                result.routing_changed = true;
+            }
+            clearBuffer(&snapshot.request_move_plugin_id);
+            snapshot.request_move_plugin_delta = 0;
+        }
         if (snapshot.request_select_noise_model_path[0] != 0) clearBuffer(&snapshot.request_select_noise_model_path);
         return result;
     }
@@ -805,9 +815,11 @@ fn addPluginToChannel(state_store: *StateStore, channel_id: []const u8, descript
         .label = descriptor.label,
         .backend = descriptor.backend,
         .enabled = true,
-        .slot = @intCast(next_index - 1),
+        .slot = nextPluginSlotForChannel(state_store, channel_id),
     });
     const owned_plugin_id = state_store.channel_plugins.items[state_store.channel_plugins.items.len - 1].id;
+    normalizeChannelPluginSlots(state_store, channel_id);
+    sortChannelPluginsBySlot(state_store);
     for (descriptor.control_ports) |port| {
         if (port.is_output) continue;
         try state_store.addChannelPluginParam(.{ .plugin_id = owned_plugin_id, .symbol = port.symbol, .value = port.default_value });
@@ -816,13 +828,112 @@ fn addPluginToChannel(state_store: *StateStore, channel_id: []const u8, descript
 }
 
 fn removePlugin(state_store: *StateStore, id: []const u8) !void {
-    if (findPluginIndex(state_store, id)) |index| freeChannelPlugin(state_store.allocator, state_store.channel_plugins.orderedRemove(index));
+    var affected_channel_id: ?[]u8 = null;
+    if (findPluginIndex(state_store, id)) |index| {
+        affected_channel_id = try state_store.allocator.dupe(u8, state_store.channel_plugins.items[index].channel_id);
+        freeChannelPlugin(state_store.allocator, state_store.channel_plugins.orderedRemove(index));
+    }
+    defer if (affected_channel_id) |owned| state_store.allocator.free(owned);
     var i: usize = 0;
     while (i < state_store.channel_plugin_params.items.len) {
         if (std.mem.eql(u8, state_store.channel_plugin_params.items[i].plugin_id, id)) {
             freeChannelPluginParam(state_store.allocator, state_store.channel_plugin_params.orderedRemove(i));
         } else i += 1;
     }
+    if (affected_channel_id) |channel_id| {
+        normalizeChannelPluginSlots(state_store, channel_id);
+        sortChannelPluginsBySlot(state_store);
+    }
+}
+
+fn movePlugin(state_store: *StateStore, plugin_id: []const u8, delta: i32) bool {
+    const plugin_index = findPluginIndex(state_store, plugin_id) orelse return false;
+    const channel_id = state_store.channel_plugins.items[plugin_index].channel_id;
+    var current_position: usize = 0;
+    var target_position: ?usize = null;
+    var ordered_count: usize = 0;
+
+    for (state_store.channel_plugins.items) |plugin| {
+        if (!std.mem.eql(u8, plugin.channel_id, channel_id)) continue;
+        if (std.mem.eql(u8, plugin.id, plugin_id)) {
+            current_position = ordered_count;
+        }
+        ordered_count += 1;
+    }
+    if (ordered_count <= 1) return false;
+    if (delta < 0) {
+        if (current_position == 0) return false;
+        target_position = current_position - 1;
+    } else {
+        if (current_position + 1 >= ordered_count) return false;
+        target_position = current_position + 1;
+    }
+
+    var current_plugin: ?*plugins_mod.ChannelPlugin = null;
+    var target_plugin: ?*plugins_mod.ChannelPlugin = null;
+    ordered_count = 0;
+    for (state_store.channel_plugins.items) |*plugin| {
+        if (!std.mem.eql(u8, plugin.channel_id, channel_id)) continue;
+        if (ordered_count == current_position) current_plugin = plugin;
+        if (ordered_count == target_position.?) target_plugin = plugin;
+        ordered_count += 1;
+    }
+    if (current_plugin == null or target_plugin == null) return false;
+
+    const slot = current_plugin.?.slot;
+    current_plugin.?.slot = target_plugin.?.slot;
+    target_plugin.?.slot = slot;
+    normalizeChannelPluginSlots(state_store, channel_id);
+    sortChannelPluginsBySlot(state_store);
+    return true;
+}
+
+fn nextPluginSlotForChannel(state_store: *const StateStore, channel_id: []const u8) u32 {
+    var max_slot: u32 = 0;
+    var found = false;
+    for (state_store.channel_plugins.items) |plugin| {
+        if (!std.mem.eql(u8, plugin.channel_id, channel_id)) continue;
+        max_slot = @max(max_slot, plugin.slot);
+        found = true;
+    }
+    return if (found) max_slot + 1 else 0;
+}
+
+fn normalizeChannelPluginSlots(state_store: *StateStore, channel_id: []const u8) void {
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var i: usize = 0;
+        while (i < state_store.channel_plugins.items.len) : (i += 1) {
+            var j: usize = i + 1;
+            while (j < state_store.channel_plugins.items.len) : (j += 1) {
+                const lhs = state_store.channel_plugins.items[i];
+                const rhs = state_store.channel_plugins.items[j];
+                if (!std.mem.eql(u8, lhs.channel_id, channel_id) or !std.mem.eql(u8, rhs.channel_id, channel_id)) continue;
+                if (lhs.slot > rhs.slot) {
+                    std.mem.swap(plugins_mod.ChannelPlugin, &state_store.channel_plugins.items[i], &state_store.channel_plugins.items[j]);
+                    changed = true;
+                }
+            }
+        }
+    }
+    var slot: u32 = 0;
+    for (state_store.channel_plugins.items) |*plugin| {
+        if (!std.mem.eql(u8, plugin.channel_id, channel_id)) continue;
+        plugin.slot = slot;
+        slot += 1;
+    }
+}
+
+fn sortChannelPluginsBySlot(state_store: *StateStore) void {
+    std.mem.sort(plugins_mod.ChannelPlugin, state_store.channel_plugins.items, {}, struct {
+        fn lessThan(_: void, lhs: plugins_mod.ChannelPlugin, rhs: plugins_mod.ChannelPlugin) bool {
+            const channel_cmp = std.mem.order(u8, lhs.channel_id, rhs.channel_id);
+            if (channel_cmp != .eq) return channel_cmp == .lt;
+            if (lhs.slot != rhs.slot) return lhs.slot < rhs.slot;
+            return std.mem.order(u8, lhs.id, rhs.id) == .lt;
+        }
+    }.lessThan);
 }
 
 fn syncChannelBindingSelections(state_store: *StateStore) !bool {

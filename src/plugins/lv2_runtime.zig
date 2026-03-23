@@ -126,6 +126,7 @@ pub const Lv2Runtime = if (build_options.enable_lilv) struct {
         plugin_id: []u8,
         channel_id: []u8,
         descriptor_id: []u8,
+        slot: u32 = 0,
         enabled: bool = true,
         supports_plugin_state_sync: bool = false,
         instance: *c.LilvInstance,
@@ -525,6 +526,7 @@ pub const Lv2Runtime = if (build_options.enable_lilv) struct {
             .plugin_id = try self.allocator.dupe(u8, channel_plugin.id),
             .channel_id = try self.allocator.dupe(u8, channel_plugin.channel_id),
             .descriptor_id = try self.allocator.dupe(u8, descriptor.id),
+            .slot = channel_plugin.slot,
             .enabled = channel_plugin.enabled,
             .supports_plugin_state_sync = descriptorSupportsPluginStateSync(descriptor),
             .instance = instance,
@@ -687,6 +689,7 @@ fn applyControlValues(instance: anytype, descriptors: []const host.PluginDescrip
     const descriptor = findDescriptor(descriptors, instance.descriptor_id) orelse return;
     const channel_plugin = findChannelPlugin(channel_plugins, instance.plugin_id) orelse return;
     instance.enabled = channel_plugin.enabled;
+    instance.slot = channel_plugin.slot;
     for (descriptor.control_ports) |control_port| {
         if (control_port.is_output) continue;
         const value = switch (control_port.sync_kind) {
@@ -721,6 +724,7 @@ fn syncedToggleValue(control_port: host.PluginControlPort, enabled: bool) f32 {
 fn sortManagedInstances(_: void, lhs: Lv2Runtime.ManagedInstance, rhs: Lv2Runtime.ManagedInstance) bool {
     const channel_cmp = std.mem.order(u8, lhs.channel_id, rhs.channel_id);
     if (channel_cmp != .eq) return channel_cmp == .lt;
+    if (lhs.slot != rhs.slot) return lhs.slot < rhs.slot;
     return pluginNumericSuffix(lhs.plugin_id) < pluginNumericSuffix(rhs.plugin_id);
 }
 

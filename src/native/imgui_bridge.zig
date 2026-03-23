@@ -156,6 +156,8 @@ pub const UiSnapshot = extern struct {
     request_add_plugin_channel_id: [64]u8,
     request_add_plugin_descriptor_id: [64]u8,
     request_remove_plugin_id: [64]u8,
+    request_move_plugin_id: [64]u8,
+    request_move_plugin_delta: c_int,
     request_open_plugin_ui_id: [64]u8,
     request_select_noise_model_path: [512]u8,
 };
