@@ -18,6 +18,8 @@ typedef struct WireDeckLevelSample {
   double timestamp_seconds;
   float input_level;
   float output_level;
+  float suppressed_noise_level;
+  float voice_preservation_level;
 } WireDeckLevelSample;
 
 typedef struct WireDeckCudaDenoiserUI {
@@ -51,6 +53,8 @@ typedef struct WireDeckCudaDenoiserUI {
   float output_gain_db_value;
   float input_level_value;
   float output_level_value;
+  float suppressed_noise_level_value;
+  float voice_preservation_level_value;
   float model_loaded_value;
   float runtime_phase_value;
   WireDeckLevelSample level_history[WD_LEVEL_HISTORY_CAPACITY];
@@ -187,6 +191,8 @@ wd_ui_append_level_sample(WireDeckCudaDenoiserUI* ui)
   sample->timestamp_seconds = now_seconds;
   sample->input_level = ui->input_level_value;
   sample->output_level = ui->output_level_value;
+  sample->suppressed_noise_level = ui->suppressed_noise_level_value;
+  sample->voice_preservation_level = ui->voice_preservation_level_value;
 }
 
 static gboolean
@@ -235,6 +241,12 @@ wd_ui_render_level_history(GtkWidget* widget, cairo_t* cr, gpointer data)
     }
     if ((double)sample->output_level > max_level) {
       max_level = sample->output_level;
+    }
+    if ((double)sample->suppressed_noise_level > max_level) {
+      max_level = sample->suppressed_noise_level;
+    }
+    if ((double)sample->voice_preservation_level > max_level) {
+      max_level = sample->voice_preservation_level;
     }
   }
   if (max_level < 0.01) {
@@ -311,6 +323,42 @@ wd_ui_render_level_history(GtkWidget* widget, cairo_t* cr, gpointer data)
     cairo_set_source_rgb(cr, 0.98, 0.60, 0.20);
     cairo_set_line_width(cr, 2.0);
     cairo_stroke(cr);
+
+    for (index = 0; index < ui->level_history_count; ++index) {
+      const WireDeckLevelSample* sample = &ui->level_history[(ui->level_history_start + index) % WD_LEVEL_HISTORY_CAPACITY];
+      double age_seconds = now_seconds - sample->timestamp_seconds;
+      double x = graph_right - (age_seconds / WD_LEVEL_HISTORY_WINDOW_SECONDS) * graph_width;
+      float level = sample->suppressed_noise_level;
+      double suppressed_y;
+      wd_ui_clamp_level(&level, (float)max_level);
+      suppressed_y = graph_bottom - (level / max_level) * graph_height;
+      if (index == 0) {
+        cairo_move_to(cr, x, suppressed_y);
+      } else {
+        cairo_line_to(cr, x, suppressed_y);
+      }
+    }
+    cairo_set_source_rgb(cr, 0.86, 0.28, 0.23);
+    cairo_set_line_width(cr, 1.8);
+    cairo_stroke(cr);
+
+    for (index = 0; index < ui->level_history_count; ++index) {
+      const WireDeckLevelSample* sample = &ui->level_history[(ui->level_history_start + index) % WD_LEVEL_HISTORY_CAPACITY];
+      double age_seconds = now_seconds - sample->timestamp_seconds;
+      double x = graph_right - (age_seconds / WD_LEVEL_HISTORY_WINDOW_SECONDS) * graph_width;
+      float level = sample->voice_preservation_level;
+      double voice_y;
+      wd_ui_clamp_level(&level, (float)max_level);
+      voice_y = graph_bottom - (level / max_level) * graph_height;
+      if (index == 0) {
+        cairo_move_to(cr, x, voice_y);
+      } else {
+        cairo_line_to(cr, x, voice_y);
+      }
+    }
+    cairo_set_source_rgb(cr, 0.36, 0.82, 0.43);
+    cairo_set_line_width(cr, 1.8);
+    cairo_stroke(cr);
   }
 
   cairo_reset_clip(cr);
@@ -328,6 +376,20 @@ wd_ui_render_level_history(GtkWidget* widget, cairo_t* cr, gpointer data)
   cairo_set_source_rgb(cr, 0.88, 0.89, 0.91);
   cairo_move_to(cr, graph_left + 96.0, 9.0);
   cairo_show_text(cr, "Output");
+
+  cairo_set_source_rgb(cr, 0.86, 0.28, 0.23);
+  cairo_rectangle(cr, graph_left + 156.0, 4.0, 14.0, 3.0);
+  cairo_fill(cr);
+  cairo_set_source_rgb(cr, 0.88, 0.89, 0.91);
+  cairo_move_to(cr, graph_left + 176.0, 9.0);
+  cairo_show_text(cr, "Suppression");
+
+  cairo_set_source_rgb(cr, 0.36, 0.82, 0.43);
+  cairo_rectangle(cr, graph_left + 262.0, 4.0, 14.0, 3.0);
+  cairo_fill(cr);
+  cairo_set_source_rgb(cr, 0.88, 0.89, 0.91);
+  cairo_move_to(cr, graph_left + 282.0, 9.0);
+  cairo_show_text(cr, "Mask Keep");
 
   return FALSE;
 }
@@ -422,9 +484,11 @@ wd_ui_refresh_runtime_debug(WireDeckCudaDenoiserUI* ui)
     snprintf(
       text,
       sizeof(text),
-      "Levels (60s): input %.6f | output %.6f",
+      "Levels (60s): input %.6f | output %.6f | suppression_est %.6f | mask_keep %.6f",
       ui->input_level_value,
-      ui->output_level_value);
+      ui->output_level_value,
+      ui->suppressed_noise_level_value,
+      ui->voice_preservation_level_value);
     gtk_label_set_text(GTK_LABEL(ui->level_history_caption), text);
   }
   if (ui->level_history_area) {
@@ -697,6 +761,8 @@ wd_ui_instantiate(const struct LV2UI_Descriptor* descriptor,
   ui->output_gain_db_value = 0.0f;
   ui->input_level_value = 0.0f;
   ui->output_level_value = 0.0f;
+  ui->suppressed_noise_level_value = 0.0f;
+  ui->voice_preservation_level_value = 0.0f;
   ui->model_loaded_value = 0.0f;
   ui->runtime_phase_value = (float)WD_RUNTIME_IDLE;
   ui->gpu_index_value = -1;
@@ -755,7 +821,7 @@ wd_ui_instantiate(const struct LV2UI_Descriptor* descriptor,
   gtk_scale_set_digits(GTK_SCALE(ui->threshold_scale), 2);
   gtk_table_attach(GTK_TABLE(content), ui->threshold_scale, 1, 2, 3, 4, GTK_EXPAND | GTK_FILL, GTK_FILL, 0, 0);
 
-  buffer_ms_label = gtk_label_new("Buffer size (ms)");
+  buffer_ms_label = gtk_label_new("Output delay (ms)");
   gtk_misc_set_alignment(GTK_MISC(buffer_ms_label), 0.0f, 0.5f);
   gtk_table_attach(GTK_TABLE(content), buffer_ms_label, 0, 1, 4, 5, GTK_FILL, GTK_FILL, 0, 0);
 
@@ -902,6 +968,16 @@ wd_ui_port_event(LV2UI_Handle handle, uint32_t port_index, uint32_t buffer_size,
     break;
   case WD_PORT_OUTPUT_LEVEL:
     ui->output_level_value = value;
+    wd_ui_append_level_sample(ui);
+    wd_ui_refresh_runtime_debug(ui);
+    break;
+  case WD_PORT_SUPPRESSED_NOISE_LEVEL:
+    ui->suppressed_noise_level_value = value;
+    wd_ui_append_level_sample(ui);
+    wd_ui_refresh_runtime_debug(ui);
+    break;
+  case WD_PORT_VOICE_PRESERVATION_LEVEL:
+    ui->voice_preservation_level_value = value;
     wd_ui_append_level_sample(ui);
     wd_ui_refresh_runtime_debug(ui);
     break;

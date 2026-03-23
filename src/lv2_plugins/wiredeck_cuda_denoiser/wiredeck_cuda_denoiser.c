@@ -59,6 +59,8 @@ typedef struct WireDeckCudaDenoiser {
   float* output_level;
   float* model_loaded;
   float* runtime_phase;
+  float* suppressed_noise_level;
+  float* voice_preservation_level;
   const float* input_l;
   const float* input_r;
   float* output_l;
@@ -766,6 +768,12 @@ wd_connect_port(LV2_Handle instance, uint32_t port, void* data)
   case WD_PORT_RUNTIME_PHASE:
     self->runtime_phase = (float*)data;
     break;
+  case WD_PORT_SUPPRESSED_NOISE_LEVEL:
+    self->suppressed_noise_level = (float*)data;
+    break;
+  case WD_PORT_VOICE_PRESERVATION_LEVEL:
+    self->voice_preservation_level = (float*)data;
+    break;
   case WD_PORT_INPUT_L:
     self->input_l = (const float*)data;
     break;
@@ -803,6 +811,8 @@ wd_run(LV2_Handle instance, uint32_t sample_count)
   unsigned int expected_sample_rate_hz = 48000u;
   float block_input_peak = 0.0f;
   float block_output_peak = 0.0f;
+  float suppressed_noise_level = 0.0f;
+  float voice_preservation_level = 0.0f;
   unsigned int requested_delay_samples = 0;
   float reduction = self->threshold ? *self->threshold : 0.8f;
   float mix = self->mix ? *self->mix : 1.0f;
@@ -980,6 +990,21 @@ wd_run(LV2_Handle instance, uint32_t sample_count)
   }
   if (self->output_level) {
     *self->output_level = block_output_peak;
+  }
+  if (status_code == WD_STATUS_WDGP_MODEL_READY && runtime_matches_request && runtime) {
+    float mask_keep = runtime->last_mask_mean;
+    if (mask_keep < 0.0f) mask_keep = 0.0f;
+    if (mask_keep > 1.0f) mask_keep = 1.0f;
+    suppressed_noise_level = block_input_peak * (1.0f - mask_keep);
+    /* This port is used by the UI as a mask-keep estimate. It is not a real
+       voice detector, so keep it tied to the retained mask energy only. */
+    voice_preservation_level = block_output_peak * mask_keep;
+  }
+  if (self->suppressed_noise_level) {
+    *self->suppressed_noise_level = suppressed_noise_level;
+  }
+  if (self->voice_preservation_level) {
+    *self->voice_preservation_level = voice_preservation_level;
   }
   if (self->runtime_phase && *self->runtime_phase == (float)WD_RUNTIME_RUNNING) {
     *self->runtime_phase = (float)WD_RUNTIME_IDLE;

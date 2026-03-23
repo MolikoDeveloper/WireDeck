@@ -48,6 +48,28 @@ wd_backend_error(char* error_message, size_t error_message_size, const char* fmt
   snprintf(error_message, error_message_size, fmt ? fmt : "%s", value ? value : "");
 }
 
+static unsigned int
+wd_effective_temporal_radius(const WireDeckWdgpModel* model)
+{
+  unsigned int block_count;
+  unsigned int kernel_radius;
+  if (!model) {
+    return 0;
+  }
+  block_count = model->metadata.residual_blocks > 0 ? (unsigned int)model->metadata.residual_blocks : 0u;
+  kernel_radius = model->metadata.kernel_time > 1 ? (unsigned int)(model->metadata.kernel_time / 2) : 0u;
+  return block_count * 2u * kernel_radius;
+}
+
+static unsigned int
+wd_effective_sequence_frames(const WireDeckWdgpModel* model)
+{
+  unsigned int radius = wd_effective_temporal_radius(model);
+  unsigned int lookahead = (model && model->metadata.lookahead_frames > 0) ? (unsigned int)model->metadata.lookahead_frames : 0u;
+  unsigned int frames = (radius * 2u) + 1u + lookahead;
+  return frames > 0u ? frames : 1u;
+}
+
 static const WireDeckCudaWeightBuffer*
 wd_find_weight_buffer(const WireDeckCudaBackend* backend, const char* name)
 {
@@ -589,14 +611,10 @@ wd_cuda_backend_prepare(
     backend->weights[index].size_bytes = tensor->byte_length;
   }
   backend->weights_ready = 1;
-  backend->sequence_frames = (unsigned int)(model->metadata.kernel_time + (model->metadata.lookahead_frames > 0 ? model->metadata.lookahead_frames : 0));
-  if (backend->sequence_frames == 0) {
-    backend->sequence_frames = 1;
-  }
-  if ((unsigned int)(model->metadata.lookahead_frames > 0 ? model->metadata.lookahead_frames : 0) >= backend->sequence_frames) {
-    backend->target_frame_index = 0;
-  } else {
-    backend->target_frame_index = backend->sequence_frames - 1u - (unsigned int)(model->metadata.lookahead_frames > 0 ? model->metadata.lookahead_frames : 0);
+  backend->sequence_frames = wd_effective_sequence_frames(model);
+  backend->target_frame_index = wd_effective_temporal_radius(model);
+  if (backend->target_frame_index >= backend->sequence_frames) {
+    backend->target_frame_index = backend->sequence_frames - 1u;
   }
   backend->input_size_bytes = (size_t)backend->sequence_frames * (size_t)model->metadata.bands * sizeof(float);
   backend->channels_size_bytes = (size_t)model->metadata.channels * (size_t)backend->sequence_frames * (size_t)model->metadata.bands * sizeof(float);
@@ -747,7 +765,9 @@ wd_cuda_backend_run_model(
     *out_mask_mean = mask_mean / (float)bands;
   }
   if (out_vad) {
-    *out_vad = mask_mean / (float)bands;
+    /* A true VAD head is not executed in the LV2 runtime yet. Keep this
+       output neutral instead of mirroring mask_mean and pretending it is VAD. */
+    *out_vad = 0.0f;
   }
   if (error_message && error_message_size > 0) error_message[0] = '\0';
   return 1;

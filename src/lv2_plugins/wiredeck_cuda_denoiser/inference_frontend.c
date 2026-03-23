@@ -57,6 +57,28 @@ wd_resample_linear(const float* input, int input_size, float* output, int output
   }
 }
 
+static int
+wd_effective_temporal_radius(const WireDeckWdgpMetadata* metadata)
+{
+  int block_count;
+  int kernel_radius;
+  if (!metadata) {
+    return 0;
+  }
+  block_count = metadata->residual_blocks > 0 ? metadata->residual_blocks : 0;
+  kernel_radius = metadata->kernel_time > 1 ? metadata->kernel_time / 2 : 0;
+  return block_count * 2 * kernel_radius;
+}
+
+static int
+wd_effective_temporal_frames(const WireDeckWdgpMetadata* metadata)
+{
+  int radius = wd_effective_temporal_radius(metadata);
+  int lookahead = (metadata && metadata->lookahead_frames > 0) ? metadata->lookahead_frames : 0;
+  int frames = (radius * 2) + 1 + lookahead;
+  return frames > 0 ? frames : 1;
+}
+
 static void
 wd_fft_inplace(float* real, float* imag, int size, int inverse)
 {
@@ -208,9 +230,13 @@ wd_frontend_prepare(WireDeckInferenceFrontend* frontend, const WireDeckWdgpMetad
   frontend->bands = metadata->bands;
   frontend->fft_bins = (metadata->stft_size / 2) + 1;
   frontend->lookahead_frames = metadata->lookahead_frames > 0 ? metadata->lookahead_frames : 0;
-  frontend->temporal_frames = metadata->kernel_time + frontend->lookahead_frames;
-  if (frontend->temporal_frames <= 0) {
-    frontend->temporal_frames = 1;
+  frontend->temporal_frames = wd_effective_temporal_frames(metadata);
+  frontend->target_frame_index = wd_effective_temporal_radius(metadata);
+  if (frontend->target_frame_index < 0) {
+    frontend->target_frame_index = 0;
+  }
+  if (frontend->target_frame_index >= frontend->temporal_frames) {
+    frontend->target_frame_index = frontend->temporal_frames - 1;
   }
   temporal_feature_count = (size_t)frontend->temporal_frames * (size_t)frontend->bands;
   temporal_spectrum_count = (size_t)frontend->temporal_frames * (size_t)frontend->fft_bins;
@@ -307,7 +333,7 @@ wd_frontend_apply_mask_and_synthesize(WireDeckInferenceFrontend* frontend, const
   const float* source_real;
   const float* source_imag;
 
-  if (!frontend || !band_mask || !frontend->fft_real || !frontend->fft_imag || !frontend->synthesis_frame || !frontend->ola_buffer || !frontend->shaped_mask || !frontend->expanded_mask || frontend->temporal_frame_count <= frontend->lookahead_frames) {
+  if (!frontend || !band_mask || !frontend->fft_real || !frontend->fft_imag || !frontend->synthesis_frame || !frontend->ola_buffer || !frontend->shaped_mask || !frontend->expanded_mask || frontend->temporal_frame_count <= frontend->target_frame_index) {
     return;
   }
   if (reduction_strength < 0.0f) reduction_strength = 0.0f;
@@ -321,9 +347,9 @@ wd_frontend_apply_mask_and_synthesize(WireDeckInferenceFrontend* frontend, const
   }
 
   wd_resample_linear(frontend->shaped_mask, frontend->bands, frontend->expanded_mask, frontend->fft_bins);
-  target_frame = frontend->temporal_frame_count - 1 - frontend->lookahead_frames;
-  if (target_frame < 0) {
-    target_frame = 0;
+  target_frame = frontend->target_frame_index;
+  if (target_frame >= frontend->temporal_frame_count) {
+    target_frame = frontend->temporal_frame_count - 1;
   }
   source_real = frontend->spectrum_real_history + (size_t)target_frame * (size_t)frontend->fft_bins;
   source_imag = frontend->spectrum_imag_history + (size_t)target_frame * (size_t)frontend->fft_bins;

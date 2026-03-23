@@ -14,6 +14,7 @@ typedef struct WireDeckInferenceFrontend {
   int fft_bins;
   int lookahead_frames;
   int temporal_frames;
+  int target_frame_index;
   int temporal_frame_count;
   int write_index;
   int hop_accumulator;

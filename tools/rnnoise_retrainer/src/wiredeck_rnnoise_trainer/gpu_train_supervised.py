@@ -25,6 +25,34 @@ from wiredeck_rnnoise_trainer.gpu_train import (
 )
 
 
+def _load_existing_summary(summary_path: Path) -> dict[str, object]:
+    if not summary_path.exists():
+        return {}
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return summary if isinstance(summary, dict) else {}
+
+
+def _effective_temporal_radius(config: WireDeckVoiceDenoiserConfig) -> int:
+    block_count = max(0, int(config.residual_blocks))
+    kernel_radius = max(0, int(config.kernel_time) // 2)
+    return block_count * 2 * kernel_radius
+
+
+def _effective_realtime_sequence(config: WireDeckVoiceDenoiserConfig) -> tuple[int, int]:
+    radius = _effective_temporal_radius(config)
+    lookahead = max(0, int(config.lookahead_frames))
+    sequence_frames = (radius * 2) + 1 + lookahead
+    if sequence_frames <= 0:
+        sequence_frames = 1
+    target_frame_index = radius
+    if target_frame_index >= sequence_frames:
+        target_frame_index = sequence_frames - 1
+    return sequence_frames, target_frame_index
+
+
 class SupervisedNoisySpeechDataset(Dataset):
     def __init__(
         self,
@@ -44,12 +72,15 @@ class SupervisedNoisySpeechDataset(Dataset):
         low_speech_probability: float,
         low_speech_extra_min_db: float,
         low_speech_extra_max_db: float,
+        allow_noise_amplification: bool,
         vad_positive_snr_db: float,
         vad_negative_snr_db: float,
         vad_energy_threshold: float,
         state_noise_energy_threshold: float,
         state_speech_dominant_snr_db: float,
         state_noise_dominant_snr_db: float,
+        realtime_sequence_frames: int = 0,
+        realtime_target_frame_index: int = 0,
         seed: int = 0,
     ) -> None:
         self.speech_files = speech_files
@@ -68,20 +99,51 @@ class SupervisedNoisySpeechDataset(Dataset):
         self.low_speech_probability = low_speech_probability
         self.low_speech_extra_min_db = low_speech_extra_min_db
         self.low_speech_extra_max_db = low_speech_extra_max_db
+        self.allow_noise_amplification = allow_noise_amplification
         self.vad_positive_snr_db = vad_positive_snr_db
         self.vad_negative_snr_db = vad_negative_snr_db
         self.vad_energy_threshold = vad_energy_threshold
         self.state_noise_energy_threshold = state_noise_energy_threshold
         self.state_speech_dominant_snr_db = state_speech_dominant_snr_db
         self.state_noise_dominant_snr_db = state_noise_dominant_snr_db
+        self.realtime_sequence_frames = realtime_sequence_frames
+        self.realtime_target_frame_index = realtime_target_frame_index
         self.seed = seed
         self.window = torch.hann_window(stft_size)
+        self.current_epoch = 0
+        self._speech_cycle_index = -1
+        self._speech_cycle_order: list[Path] = list(self.speech_files)
 
     def __len__(self) -> int:
         return self.samples_per_epoch
 
-    def _build_example(self, rng: random.Random) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        speech_path = self.speech_files[rng.randrange(len(self.speech_files))]
+    def set_epoch(self, epoch: int) -> None:
+        self.current_epoch = max(0, int(epoch))
+
+    def _speech_order_for_cycle(self, cycle_index: int) -> list[Path]:
+        if cycle_index != self._speech_cycle_index:
+            rng = random.Random(self.seed + (cycle_index * 1_000_003))
+            order = list(self.speech_files)
+            rng.shuffle(order)
+            self._speech_cycle_order = order
+            self._speech_cycle_index = cycle_index
+        return self._speech_cycle_order
+
+    def _speech_path_for_sample(self, index: int) -> Path:
+        global_index = (self.current_epoch * self.samples_per_epoch) + index
+        cycle_size = max(1, len(self.speech_files))
+        cycle_index = global_index // cycle_size
+        cycle_offset = global_index % cycle_size
+        order = self._speech_order_for_cycle(cycle_index)
+        return order[cycle_offset]
+
+    def _build_example(
+        self,
+        rng: random.Random,
+        speech_path: Path | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if speech_path is None:
+            speech_path = self.speech_files[rng.randrange(len(self.speech_files))]
         noise_path = self.noise_files[rng.randrange(len(self.noise_files))]
 
         clean = torch.from_numpy(_read_segment(speech_path, self.segment_samples, rng))
@@ -103,7 +165,10 @@ class SupervisedNoisySpeechDataset(Dataset):
             clean_rms = clean.square().mean().sqrt().clamp_min(1.0e-4)
             noise_rms = noise.square().mean().sqrt().clamp_min(1.0e-4)
             desired_noise_rms = clean_rms / (10.0 ** (target_snr_db / 20.0))
-            noise = noise * (desired_noise_rms / noise_rms)
+            noise_scale = desired_noise_rms / noise_rms
+            if not self.allow_noise_amplification:
+                noise_scale = min(1.0, float(noise_scale))
+            noise = noise * noise_scale
 
         noisy = torch.clamp(clean + noise, -1.0, 1.0)
         clean_mag, noise_mag, noisy_mag = self._spectrogram_triplet(clean, noise, noisy)
@@ -118,11 +183,21 @@ class SupervisedNoisySpeechDataset(Dataset):
         vad_energy_gate = (speech_energy > self.vad_energy_threshold).to(dtype=torch.float32)
         vad_target = vad_energy_gate * vad_snr_score
         state_target = self._build_state_target(speech_energy.squeeze(1), noise_energy.squeeze(1), frame_snr_db.squeeze(1))
+        if self.realtime_sequence_frames > 0:
+            features, mask_target, vad_target, state_target = self._crop_realtime_window(
+                rng,
+                features,
+                mask_target,
+                vad_target,
+                state_target,
+            )
         return features, mask_target, vad_target, state_target, clean, noise, noisy
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        rng = random.Random(self.seed + index)
-        features, mask_target, vad_target, state_target, _, _, _ = self._build_example(rng)
+        global_index = (self.current_epoch * self.samples_per_epoch) + index
+        rng = random.Random(self.seed + global_index)
+        speech_path = self._speech_path_for_sample(index)
+        features, mask_target, vad_target, state_target, _, _, _ = self._build_example(rng, speech_path=speech_path)
         return features, mask_target, vad_target, state_target
 
     def build_preview(self, epoch: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -181,6 +256,44 @@ class SupervisedNoisySpeechDataset(Dataset):
         state_target = torch.where(mixed, torch.full_like(state_target, 2), state_target)
         return state_target
 
+    def _crop_realtime_window(
+        self,
+        rng: random.Random,
+        features: torch.Tensor,
+        mask_target: torch.Tensor,
+        vad_target: torch.Tensor,
+        state_target: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        sequence_frames = self.realtime_sequence_frames
+        target_frame_index = self.realtime_target_frame_index
+        total_frames = int(features.shape[0])
+
+        if sequence_frames <= 0 or total_frames <= 0:
+          return features, mask_target, vad_target, state_target
+
+        if total_frames < sequence_frames:
+            pad_frames = sequence_frames - total_frames
+            features = F.pad(features, (0, 0, 0, pad_frames))
+            mask_target = F.pad(mask_target, (0, 0, 0, pad_frames))
+            vad_target = F.pad(vad_target, (0, 0, 0, pad_frames))
+            state_target = F.pad(state_target, (0, pad_frames), value=0)
+            return features, mask_target, vad_target, state_target
+
+        min_target_frame = target_frame_index
+        max_target_frame = total_frames - (sequence_frames - target_frame_index)
+        if max_target_frame < min_target_frame:
+            start = max(0, total_frames - sequence_frames)
+        else:
+            target_frame = rng.randint(min_target_frame, max_target_frame)
+            start = target_frame - target_frame_index
+        end = start + sequence_frames
+        return (
+            features[start:end],
+            mask_target[start:end],
+            vad_target[start:end],
+            state_target[start:end],
+        )
+
 
 class WireDeckSupervisedVoiceDenoiser(nn.Module):
     def __init__(self, config: WireDeckVoiceDenoiserConfig | None = None, state_hidden_channels: int | None = None) -> None:
@@ -225,6 +338,7 @@ def _render_preview(
     *,
     stft_size: int,
     hop_size: int,
+    write_audio_files: bool = True,
 ) -> dict[str, float | str]:
     features, _, _, state_target, clean, noise, noisy = preview
     preview_dir = output_dir / "epoch_audio"
@@ -265,13 +379,10 @@ def _render_preview(
     ).cpu()
 
     sample_path = preview_dir / f"epoch-{epoch:03d}-sample.wav"
-    noise_path = preview_dir / f"epoch-{epoch:03d}-noise.wav"
-    voice_path = preview_dir / f"epoch-{epoch:03d}-voice.wav"
-    output_path = preview_dir / f"epoch-{epoch:03d}-output.wav"
-    write_audio_mono_48k(sample_path, noisy_cpu.numpy())
-    write_audio_mono_48k(noise_path, noise_cpu.numpy())
-    write_audio_mono_48k(voice_path, clean_cpu.numpy())
-    write_audio_mono_48k(output_path, enhanced.numpy())
+    output_path = preview_dir / f"epoch-{epoch:03d}-suppressed.wav"
+    if write_audio_files:
+        write_audio_mono_48k(sample_path, noisy_cpu.numpy())
+        write_audio_mono_48k(output_path, enhanced.numpy())
 
     residual = enhanced - clean_cpu
     noise_rms = max(_tensor_rms(noise_cpu), 1.0e-6)
@@ -355,10 +466,8 @@ def _render_preview(
     mixed_noise_reduction_pct = _noise_reduction(mixed_frames)
 
     return {
-        "preview_sample_path": str(sample_path.resolve()),
-        "preview_noise_path": str(noise_path.resolve()),
-        "preview_voice_path": str(voice_path.resolve()),
-        "preview_output_path": str(output_path.resolve()),
+        "preview_sample_path": str(sample_path.resolve()) if write_audio_files else "",
+        "preview_suppressed_path": str(output_path.resolve()) if write_audio_files else "",
         "preview_mask_mean": float(mask_pred_cpu.mean().item()),
         "preview_vad_mean_pct": vad_mean_pct,
         "preview_cancellation_pct": cancellation_pct,
@@ -373,6 +482,74 @@ def _render_preview(
         "preview_output_rms": output_rms,
         "preview_noise_rms": noise_rms,
         "preview_residual_rms": residual_rms,
+    }
+
+
+def _render_fixed_preview_audio(
+    model: WireDeckSupervisedVoiceDenoiser,
+    config: WireDeckVoiceDenoiserConfig,
+    device: torch.device,
+    output_dir: Path,
+    epoch: int,
+    preview_audio_path: Path,
+    *,
+    segment_samples: int,
+    stft_size: int,
+    hop_size: int,
+) -> dict[str, float | str]:
+    preview_dir = output_dir / "epoch_audio"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+
+    noisy_cpu = torch.from_numpy(_read_segment(preview_audio_path, segment_samples, random.Random(0))).to(dtype=torch.float32)
+    features_batch = _build_centered_features(noisy_cpu, config.bands, stft_size, hop_size).unsqueeze(0).to(device=device, dtype=torch.float32)
+    window = torch.hann_window(stft_size)
+
+    with torch.no_grad():
+        mask_pred, vad_pred, state_logits = model(features_batch)
+        mask_pred_cpu = mask_pred.squeeze(0).cpu()
+        vad_pred_cpu = vad_pred.squeeze(0).squeeze(-1).cpu()
+        state_probs = torch.softmax(state_logits.squeeze(0), dim=-1).cpu()
+
+    noisy_spec = torch.stft(
+        noisy_cpu,
+        n_fft=stft_size,
+        hop_length=hop_size,
+        win_length=stft_size,
+        window=window,
+        center=True,
+        return_complex=True,
+    ).transpose(0, 1)
+    freq_bins = noisy_spec.shape[1]
+    mask_full = _compress_to_freq_bins(mask_pred_cpu, freq_bins)
+    enhanced_spec = noisy_spec * mask_full.to(dtype=noisy_spec.dtype)
+    enhanced = torch.istft(
+        enhanced_spec.transpose(0, 1),
+        n_fft=stft_size,
+        hop_length=hop_size,
+        win_length=stft_size,
+        window=window,
+        center=True,
+        length=int(noisy_cpu.shape[0]),
+    ).cpu()
+
+    output_path = preview_dir / f"epoch-{epoch:03d}-suppressed.wav"
+    write_audio_mono_48k(output_path, enhanced.numpy())
+
+    input_rms = _tensor_rms(noisy_cpu)
+    output_rms = _tensor_rms(enhanced)
+    cancellation_pct = max(0.0, min(100.0, 100.0 * (1.0 - (output_rms / max(input_rms, 1.0e-6)))))
+
+    return {
+        "fixed_preview_source_path": str(preview_audio_path.resolve()),
+        "fixed_preview_suppressed_path": str(output_path.resolve()),
+        "fixed_preview_mask_mean": float(mask_pred_cpu.mean().item()),
+        "fixed_preview_vad_mean_pct": float(vad_pred_cpu.mean().item() * 100.0),
+        "fixed_preview_noise_detected_pct": float(state_probs[:, 0].mean().item() * 100.0),
+        "fixed_preview_speech_detected_pct": float(state_probs[:, 1].mean().item() * 100.0),
+        "fixed_preview_mixed_detected_pct": float(state_probs[:, 2].mean().item() * 100.0),
+        "fixed_preview_cancellation_pct": cancellation_pct,
+        "fixed_preview_input_rms": input_rms,
+        "fixed_preview_output_rms": output_rms,
     }
 
 
@@ -437,6 +614,7 @@ def train_gpu_supervised_model(
     low_speech_probability: float,
     low_speech_extra_min_db: float,
     low_speech_extra_max_db: float,
+    allow_noise_amplification: bool,
     vad_positive_snr_db: float,
     vad_negative_snr_db: float,
     vad_energy_threshold: float,
@@ -446,6 +624,8 @@ def train_gpu_supervised_model(
     state_speech_dominant_snr_db: float,
     state_noise_dominant_snr_db: float,
     state_hidden_channels: int | None,
+    realtime_supervision: bool,
+    preview_audio_path: Path | None,
 ) -> dict[str, object]:
     if sample_rate_hz != 48_000:
         raise ValueError("the current trainer expects 48 kHz normalized WAV files")
@@ -464,6 +644,11 @@ def train_gpu_supervised_model(
     if state_speech_dominant_snr_db <= state_noise_dominant_snr_db:
         raise ValueError("state_speech_dominant_snr_db must be greater than state_noise_dominant_snr_db")
 
+    realtime_sequence_frames = 0
+    realtime_target_frame_index = 0
+    if realtime_supervision:
+        realtime_sequence_frames, realtime_target_frame_index = _effective_realtime_sequence(config)
+
     speech_files = list_wav_files(speech_dir)
     base_noise_files = list_wav_files(noise_dir)
     noise_files = build_weighted_noise_file_list(
@@ -479,6 +664,8 @@ def train_gpu_supervised_model(
         raise FileNotFoundError(f"no speech wav files found in {speech_dir}")
     if not base_noise_files:
         raise FileNotFoundError(f"no noise wav files found in {noise_dir}")
+    if preview_audio_path is not None and not preview_audio_path.exists():
+        raise FileNotFoundError(f"preview audio file not found: {preview_audio_path}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     device = choose_training_device(force_device=device_name, allow_cpu=allow_cpu)
@@ -501,12 +688,15 @@ def train_gpu_supervised_model(
         low_speech_probability=low_speech_probability,
         low_speech_extra_min_db=low_speech_extra_min_db,
         low_speech_extra_max_db=low_speech_extra_max_db,
+        allow_noise_amplification=allow_noise_amplification,
         vad_positive_snr_db=vad_positive_snr_db,
         vad_negative_snr_db=vad_negative_snr_db,
         vad_energy_threshold=vad_energy_threshold,
         state_noise_energy_threshold=state_noise_energy_threshold,
         state_speech_dominant_snr_db=state_speech_dominant_snr_db,
         state_noise_dominant_snr_db=state_noise_dominant_snr_db,
+        realtime_sequence_frames=realtime_sequence_frames,
+        realtime_target_frame_index=realtime_target_frame_index,
         seed=seed,
     )
     dataloader = DataLoader(
@@ -523,7 +713,21 @@ def train_gpu_supervised_model(
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     start_epoch = 0
     summary_path = output_dir / "training_summary.json"
+    previous_summary = _load_existing_summary(summary_path)
     history: list[dict[str, float]] = _load_existing_history(summary_path)
+    previous_best_checkpoint = previous_summary.get("best_checkpoint")
+    best_mask_loss = float("inf")
+    best_checkpoint: Path | None = None
+    if history:
+        historical_mask_losses = [
+            float(entry["mask_loss"])
+            for entry in history
+            if isinstance(entry, dict) and "mask_loss" in entry
+        ]
+        if historical_mask_losses:
+            best_mask_loss = min(historical_mask_losses)
+        if isinstance(previous_best_checkpoint, str) and previous_best_checkpoint:
+            best_checkpoint = Path(previous_best_checkpoint)
 
     if initial_checkpoint is not None:
         state = torch.load(initial_checkpoint, map_location="cpu")
@@ -555,11 +759,30 @@ def train_gpu_supervised_model(
                     f"(missing={len(skipped_missing)} shape_mismatch={len(skipped_shape)})"
                 )
 
+    # Fine-tuning should start from the caller-provided LR schedule, not resume
+    # the previous run's annealing phase. Restoring the old scheduler can make
+    # the LR spike or follow an unrelated cycle after a checkpoint handoff.
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
-    best_mask_loss = float("inf")
-    best_checkpoint: Path | None = None
+    if initial_checkpoint is not None and isinstance(state, dict):
+        scheduler_state = state.get("scheduler_state_dict")
+        if isinstance(scheduler_state, dict):
+            print("[wiredeck-rnnoise] scheduler state ignored; starting a fresh LR schedule for this finetune run")
+
+    print(
+        "[wiredeck-rnnoise] supervised training start_epoch={start_epoch:03d} "
+        "target_end_epoch={end_epoch:03d} lr={lr:.6f} clip={clip:.2f}s realtime={realtime} seq_frames={seq_frames} target_frame={target_frame}".format(
+            start_epoch=start_epoch,
+            end_epoch=start_epoch + epochs,
+            lr=learning_rate,
+            clip=clip_seconds,
+            realtime="yes" if realtime_supervision else "no",
+            seq_frames=realtime_sequence_frames,
+            target_frame=realtime_target_frame_index,
+        )
+    )
 
     for epoch in range(start_epoch + 1, start_epoch + epochs + 1):
+        dataset.set_epoch(epoch - 1)
         model.train()
         total_loss = 0.0
         total_mask_loss = 0.0
@@ -575,9 +798,23 @@ def train_gpu_supervised_model(
 
             optimizer.zero_grad(set_to_none=True)
             mask_pred, vad_pred, state_logits = model(features)
-            mask_loss = F.l1_loss(mask_pred, mask_target)
-            vad_loss = F.binary_cross_entropy(vad_pred.clamp(1.0e-4, 1.0 - 1.0e-4), vad_target)
-            state_loss = F.cross_entropy(state_logits.reshape(-1, 3), state_target.reshape(-1))
+            if realtime_supervision:
+                mask_loss = F.l1_loss(
+                    mask_pred[:, realtime_target_frame_index, :],
+                    mask_target[:, realtime_target_frame_index, :],
+                )
+                vad_loss = F.binary_cross_entropy(
+                    vad_pred[:, realtime_target_frame_index, :].clamp(1.0e-4, 1.0 - 1.0e-4),
+                    vad_target[:, realtime_target_frame_index, :],
+                )
+                state_loss = F.cross_entropy(
+                    state_logits[:, realtime_target_frame_index, :],
+                    state_target[:, realtime_target_frame_index],
+                )
+            else:
+                mask_loss = F.l1_loss(mask_pred, mask_target)
+                vad_loss = F.binary_cross_entropy(vad_pred.clamp(1.0e-4, 1.0 - 1.0e-4), vad_target)
+                state_loss = F.cross_entropy(state_logits.reshape(-1, 3), state_target.reshape(-1))
             loss = mask_loss + vad_loss_weight * vad_loss + state_loss_weight * state_loss
             loss.backward()
             optimizer.step()
@@ -606,10 +843,24 @@ def train_gpu_supervised_model(
             dataset.build_preview(epoch),
             stft_size=stft_size,
             hop_size=hop_size,
+            write_audio_files=preview_audio_path is None,
         )
+        if preview_audio_path is not None:
+            fixed_preview_metrics = _render_fixed_preview_audio(
+                model,
+                config,
+                device,
+                output_dir,
+                epoch,
+                preview_audio_path,
+                segment_samples=segment_samples,
+                stft_size=stft_size,
+                hop_size=hop_size,
+            )
+            preview_metrics.update(fixed_preview_metrics)
         metrics.update(preview_metrics)
         history.append(metrics)
-        checkpoint = save_checkpoint(model, optimizer, output_dir, epoch, config, metrics)
+        checkpoint = save_checkpoint(model, optimizer, output_dir, epoch, config, metrics, scheduler=scheduler)
         if metrics["mask_loss"] < best_mask_loss:
             best_mask_loss = metrics["mask_loss"]
             best_checkpoint = checkpoint
@@ -640,6 +891,18 @@ def train_gpu_supervised_model(
                 output_rms=metrics["preview_output_rms"],
             )
         )
+        if preview_audio_path is not None:
+            print(
+                "[wiredeck-rnnoise] fixed preview epoch {epoch:03d} speech={speech:.2f}% mixed={mixed:.2f}% noise={noise:.2f}% cancel={cancel:.2f}% input_rms={input_rms:.6f} output_rms={output_rms:.6f}".format(
+                    epoch=epoch,
+                    speech=metrics["fixed_preview_speech_detected_pct"],
+                    mixed=metrics["fixed_preview_mixed_detected_pct"],
+                    noise=metrics["fixed_preview_noise_detected_pct"],
+                    cancel=metrics["fixed_preview_cancellation_pct"],
+                    input_rms=metrics["fixed_preview_input_rms"],
+                    output_rms=metrics["fixed_preview_output_rms"],
+                )
+            )
 
     summary = {
         "device": str(device),
@@ -674,6 +937,7 @@ def train_gpu_supervised_model(
         "low_speech_probability": low_speech_probability,
         "low_speech_extra_min_db": low_speech_extra_min_db,
         "low_speech_extra_max_db": low_speech_extra_max_db,
+        "allow_noise_amplification": allow_noise_amplification,
         "vad_positive_snr_db": vad_positive_snr_db,
         "vad_negative_snr_db": vad_negative_snr_db,
         "vad_energy_threshold": vad_energy_threshold,
@@ -683,6 +947,9 @@ def train_gpu_supervised_model(
         "state_speech_dominant_snr_db": state_speech_dominant_snr_db,
         "state_noise_dominant_snr_db": state_noise_dominant_snr_db,
         "state_hidden_channels": state_hidden_channels or config.hidden_channels,
+        "realtime_supervision": realtime_supervision,
+        "realtime_sequence_frames": realtime_sequence_frames,
+        "realtime_target_frame_index": realtime_target_frame_index,
         "initial_checkpoint": str(initial_checkpoint.resolve()) if initial_checkpoint is not None else None,
         "preview_audio_dir": str((output_dir / "epoch_audio").resolve()),
         "history": history,

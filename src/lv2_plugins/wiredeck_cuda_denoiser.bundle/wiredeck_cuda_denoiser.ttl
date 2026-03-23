@@ -35,7 +35,7 @@
         a lv2:InputPort , lv2:ControlPort ;
         lv2:index 2 ;
         lv2:symbol "buffer_ms" ;
-        lv2:name "Buffer Size (ms)" ;
+        lv2:name "Output Delay (ms)" ;
         lv2:default 12.0 ;
         lv2:minimum 0.0 ;
         lv2:maximum 80.0
@@ -144,23 +144,39 @@
         lv2:maximum 4 ;
         lv2:portProperty lv2:integer
     ] , [
-        a lv2:InputPort , lv2:AudioPort ;
+        a lv2:OutputPort , lv2:ControlPort ;
         lv2:index 15 ;
+        lv2:symbol "suppressed_noise_level" ;
+        lv2:name "Suppression Estimate" ;
+        lv2:default 0 ;
+        lv2:minimum 0 ;
+        lv2:maximum 1
+    ] , [
+        a lv2:OutputPort , lv2:ControlPort ;
+        lv2:index 16 ;
+        lv2:symbol "voice_preservation_level" ;
+        lv2:name "Mask Keep Estimate" ;
+        lv2:default 0 ;
+        lv2:minimum 0 ;
+        lv2:maximum 1
+    ] , [
+        a lv2:InputPort , lv2:AudioPort ;
+        lv2:index 17 ;
         lv2:symbol "input_l" ;
         lv2:name "Input L"
     ] , [
         a lv2:InputPort , lv2:AudioPort ;
-        lv2:index 16 ;
+        lv2:index 18 ;
         lv2:symbol "input_r" ;
         lv2:name "Input R"
     ] , [
         a lv2:OutputPort , lv2:AudioPort ;
-        lv2:index 17 ;
+        lv2:index 19 ;
         lv2:symbol "output_l" ;
         lv2:name "Output L"
     ] , [
         a lv2:OutputPort , lv2:AudioPort ;
-        lv2:index 18 ;
+        lv2:index 20 ;
         lv2:symbol "output_r" ;
         lv2:name "Output R"
     ] .

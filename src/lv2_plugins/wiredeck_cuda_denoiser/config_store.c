@@ -78,6 +78,52 @@ wd_extract_json_int(const char* json, const char* key, int* output)
   return 1;
 }
 
+static const char*
+wd_find_json_object_body(const char* json, const char* key)
+{
+  char needle[128];
+  const char* start;
+
+  if (!json || !key) {
+    return NULL;
+  }
+
+  snprintf(needle, sizeof(needle), "\"%s\"", key);
+  start = strstr(json, needle);
+  if (!start) {
+    return NULL;
+  }
+  start = strchr(start + strlen(needle), ':');
+  if (!start) {
+    return NULL;
+  }
+  start = strchr(start, '{');
+  if (!start) {
+    return NULL;
+  }
+  return start + 1;
+}
+
+static int
+wd_extract_json_string_nested(const char* json, const char* object_key, const char* key, char* output, size_t output_size)
+{
+  const char* body = wd_find_json_object_body(json, object_key);
+  if (!body) {
+    return 0;
+  }
+  return wd_extract_json_string(body, key, output, output_size);
+}
+
+static int
+wd_extract_json_int_nested(const char* json, const char* object_key, const char* key, int* output)
+{
+  const char* body = wd_find_json_object_body(json, object_key);
+  if (!body) {
+    return 0;
+  }
+  return wd_extract_json_int(body, key, output);
+}
+
 static void
 wd_write_error(char* error_message, size_t error_message_size, const char* fmt, const char* value)
 {
@@ -563,13 +609,30 @@ wd_load_wdgp_metadata(const char* models_dir, const char* file_name, WireDeckWdg
   wd_extract_json_int(metadata_json, "sample_rate_hz", &out_metadata->sample_rate_hz);
   wd_extract_json_int(metadata_json, "stft_size", &out_metadata->stft_size);
   wd_extract_json_int(metadata_json, "hop_size", &out_metadata->hop_size);
-  wd_extract_json_int(metadata_json, "bands", &out_metadata->bands);
-  wd_extract_json_int(metadata_json, "channels", &out_metadata->channels);
-  wd_extract_json_int(metadata_json, "hidden_channels", &out_metadata->hidden_channels);
-  wd_extract_json_int(metadata_json, "residual_blocks", &out_metadata->residual_blocks);
-  wd_extract_json_int(metadata_json, "kernel_time", &out_metadata->kernel_time);
-  wd_extract_json_int(metadata_json, "kernel_freq", &out_metadata->kernel_freq);
-  wd_extract_json_int(metadata_json, "lookahead_frames", &out_metadata->lookahead_frames);
+  if (!wd_extract_json_int(metadata_json, "bands", &out_metadata->bands)) {
+    wd_extract_json_int_nested(metadata_json, "config", "bands", &out_metadata->bands);
+  }
+  if (!wd_extract_json_int(metadata_json, "channels", &out_metadata->channels)) {
+    wd_extract_json_int_nested(metadata_json, "config", "channels", &out_metadata->channels);
+  }
+  if (!wd_extract_json_int(metadata_json, "hidden_channels", &out_metadata->hidden_channels)) {
+    wd_extract_json_int_nested(metadata_json, "config", "hidden_channels", &out_metadata->hidden_channels);
+  }
+  if (!wd_extract_json_int(metadata_json, "residual_blocks", &out_metadata->residual_blocks)) {
+    wd_extract_json_int_nested(metadata_json, "config", "residual_blocks", &out_metadata->residual_blocks);
+  }
+  if (!wd_extract_json_int(metadata_json, "kernel_time", &out_metadata->kernel_time)) {
+    wd_extract_json_int_nested(metadata_json, "config", "kernel_time", &out_metadata->kernel_time);
+  }
+  if (!wd_extract_json_int(metadata_json, "kernel_freq", &out_metadata->kernel_freq)) {
+    wd_extract_json_int_nested(metadata_json, "config", "kernel_freq", &out_metadata->kernel_freq);
+  }
+  if (!wd_extract_json_int(metadata_json, "lookahead_frames", &out_metadata->lookahead_frames)) {
+    wd_extract_json_int_nested(metadata_json, "config", "lookahead_frames", &out_metadata->lookahead_frames);
+  }
+  if (!out_metadata->model_name[0]) {
+    wd_extract_json_string_nested(metadata_json, "config", "model_name", out_metadata->model_name, sizeof(out_metadata->model_name));
+  }
   free(metadata_json);
 
   if (!out_metadata->valid) {

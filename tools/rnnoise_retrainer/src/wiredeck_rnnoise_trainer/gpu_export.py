@@ -84,7 +84,7 @@ def build_metadata(
     config: object,
 ) -> dict:
     config_dict = asdict(config) if is_dataclass(config) else dict(config)
-    return {
+    metadata = {
         "model_name": model_name,
         "export_format": "wiredeck_gpu_model_v1",
         "sample_rate_hz": sample_rate_hz,
@@ -94,4 +94,5 @@ def build_metadata(
         "runtime_layout": "NHWC",
         "config": config_dict,
     }
-
+    metadata.update(config_dict)
+    return metadata

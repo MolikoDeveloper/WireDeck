@@ -23,10 +23,12 @@ typedef enum WireDeckCudaDenoiserPortIndex {
   WD_PORT_OUTPUT_LEVEL = 12,
   WD_PORT_MODEL_LOADED = 13,
   WD_PORT_RUNTIME_PHASE = 14,
-  WD_PORT_INPUT_L = 15,
-  WD_PORT_INPUT_R = 16,
-  WD_PORT_OUTPUT_L = 17,
-  WD_PORT_OUTPUT_R = 18,
+  WD_PORT_SUPPRESSED_NOISE_LEVEL = 15,
+  WD_PORT_VOICE_PRESERVATION_LEVEL = 16,
+  WD_PORT_INPUT_L = 17,
+  WD_PORT_INPUT_R = 18,
+  WD_PORT_OUTPUT_L = 19,
+  WD_PORT_OUTPUT_R = 20,
 } WireDeckCudaDenoiserPortIndex;
 
 typedef enum WireDeckCudaDenoiserStatusCode {

@@ -122,6 +122,12 @@ def load_checkpoint_model(
     config = WireDeckVoiceDenoiserConfig(**config_dict) if isinstance(config_dict, dict) else WireDeckVoiceDenoiserConfig()
     model = WireDeckVoiceDenoiser(config)
     state_dict = state["state_dict"] if isinstance(state, dict) and "state_dict" in state else state
+    if isinstance(state_dict, dict) and any(key.startswith("base_model.") for key in state_dict):
+        state_dict = {
+            key[len("base_model."):]: value
+            for key, value in state_dict.items()
+            if key.startswith("base_model.")
+        }
     model.load_state_dict(state_dict, strict=False)
     model.eval()
     model.to(device)
