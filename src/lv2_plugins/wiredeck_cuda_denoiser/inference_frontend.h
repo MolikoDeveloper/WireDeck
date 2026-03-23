@@ -38,6 +38,7 @@ typedef struct WireDeckInferenceFrontend {
 void wd_frontend_init(WireDeckInferenceFrontend* frontend);
 void wd_frontend_deinit(WireDeckInferenceFrontend* frontend);
 int wd_frontend_prepare(WireDeckInferenceFrontend* frontend, const WireDeckWdgpMetadata* metadata);
+void wd_frontend_reset_state(WireDeckInferenceFrontend* frontend);
 int wd_frontend_push(WireDeckInferenceFrontend* frontend, float mono_sample);
 const float* wd_frontend_latest_features(WireDeckInferenceFrontend* frontend);
 void wd_frontend_apply_mask_and_synthesize(WireDeckInferenceFrontend* frontend, const float* band_mask, float reduction_strength);

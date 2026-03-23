@@ -283,6 +283,30 @@ wd_atomic_load_int(const int* value)
 }
 
 static void
+wd_runtime_reset_silence_state(WireDeckPluginRuntime* runtime)
+{
+  int band_index;
+  int band_count;
+  if (!runtime || !runtime->shared_runtime) {
+    return;
+  }
+  wd_frontend_reset_state(&runtime->frontend);
+  band_count = runtime->shared_runtime->model.metadata.bands;
+  if (runtime->latest_mask) {
+    for (band_index = 0; band_index < band_count; ++band_index) {
+      runtime->latest_mask[band_index] = 1.0f;
+    }
+  }
+  if (runtime->smoothed_mask) {
+    for (band_index = 0; band_index < band_count; ++band_index) {
+      runtime->smoothed_mask[band_index] = 1.0f;
+    }
+  }
+  runtime->last_mask_mean = 1.0f;
+  runtime->last_vad = 0.0f;
+}
+
+static void
 wd_atomic_store_u32(unsigned int* value, unsigned int next)
 {
   __atomic_store_n(value, next, __ATOMIC_RELEASE);
@@ -829,6 +853,7 @@ wd_run(LV2_Handle instance, uint32_t sample_count)
   float block_output_peak = 0.0f;
   float suppressed_noise_level = 0.0f;
   float voice_preservation_level = 0.0f;
+  int silent_block = 0;
   unsigned int requested_delay_samples = 0;
   float reduction = self->threshold ? *self->threshold : 0.8f;
   float mix = self->mix ? *self->mix : 1.0f;
@@ -914,16 +939,23 @@ wd_run(LV2_Handle instance, uint32_t sample_count)
   }
 
   for (sample_index = 0; sample_index < sample_count; ++sample_index) {
-    float left = self->input_l[sample_index];
-    float right = self->input_r[sample_index];
-    float mono = wd_downmix_input_sample(left, right);
+    float mono = wd_downmix_input_sample(self->input_l[sample_index], self->input_r[sample_index]);
     float input_abs = mono < 0.0f ? -mono : mono;
-    float final_left;
-    float final_right;
-
     if (input_abs > block_input_peak) {
       block_input_peak = input_abs;
     }
+  }
+  silent_block = block_input_peak <= 1.0e-7f;
+  if (silent_block && runtime && status_code == WD_STATUS_WDGP_MODEL_READY && runtime_matches_request) {
+    wd_runtime_reset_silence_state(runtime);
+  }
+
+  for (sample_index = 0; sample_index < sample_count; ++sample_index) {
+    float left = self->input_l[sample_index];
+    float right = self->input_r[sample_index];
+    float mono = wd_downmix_input_sample(left, right);
+    float final_left;
+    float final_right;
 
     if (mix <= 0.001f || reduction <= 0.001f) {
       final_left = left * output_gain;
@@ -933,6 +965,10 @@ wd_run(LV2_Handle instance, uint32_t sample_count)
       final_left = left * output_gain;
       final_right = right * output_gain;
       if (self->runtime_phase) *self->runtime_phase = (float)WD_RUNTIME_BYPASS;
+    } else if (silent_block) {
+      final_left = 0.0f;
+      final_right = 0.0f;
+      if (self->runtime_phase) *self->runtime_phase = (float)WD_RUNTIME_IDLE;
     } else {
       if (status_code == WD_STATUS_WDGP_MODEL_READY && runtime_matches_request && runtime && wd_frontend_push(&runtime->frontend, mono)) {
         const float* features = wd_frontend_latest_features(&runtime->frontend);
@@ -1007,7 +1043,7 @@ wd_run(LV2_Handle instance, uint32_t sample_count)
   if (self->output_level) {
     *self->output_level = block_output_peak;
   }
-  if (status_code == WD_STATUS_WDGP_MODEL_READY && runtime_matches_request && runtime) {
+  if (!silent_block && status_code == WD_STATUS_WDGP_MODEL_READY && runtime_matches_request && runtime) {
     float mask_keep = runtime->last_mask_mean;
     if (mask_keep < 0.0f) mask_keep = 0.0f;
     if (mask_keep > 1.0f) mask_keep = 1.0f;

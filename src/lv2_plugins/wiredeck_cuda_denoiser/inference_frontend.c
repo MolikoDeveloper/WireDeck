@@ -265,6 +265,31 @@ wd_frontend_prepare(WireDeckInferenceFrontend* frontend, const WireDeckWdgpMetad
   return 1;
 }
 
+void
+wd_frontend_reset_state(WireDeckInferenceFrontend* frontend)
+{
+  if (!frontend) {
+    return;
+  }
+  frontend->temporal_frame_count = 0;
+  frontend->write_index = 0;
+  frontend->hop_accumulator = 0;
+  frontend->ola_read_index = 0;
+  frontend->ola_write_index = 0;
+  if (frontend->ring_buffer) memset(frontend->ring_buffer, 0x00, (size_t)frontend->stft_size * sizeof(float));
+  if (frontend->fft_magnitude) memset(frontend->fft_magnitude, 0x00, (size_t)frontend->fft_bins * sizeof(float));
+  if (frontend->fft_real) memset(frontend->fft_real, 0x00, (size_t)frontend->stft_size * sizeof(float));
+  if (frontend->fft_imag) memset(frontend->fft_imag, 0x00, (size_t)frontend->stft_size * sizeof(float));
+  if (frontend->feature_history) memset(frontend->feature_history, 0x00, (size_t)frontend->temporal_frames * (size_t)frontend->bands * sizeof(float));
+  if (frontend->spectrum_real_history) memset(frontend->spectrum_real_history, 0x00, (size_t)frontend->temporal_frames * (size_t)frontend->fft_bins * sizeof(float));
+  if (frontend->spectrum_imag_history) memset(frontend->spectrum_imag_history, 0x00, (size_t)frontend->temporal_frames * (size_t)frontend->fft_bins * sizeof(float));
+  if (frontend->synthesis_frame) memset(frontend->synthesis_frame, 0x00, (size_t)frontend->stft_size * sizeof(float));
+  if (frontend->ola_buffer) memset(frontend->ola_buffer, 0x00, (size_t)frontend->stft_size * sizeof(float));
+  if (frontend->ola_norm_buffer) memset(frontend->ola_norm_buffer, 0x00, (size_t)frontend->stft_size * sizeof(float));
+  if (frontend->shaped_mask) memset(frontend->shaped_mask, 0x00, (size_t)frontend->bands * sizeof(float));
+  if (frontend->expanded_mask) memset(frontend->expanded_mask, 0x00, (size_t)frontend->fft_bins * sizeof(float));
+}
+
 int
 wd_frontend_push(WireDeckInferenceFrontend* frontend, float mono_sample)
 {
