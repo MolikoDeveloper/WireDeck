@@ -60,11 +60,15 @@ typedef struct WireDeckCudaDenoiserUI {
   WireDeckLevelSample level_history[WD_LEVEL_HISTORY_CAPACITY];
   uint32_t level_history_start;
   uint32_t level_history_count;
+  guint refresh_timer_id;
   int gpu_index_value;
   int model_index_value;
   int updating;
   int widgets_alive;
 } WireDeckCudaDenoiserUI;
+
+static void
+wd_ui_refresh_runtime_debug(WireDeckCudaDenoiserUI* ui);
 
 static void
 wd_ui_on_root_destroy(GtkWidget* widget, gpointer data)
@@ -77,6 +81,10 @@ wd_ui_on_root_destroy(GtkWidget* widget, gpointer data)
   }
 
   ui->widgets_alive = 0;
+  if (ui->refresh_timer_id != 0u) {
+    g_source_remove(ui->refresh_timer_id);
+    ui->refresh_timer_id = 0u;
+  }
   ui->root = NULL;
   ui->folder_button = NULL;
   ui->model_combo = NULL;
@@ -193,6 +201,20 @@ wd_ui_append_level_sample(WireDeckCudaDenoiserUI* ui)
   sample->output_level = ui->output_level_value;
   sample->suppressed_noise_level = ui->suppressed_noise_level_value;
   sample->voice_preservation_level = ui->voice_preservation_level_value;
+}
+
+static gboolean
+wd_ui_refresh_tick(gpointer data)
+{
+  WireDeckCudaDenoiserUI* ui = (WireDeckCudaDenoiserUI*)data;
+
+  if (!ui || !ui->widgets_alive) {
+    return FALSE;
+  }
+
+  wd_ui_append_level_sample(ui);
+  wd_ui_refresh_runtime_debug(ui);
+  return TRUE;
 }
 
 static gboolean
@@ -890,6 +912,7 @@ wd_ui_instantiate(const struct LV2UI_Descriptor* descriptor,
   wd_ui_refresh_model_info(ui);
   wd_ui_sync_initial_state(ui);
   wd_ui_refresh_runtime_debug(ui);
+  ui->refresh_timer_id = g_timeout_add(50, wd_ui_refresh_tick, ui);
 
   g_signal_connect(ui->folder_button, "selection-changed", G_CALLBACK(wd_ui_on_folder_changed), ui);
   g_signal_connect(ui->model_combo, "changed", G_CALLBACK(wd_ui_on_model_changed), ui);
@@ -911,6 +934,10 @@ wd_ui_cleanup(LV2UI_Handle handle)
     return;
   }
   ui->widgets_alive = 0;
+  if (ui->refresh_timer_id != 0u) {
+    g_source_remove(ui->refresh_timer_id);
+    ui->refresh_timer_id = 0u;
+  }
   wd_free_model_scan_result(&ui->models);
   free(ui);
 }
