@@ -35,6 +35,18 @@ def _load_existing_summary(summary_path: Path) -> dict[str, object]:
     return summary if isinstance(summary, dict) else {}
 
 
+def _ansi_wrap(text: str, code: str) -> str:
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _fmt_pct_color(label: str, value: float, code: str) -> str:
+    return _ansi_wrap(f"{label}={value:.2f}%", code)
+
+
+def _fmt_float_color(label: str, value: float, code: str) -> str:
+    return _ansi_wrap(f"{label}={value:.6f}", code)
+
+
 def _effective_temporal_radius(config: WireDeckVoiceDenoiserConfig) -> int:
     block_count = max(0, int(config.residual_blocks))
     kernel_radius = max(0, int(config.kernel_time) // 2)
@@ -893,14 +905,14 @@ def train_gpu_supervised_model(
         )
         if preview_audio_path is not None:
             print(
-                "[wiredeck-rnnoise] fixed preview epoch {epoch:03d} speech={speech:.2f}% mixed={mixed:.2f}% noise={noise:.2f}% cancel={cancel:.2f}% input_rms={input_rms:.6f} output_rms={output_rms:.6f}".format(
+                "[wiredeck-rnnoise] fixed preview epoch {epoch:03d} {speech} {mixed} {noise} {cancel} {input_rms} {output_rms}".format(
                     epoch=epoch,
-                    speech=metrics["fixed_preview_speech_detected_pct"],
-                    mixed=metrics["fixed_preview_mixed_detected_pct"],
-                    noise=metrics["fixed_preview_noise_detected_pct"],
-                    cancel=metrics["fixed_preview_cancellation_pct"],
-                    input_rms=metrics["fixed_preview_input_rms"],
-                    output_rms=metrics["fixed_preview_output_rms"],
+                    speech=_fmt_pct_color("speech", float(metrics["fixed_preview_speech_detected_pct"]), "32"),
+                    mixed=_fmt_pct_color("mixed", float(metrics["fixed_preview_mixed_detected_pct"]), "33"),
+                    noise=_fmt_pct_color("noise", float(metrics["fixed_preview_noise_detected_pct"]), "31"),
+                    cancel=_fmt_pct_color("cancel", float(metrics["fixed_preview_cancellation_pct"]), "36"),
+                    input_rms=_fmt_float_color("input_rms", float(metrics["fixed_preview_input_rms"]), "90"),
+                    output_rms=_fmt_float_color("output_rms", float(metrics["fixed_preview_output_rms"]), "90"),
                 )
             )
 

@@ -242,14 +242,30 @@ static float
 wd_downmix_input_sample(float left, float right)
 {
   const float silence_threshold = 1.0e-6f;
+  const float dominance_ratio = 1.995f; /* ~6 dB */
   float left_abs = left < 0.0f ? -left : left;
   float right_abs = right < 0.0f ? -right : right;
+  float quieter;
+  float louder;
 
   if (left_abs <= silence_threshold && right_abs > silence_threshold) {
     return right;
   }
   if (right_abs <= silence_threshold && left_abs > silence_threshold) {
     return left;
+  }
+  quieter = left_abs < right_abs ? left_abs : right_abs;
+  louder = left_abs > right_abs ? left_abs : right_abs;
+
+  /* USB microphones that expose "stereo" often carry the same source with
+     different gain or phase quirks. Avoid averaging when one side dominates or
+     when the channels disagree in polarity, because that can attenuate speech
+     before the mono denoiser sees it. */
+  if ((left * right) < 0.0f || (quieter <= silence_threshold && louder > silence_threshold)) {
+    return left_abs >= right_abs ? left : right;
+  }
+  if (quieter > silence_threshold && (louder / quieter) >= dominance_ratio) {
+    return left_abs >= right_abs ? left : right;
   }
   return 0.5f * (left + right);
 }
