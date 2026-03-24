@@ -101,6 +101,7 @@ struct WireDeckImGuiBridge {
     WireDeckIconTexture mic_off_icon{};
     WireDeckIconTexture world_icon{};
     WireDeckIconTexture world_off_icon{};
+    WireDeckIconTexture trash_icon{};
     WireDeckIconTexture headset_icon{};
     WireDeckIconTexture generic_app_icon{};
     std::vector<WireDeckCachedIcon> source_icons{};
@@ -818,6 +819,7 @@ bool load_icon_textures(WireDeckImGuiBridge* bridge) {
     const auto mic_off_path = find_wiredeck_asset_path("assets/icons/mic-off.png");
     const auto world_path = find_wiredeck_asset_path("assets/icons/world.png");
     const auto world_off_path = find_wiredeck_asset_path("assets/icons/world-off.png");
+    const auto trash_path = find_wiredeck_asset_path("assets/icons/trash.png");
     const auto headset_path = find_wiredeck_asset_path("assets/icons/headset.png");
     const auto generic_app_path = find_wiredeck_asset_path("assets/icons/generic-app.png");
 
@@ -828,9 +830,10 @@ bool load_icon_textures(WireDeckImGuiBridge* bridge) {
     const bool loaded_mic_off = !mic_off_path.empty() && load_icon_texture(bridge, mic_off_path.c_str(), &bridge->mic_off_icon);
     const bool loaded_world = !world_path.empty() && load_icon_texture(bridge, world_path.c_str(), &bridge->world_icon);
     const bool loaded_world_off = !world_off_path.empty() && load_icon_texture(bridge, world_off_path.c_str(), &bridge->world_off_icon);
+    const bool loaded_trash = !trash_path.empty() && load_icon_texture(bridge, trash_path.c_str(), &bridge->trash_icon);
     const bool loaded_headset = !headset_path.empty() && load_icon_texture(bridge, headset_path.c_str(), &bridge->headset_icon);
     const bool loaded_generic_app = !generic_app_path.empty() && load_icon_texture(bridge, generic_app_path.c_str(), &bridge->generic_app_icon);
-    return loaded_volume && loaded_volume_off && loaded_fx && loaded_mic && loaded_mic_off && loaded_world && loaded_world_off && loaded_headset && loaded_generic_app;
+    return loaded_volume && loaded_volume_off && loaded_fx && loaded_mic && loaded_mic_off && loaded_world && loaded_world_off && loaded_trash && loaded_headset && loaded_generic_app;
 }
 
 WireDeckIconTexture* find_cached_source_icon(WireDeckImGuiBridge* bridge, const std::string& cache_key) {
@@ -1102,8 +1105,10 @@ void cleanup_vulkan(WireDeckImGuiBridge* bridge) {
         destroy_icon_texture(bridge, &bridge->volume_off_icon);
         destroy_icon_texture(bridge, &bridge->fx_icon);
         destroy_icon_texture(bridge, &bridge->mic_icon);
+        destroy_icon_texture(bridge, &bridge->mic_off_icon);
         destroy_icon_texture(bridge, &bridge->world_icon);
         destroy_icon_texture(bridge, &bridge->world_off_icon);
+        destroy_icon_texture(bridge, &bridge->trash_icon);
         destroy_icon_texture(bridge, &bridge->headset_icon);
         destroy_icon_texture(bridge, &bridge->generic_app_icon);
         for (auto& icon : bridge->source_icons) {
@@ -1345,8 +1350,7 @@ void draw_volume_icon(ImDrawList* draw_list, const ImVec2& min, const ImVec2& ma
     }
 }
 
-bool render_mute_icon_button(WireDeckImGuiBridge* bridge, const char* id, bool muted) {
-    const ImVec2 size(30.0f, 30.0f);
+bool render_mute_icon_button(WireDeckImGuiBridge* bridge, const char* id, bool muted, const ImVec2& size, float inset) {
     const bool pressed = ImGui::InvisibleButton(id, size);
     const ImVec2 min = ImGui::GetItemRectMin();
     const ImVec2 max = ImGui::GetItemRectMax();
@@ -1360,7 +1364,6 @@ bool render_mute_icon_button(WireDeckImGuiBridge* bridge, const char* id, bool m
 
     const WireDeckIconTexture& texture = muted ? bridge->volume_off_icon : bridge->volume_icon;
     if (texture.descriptor_set != VK_NULL_HANDLE) {
-        const float inset = 2.0f;
         draw_list->AddImage(
             texture.descriptor_set,
             ImVec2(min.x + inset, min.y + inset),
@@ -1408,8 +1411,7 @@ void draw_fx_icon(ImDrawList* draw_list, const ImVec2& min, const ImVec2& max, I
     );
 }
 
-bool render_fx_icon_button(WireDeckImGuiBridge* bridge, const char* id) {
-    const ImVec2 size(30.0f, 30.0f);
+bool render_fx_icon_button(WireDeckImGuiBridge* bridge, const char* id, bool enabled, const ImVec2& size, float inset) {
     const bool pressed = ImGui::InvisibleButton(id, size);
     const ImVec2 min = ImGui::GetItemRectMin();
     const ImVec2 max = ImGui::GetItemRectMax();
@@ -1417,10 +1419,11 @@ bool render_fx_icon_button(WireDeckImGuiBridge* bridge, const char* id) {
     const bool active = ImGui::IsItemActive();
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
 
-    const ImVec4 icon_color = active ? ImVec4(1.0f, 1.0f, 1.0f, 1.0f) : hovered ? ImVec4(0.96f, 0.96f, 0.98f, 1.0f) : ImVec4(0.82f, 0.84f, 0.88f, 1.0f);
+    const ImVec4 icon_color = enabled
+        ? ImVec4(0.88f, 0.80f, 0.18f, 1.0f)
+        : active ? ImVec4(1.0f, 1.0f, 1.0f, 1.0f) : hovered ? ImVec4(0.96f, 0.96f, 0.98f, 1.0f) : ImVec4(0.82f, 0.84f, 0.88f, 1.0f);
     const WireDeckIconTexture& texture = bridge->fx_icon;
     if (texture.descriptor_set != VK_NULL_HANDLE) {
-        const float inset = 2.0f;
         draw_list->AddImage(
             texture.descriptor_set,
             ImVec2(min.x + inset, min.y + inset),
@@ -1440,9 +1443,10 @@ bool render_texture_toggle_button(
     const WireDeckIconTexture& inactive_texture,
     const char* id,
     bool enabled,
-    const ImVec4& active_color
+    const ImVec4& active_color,
+    const ImVec2& size = ImVec2(30.0f, 30.0f),
+    float inset = 2.0f
 ) {
-    const ImVec2 size(30.0f, 30.0f);
     const bool pressed = ImGui::InvisibleButton(id, size);
     const ImVec2 min = ImGui::GetItemRectMin();
     const ImVec2 max = ImGui::GetItemRectMax();
@@ -1468,6 +1472,43 @@ bool render_texture_toggle_button(
     return pressed;
 }
 
+bool render_fixed_icon_toggle_button(
+    const WireDeckIconTexture& active_texture,
+    const WireDeckIconTexture& inactive_texture,
+    const char* id,
+    bool enabled,
+    const ImVec4& active_color,
+    const ImVec2& size,
+    float icon_extent
+) {
+    const bool pressed = ImGui::InvisibleButton(id, size);
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 max = ImGui::GetItemRectMax();
+    const bool hovered = ImGui::IsItemHovered();
+    const bool active = ImGui::IsItemActive();
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+
+    const ImVec4 icon_color = enabled
+        ? active_color
+        : active ? ImVec4(1.0f, 1.0f, 1.0f, 1.0f) : hovered ? ImVec4(0.96f, 0.96f, 0.98f, 1.0f) : ImVec4(0.82f, 0.84f, 0.88f, 1.0f);
+    const WireDeckIconTexture& texture = enabled ? active_texture : inactive_texture;
+    if (texture.descriptor_set != VK_NULL_HANDLE) {
+        const float draw_w = std::min(icon_extent, size.x);
+        const float draw_h = std::min(icon_extent, size.y);
+        const float x0 = min.x + (size.x - draw_w) * 0.5f;
+        const float y0 = min.y + (size.y - draw_h) * 0.5f;
+        draw_list->AddImage(
+            texture.descriptor_set,
+            ImVec2(x0, y0),
+            ImVec2(x0 + draw_w, y0 + draw_h),
+            ImVec2(0.0f, 0.0f),
+            ImVec2(1.0f, 1.0f),
+            ImGui::GetColorU32(icon_color)
+        );
+    }
+    return pressed;
+}
+
 bool render_mic_exposure_button(WireDeckImGuiBridge* bridge, const char* id, bool enabled) {
     return render_texture_toggle_button(
         bridge->mic_icon,
@@ -1475,6 +1516,19 @@ bool render_mic_exposure_button(WireDeckImGuiBridge* bridge, const char* id, boo
         id,
         enabled,
         ImVec4(0.36f, 0.84f, 0.48f, 1.0f)
+    );
+}
+
+bool render_mic_exposure_button(WireDeckImGuiBridge* bridge, const char* id, bool enabled, const ImVec2& size, float inset) {
+    (void)inset;
+    return render_fixed_icon_toggle_button(
+        bridge->mic_icon,
+        bridge->mic_off_icon,
+        id,
+        enabled,
+        ImVec4(0.36f, 0.84f, 0.48f, 1.0f),
+        size,
+        13.0f
     );
 }
 
@@ -1486,6 +1540,73 @@ bool render_web_exposure_button(WireDeckImGuiBridge* bridge, const char* id, boo
         enabled,
         ImVec4(0.25f, 0.78f, 0.96f, 1.0f)
     );
+}
+
+bool render_web_exposure_button(WireDeckImGuiBridge* bridge, const char* id, bool enabled, const ImVec2& size, float inset) {
+    (void)inset;
+    return render_fixed_icon_toggle_button(
+        bridge->world_icon,
+        bridge->world_off_icon,
+        id,
+        enabled,
+        ImVec4(0.25f, 0.78f, 0.96f, 1.0f),
+        size,
+        13.0f
+    );
+}
+
+void draw_trash_icon(ImDrawList* draw_list, const ImVec2& min, const ImVec2& max, ImU32 color) {
+    const float w = max.x - min.x;
+    const float h = max.y - min.y;
+    const float stroke = std::max(1.4f, std::min(w, h) * 0.08f);
+    const float lid_y = min.y + h * 0.28f;
+    const float body_top = min.y + h * 0.36f;
+    const float body_bottom = min.y + h * 0.78f;
+    const float body_left = min.x + w * 0.28f;
+    const float body_right = min.x + w * 0.72f;
+    draw_list->AddLine(ImVec2(min.x + w * 0.24f, lid_y), ImVec2(max.x - w * 0.24f, lid_y), color, stroke);
+    draw_list->AddLine(ImVec2(min.x + w * 0.40f, min.y + h * 0.20f), ImVec2(max.x - w * 0.40f, min.y + h * 0.20f), color, stroke);
+    draw_list->AddLine(ImVec2(body_left, body_top), ImVec2(body_left, body_bottom), color, stroke);
+    draw_list->AddLine(ImVec2(body_right, body_top), ImVec2(body_right, body_bottom), color, stroke);
+    draw_list->AddLine(ImVec2(body_left, body_bottom), ImVec2(body_right, body_bottom), color, stroke);
+    draw_list->AddLine(ImVec2(min.x + w * 0.42f, body_top + h * 0.08f), ImVec2(min.x + w * 0.42f, body_bottom - h * 0.06f), color, stroke);
+    draw_list->AddLine(ImVec2(min.x + w * 0.58f, body_top + h * 0.08f), ImVec2(min.x + w * 0.58f, body_bottom - h * 0.06f), color, stroke);
+}
+
+bool render_delete_icon_button(WireDeckImGuiBridge* bridge, const char* id, const ImVec2& size, float inset) {
+    const bool pressed = ImGui::InvisibleButton(id, size);
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 max = ImGui::GetItemRectMax();
+    const bool hovered = ImGui::IsItemHovered();
+    const bool active = ImGui::IsItemActive();
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    const ImVec4 icon_color = active ? ImVec4(1.0f, 0.44f, 0.40f, 1.0f) : hovered ? ImVec4(0.96f, 0.40f, 0.36f, 1.0f) : ImVec4(0.90f, 0.28f, 0.24f, 1.0f);
+    if (bridge->trash_icon.descriptor_set != VK_NULL_HANDLE) {
+        const float draw_w = std::min(13.0f, size.x);
+        const float draw_h = std::min(13.0f, size.y);
+        const float x0 = min.x + (size.x - draw_w) * 0.5f;
+        const float y0 = min.y + (size.y - draw_h) * 0.5f;
+        draw_list->AddImage(
+            bridge->trash_icon.descriptor_set,
+            ImVec2(x0, y0),
+            ImVec2(x0 + draw_w, y0 + draw_h),
+            ImVec2(0.0f, 0.0f),
+            ImVec2(1.0f, 1.0f),
+            ImGui::GetColorU32(icon_color)
+        );
+    } else {
+        const float draw_w = std::min(13.0f, size.x);
+        const float draw_h = std::min(13.0f, size.y);
+        const float x0 = min.x + (size.x - draw_w) * 0.5f;
+        const float y0 = min.y + (size.y - draw_h) * 0.5f;
+        draw_trash_icon(
+            draw_list,
+            ImVec2(x0, y0),
+            ImVec2(x0 + draw_w, y0 + draw_h),
+            ImGui::GetColorU32(icon_color)
+        );
+    }
+    return pressed;
 }
 
 float stereo_channel_level(float base, int frame_index, float phase_offset) {
@@ -2366,75 +2487,199 @@ void render_input_card(WireDeckImGuiBridge* bridge, WireDeckUiSnapshot* snapshot
         ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse
     );
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 5.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 6.0f));
+
+    const ImVec2 win_pos = ImGui::GetWindowPos();
+    const ImVec2 win_size = ImGui::GetWindowSize();
+    const ImVec2 card_min = win_pos;
+    const ImVec2 card_max(win_pos.x + win_size.x, win_pos.y + win_size.y);
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+
+    draw_list->AddRectFilled(card_min, card_max, ImGui::GetColorU32(ImVec4(0.08f, 0.09f, 0.14f, 0.96f)), 18.0f);
+    draw_list->AddRect(card_min, card_max, ImGui::GetColorU32(ImVec4(0.60f, 0.66f, 0.86f, 0.10f)), 18.0f);
+
+    const float pad_x = 18.0f;
+    const float header_y = 16.0f;
+    const float icon_size = 28.0f;
+    ImGui::SetCursorPos(ImVec2(pad_x, header_y));
 
     WireDeckIconTexture* icon_texture = resolve_channel_icon_texture(bridge, channel);
     if (icon_texture != nullptr && icon_texture->descriptor_set != VK_NULL_HANDLE) {
-        const ImVec4 tint = source_active ? ImVec4(1.0f, 1.0f, 1.0f, 1.0f) : ImVec4(0.58f, 0.58f, 0.60f, 1.0f);
-        ImGui::Image(icon_texture->descriptor_set, ImVec2(34.0f, 34.0f), ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f), tint, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+        ImGui::InvisibleButton("##icon", ImVec2(icon_size, icon_size));
+        const ImVec2 icon_min = ImGui::GetItemRectMin();
+        const ImVec2 icon_max = ImGui::GetItemRectMax();
+        const float inset = 1.0f;
+        const ImVec4 tint = source_active ? ImVec4(0.95f, 0.96f, 0.98f, 1.0f) : ImVec4(0.58f, 0.58f, 0.60f, 0.48f);
+        draw_list->AddImage(
+            icon_texture->descriptor_set,
+            ImVec2(icon_min.x + inset, icon_min.y + inset),
+            ImVec2(icon_max.x - inset, icon_max.y - inset),
+            ImVec2(0.0f, 0.0f),
+            ImVec2(1.0f, 1.0f),
+            ImGui::GetColorU32(tint)
+        );
     } else {
-        ImGui::Dummy(ImVec2(34.0f, 34.0f));
+        ImGui::InvisibleButton("##icon", ImVec2(icon_size, icon_size));
+        const ImVec2 icon_min = ImGui::GetItemRectMin();
+        const ImVec2 icon_max = ImGui::GetItemRectMax();
+        const float cx = (icon_min.x + icon_max.x) * 0.5f;
+        const float cy = (icon_min.y + icon_max.y) * 0.5f;
+        const ImVec4 fallback_tint = source_active ? ImVec4(0.92f, 0.93f, 0.97f, 1.0f) : ImVec4(0.92f, 0.93f, 0.97f, 0.42f);
+        draw_list->AddCircleFilled(ImVec2(cx, cy - 4.0f), 4.6f, ImGui::GetColorU32(fallback_tint), 20);
+        draw_list->AddRectFilled(
+            ImVec2(cx - 7.0f, cy + 1.0f),
+            ImVec2(cx + 7.0f, cy + 11.0f),
+            ImGui::GetColorU32(fallback_tint),
+            4.0f
+        );
     }
-    ImGui::SameLine();
+
+    ImGui::SameLine(0.0f, 12.0f);
     ImGui::BeginGroup();
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 1.0f);
     ImGui::TextUnformatted(title);
     render_rename_popup(bridge, "rename_input_popup", snapshot, channel.id, title, true);
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Icon")) {
-        const std::string popup_id = std::string("input_icon_popup##") + channel.id;
+
+    const float detected_y_offset = 3.0f;
+    const ImVec2 subtitle_pos = ImGui::GetCursorScreenPos();
+    draw_list->AddCircleFilled(
+        ImVec2(subtitle_pos.x + 6.0f, subtitle_pos.y + detected_y_offset + 3.0f),
+        4.0f,
+        ImGui::GetColorU32(source_active ? ImVec4(0.36f, 0.86f, 0.42f, 1.0f) : ImVec4(0.92f, 0.29f, 0.26f, 1.0f)),
+        16
+    );
+    ImGui::Dummy(ImVec2(15.0f, 0.0f));
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + detected_y_offset);
+    ImGui::SameLine(0.0f, 0.0f);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.66f, 0.68f, 0.77f, 0.72f));
+    ImGui::TextUnformatted((subtitle != nullptr && subtitle[0] != '\0') ? subtitle : "Detected Source");
+    ImGui::PopStyleColor();
+    ImGui::EndGroup();
+
+    const float dots_center_y = win_pos.y + header_y;
+    const float dots_base_x = win_pos.x + win_size.x - 31.0f;
+    const float dot_gap = 6.0f;
+    const float dot_radius = 1.7f;
+    const ImU32 dot_color = ImGui::GetColorU32(ImVec4(0.68f, 0.70f, 0.80f, 0.55f));
+    draw_list->AddCircleFilled(ImVec2(dots_base_x, dots_center_y), dot_radius, dot_color, 12);
+    draw_list->AddCircleFilled(ImVec2(dots_base_x + dot_gap, dots_center_y), dot_radius, dot_color, 12);
+    draw_list->AddCircleFilled(ImVec2(dots_base_x + dot_gap * 2.0f, dots_center_y), dot_radius, dot_color, 12);
+
+    ImGui::SetCursorPos(ImVec2(card_width - 38.0f, 8.0f));
+    ImGui::InvisibleButton("##card_menu", ImVec2(24.0f, 18.0f));
+    if (ImGui::IsItemClicked()) {
+        const std::string popup_id = std::string("input_card_menu##") + channel.id;
         ImGui::OpenPopup(popup_id.c_str());
     }
     {
-        const std::string popup_id = std::string("input_icon_popup##") + channel.id;
+        const std::string popup_id = std::string("input_card_menu##") + channel.id;
         if (ImGui::BeginPopup(popup_id.c_str())) {
-            if (ImGui::MenuItem("Choose PNG")) {
+            if (ImGui::MenuItem("Change icon")) {
                 queue_input_icon_pick(snapshot, channel.id);
                 ImGui::CloseCurrentPopup();
             }
-            if (ImGui::MenuItem("Reset Detected Icon")) {
-                queue_input_icon_clear(snapshot, channel.id);
+            if (ImGui::MenuItem("Delete input")) {
+                queue_input_delete(snapshot, channel.id);
                 ImGui::CloseCurrentPopup();
             }
             ImGui::EndPopup();
         }
     }
-    if (subtitle != nullptr && subtitle[0] != '\0') {
-        ImGui::TextDisabled("%s", subtitle);
-    }
-    ImGui::EndGroup();
 
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    ImGui::TextDisabled("Signal");
-    render_source_stereo_meter(bridge, channel.id, display_meter_left, display_meter_right, ImVec2(ImGui::GetContentRegionAvail().x, 26.0f));
+    const float sep_y = 60.0f;
+    draw_list->AddLine(
+        ImVec2(win_pos.x + 16.0f, win_pos.y + sep_y),
+        ImVec2(win_pos.x + win_size.x - 16.0f, win_pos.y + sep_y),
+        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.06f)),
+        1.0f
+    );
 
-    ImGui::Dummy(ImVec2(0.0f, 2.0f));
-    ImGui::TextDisabled(fx_count == 1 ? "1 FX loaded" : "%d FX loaded", fx_count);
+    const float body_y = 70.0f;
+    const float btn_x = 18.0f;
+    const float btn_h = 30.0f;
+    const float fx_w = 35.0f;
+    const float m_w = 35.0f;
+    const float joined_w = fx_w + m_w;
+    const ImVec2 group_min(win_pos.x + btn_x, win_pos.y + body_y);
+    const ImVec2 group_max(group_min.x + joined_w, group_min.y + btn_h);
+    draw_list->AddRectFilled(group_min, group_max, ImGui::GetColorU32(ImVec4(0.18f, 0.20f, 0.29f, 0.96f)), 8.0f);
+    draw_list->AddLine(
+        ImVec2(group_min.x + fx_w, group_min.y + 4.0f),
+        ImVec2(group_min.x + fx_w, group_max.y - 4.0f),
+        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.10f)),
+        1.0f
+    );
 
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.64f, 0.16f, 0.16f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.78f, 0.20f, 0.20f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.52f, 0.12f, 0.12f, 1.0f));
-    ImGui::SetCursorPosY(card_height - 34.0f);
-    const float footer_width = ImGui::GetContentRegionAvail().x;
-    const float icon_button_width = 30.0f;
-    const float gap = ImGui::GetStyle().ItemSpacing.x;
-    const float remove_width = std::max(96.0f, footer_width - icon_button_width * 2.0f - gap * 2.0f);
-    if (ImGui::Button("Remove", ImVec2(remove_width, 0.0f))) {
-        queue_input_delete(snapshot, channel.id);
-    }
-    ImGui::SameLine();
-    if (render_fx_icon_button(bridge, "##fx_toggle")) {
+    ImGui::SetCursorPos(ImVec2(btn_x, body_y));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 1.0f, 1.0f, 0.03f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 1.0f, 1.0f, 0.05f));
+    if (render_fx_icon_button(bridge, "##fx_toggle", fx_count > 0, ImVec2(fx_w, btn_h), 7.0f)) {
         const std::string popup_id = std::string("input_fx_popup##") + channel.id;
         ImGui::OpenPopup(popup_id.c_str());
     }
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("FX chain (%d)", fx_count);
     }
-    render_input_fx_popup(snapshot, channel.id);
-    ImGui::SameLine();
-    if (render_mute_icon_button(bridge, "##mute_toggle", muted)) {
+    ImGui::SetCursorPos(ImVec2(btn_x + fx_w, body_y));
+    if (render_mute_icon_button(bridge, "##mute_toggle", muted, ImVec2(m_w, btn_h), 7.0f)) {
         channel.muted = muted ? 0 : 1;
     }
     ImGui::PopStyleColor(3);
+    ImGui::PopStyleVar();
+    render_input_fx_popup(snapshot, channel.id);
+
+    const float meter_x = btn_x + joined_w + 18.0f;
+    const float meter_y = body_y;
+    const float meter_w = win_size.x - meter_x - 18.0f;
+    const float label_w = 16.0f;
+    const float track_h = 8.0f;
+    const float row_gap = 8.0f;
+    const float inner_pad_y = 4.0f;
+    const float track_x0 = win_pos.x + meter_x + label_w + 10.0f;
+    const float track_x1 = win_pos.x + meter_x + meter_w - 8.0f;
+    const float track_w = std::max(0.0f, track_x1 - track_x0);
+    const float row1_y = win_pos.y + meter_y + inner_pad_y;
+    const float row2_y = row1_y + track_h + row_gap;
+    WireDeckMeterVisualState& meter_state = meter_visual_state(bridge, channel.id);
+    update_meter_visual_state(meter_state, display_meter_left, display_meter_right);
+    const auto meter_fill_color = [](float value) {
+        if (value >= 0.78f) return ImVec4(0.88f, 0.80f, 0.18f, 1.0f);
+        return ImVec4(0.31f, 0.84f, 0.38f, 1.0f);
+    };
+    const auto draw_meter_row = [&](float y, const char* label, float value, float peak_value) {
+        draw_list->AddText(
+            ImVec2(win_pos.x + meter_x, y - 2.0f),
+            ImGui::GetColorU32(ImVec4(0.72f, 0.74f, 0.82f, 0.75f)),
+            label
+        );
+        draw_list->AddRectFilled(
+            ImVec2(track_x0, y),
+            ImVec2(track_x1, y + track_h),
+            ImGui::GetColorU32(ImVec4(0.15f, 0.16f, 0.24f, 0.95f)),
+            999.0f
+        );
+        const float clamped = std::clamp(value, 0.0f, 1.0f);
+        draw_list->AddRectFilled(
+            ImVec2(track_x0, y),
+            ImVec2(track_x0 + track_w * clamped, y + track_h),
+            ImGui::GetColorU32(meter_fill_color(clamped)),
+            999.0f
+        );
+        const float peak = std::clamp(peak_value, 0.0f, 1.0f);
+        if (peak > 0.0f) {
+            const float marker_x = track_x0 + track_w * peak;
+            draw_list->AddRectFilled(
+                ImVec2(marker_x - 1.25f, y - 1.5f),
+                ImVec2(marker_x + 1.25f, y + track_h + 1.5f),
+                ImGui::GetColorU32(ImVec4(0.96f, 0.97f, 0.99f, 0.98f)),
+                2.0f
+            );
+        }
+    };
+    draw_meter_row(row1_y, "L", meter_state.current_left, meter_state.peak_left);
+    draw_meter_row(row2_y, "R", meter_state.current_right, meter_state.peak_right);
 
     ImGui::PopStyleVar(3);
     ImGui::EndChild();
@@ -2449,11 +2694,50 @@ void render_add_input_card(WireDeckUiSnapshot* snapshot, float card_width, float
         ImGuiChildFlags_Borders,
         ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse
     );
-    ImGui::Dummy(ImVec2(0.0f, 16.0f));
-    ImGui::SetCursorPosX((card_width - 48.0f) * 0.5f);
-    if (ImGui::Button("+", ImVec2(48.0f, 48.0f))) {
+
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    const ImVec2 win_pos = ImGui::GetWindowPos();
+    const ImVec2 win_size = ImGui::GetWindowSize();
+    const ImVec2 card_min = win_pos;
+    const ImVec2 card_max(win_pos.x + win_size.x, win_pos.y + win_size.y);
+    const char* label = "Add source";
+    const ImVec2 text_size = ImGui::CalcTextSize(label);
+    const float plus_box = 26.0f;
+    const float gap = 10.0f;
+    const float content_w = plus_box + gap + text_size.x;
+    const float start_x = (win_size.x - content_w) * 0.5f;
+    const float center_y = win_size.y * 0.5f;
+
+    draw_list->AddRectFilled(card_min, card_max, ImGui::GetColorU32(ImVec4(0.08f, 0.09f, 0.14f, 0.96f)), 18.0f);
+    draw_list->AddRect(card_min, card_max, ImGui::GetColorU32(ImVec4(0.60f, 0.66f, 0.86f, 0.10f)), 18.0f);
+
+    ImGui::SetCursorPos(ImVec2(0.0f, 0.0f));
+    ImGui::InvisibleButton("add_source_btn", ImVec2(win_size.x, win_size.y));
+    const bool hovered = ImGui::IsItemHovered();
+    const bool active = ImGui::IsItemActive();
+    if (ImGui::IsItemClicked()) {
         ImGui::OpenPopup("add_source_popup");
     }
+
+    const ImVec2 plus_min(win_pos.x + start_x, win_pos.y + center_y - plus_box * 0.5f);
+    const ImVec2 plus_max(plus_min.x + plus_box, plus_min.y + plus_box);
+    const float plus_cx = (plus_min.x + plus_max.x) * 0.5f;
+    const float plus_cy = (plus_min.y + plus_max.y) * 0.5f;
+    ImVec4 plus_bg = ImVec4(0.18f, 0.20f, 0.29f, 0.96f);
+    if (hovered) plus_bg = ImVec4(0.22f, 0.24f, 0.34f, 1.0f);
+    if (active) plus_bg = ImVec4(0.25f, 0.28f, 0.38f, 1.0f);
+    const ImU32 plus_fg = ImGui::GetColorU32(ImVec4(0.92f, 0.93f, 0.97f, 0.94f));
+    const ImU32 text_col = ImGui::GetColorU32(ImVec4(0.92f, 0.93f, 0.97f, 0.95f));
+
+    draw_list->AddRectFilled(plus_min, plus_max, ImGui::GetColorU32(plus_bg), 8.0f);
+    draw_list->AddLine(ImVec2(plus_cx - 5.0f, plus_cy), ImVec2(plus_cx + 5.0f, plus_cy), plus_fg, 2.0f);
+    draw_list->AddLine(ImVec2(plus_cx, plus_cy - 5.0f), ImVec2(plus_cx, plus_cy + 5.0f), plus_fg, 2.0f);
+    draw_list->AddText(
+        ImVec2(win_pos.x + start_x + plus_box + gap, win_pos.y + center_y - text_size.y * 0.5f),
+        text_col,
+        label
+    );
+
     if (ImGui::BeginPopup("add_source_popup")) {
         ImGui::TextUnformatted("Add source");
         ImGui::TextDisabled("Choose which detected device or app should appear in Sources.");
@@ -2478,9 +2762,6 @@ void render_add_input_card(WireDeckUiSnapshot* snapshot, float card_width, float
         }
         ImGui::EndPopup();
     }
-    //ImGui::Dummy(ImVec2(0.0f, 14.0f));
-    ImGui::SetCursorPosX((card_width - 124.0f) * 0.5f);
-    ImGui::TextUnformatted("Add source");
     ImGui::PopStyleVar();
     ImGui::EndChild();
 }
@@ -2504,6 +2785,7 @@ void render_output_card(WireDeckImGuiBridge* bridge, WireDeckUiSnapshot* snapsho
     bool expose_as_microphone = bus.expose_as_microphone != 0;
     bool expose_on_web = bus.expose_on_web != 0;
     ImGui::PushID(bus.id);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 12.0f));
     ImGui::BeginChild(
         "output_card",
         ImVec2(card_width, card_height),
@@ -2513,62 +2795,137 @@ void render_output_card(WireDeckImGuiBridge* bridge, WireDeckUiSnapshot* snapsho
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f, 4.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f, 4.0f));
 
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    const ImVec2 win_pos = ImGui::GetWindowPos();
+    const ImVec2 win_size = ImGui::GetWindowSize();
+    const ImVec2 card_min = win_pos;
+    const ImVec2 card_max(win_pos.x + win_size.x, win_pos.y + win_size.y);
+    draw_list->AddRectFilled(card_min, card_max, ImGui::GetColorU32(ImVec4(0.08f, 0.09f, 0.14f, 0.96f)), 18.0f);
+    draw_list->AddRect(card_min, card_max, ImGui::GetColorU32(ImVec4(0.60f, 0.66f, 0.86f, 0.10f)), 18.0f);
+
+    const float pad_x = 18.0f;
+    const float top_y = 14.0f;
+    ImGui::SetCursorPos(ImVec2(pad_x, top_y + 1.0f));
     ImGui::TextUnformatted(bus.label);
     render_rename_popup(bridge, "rename_output_popup", snapshot, bus.id, bus.label, false);
-    const float actions_width = 64.0f;
-    const float actions_x = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - actions_width;
-    ImGui::SameLine();
-    if (actions_x > ImGui::GetCursorPosX()) {
-        ImGui::SetCursorPosX(actions_x);
-    }
-    if (render_mic_exposure_button(bridge, "##output_mic_exposure", expose_as_microphone)) {
+
+    const float seg_h = 24.0f;
+    const float seg_btn_w = 28.0f;
+    const float seg_w = seg_btn_w * 3.0f;
+    const float seg_x = win_size.x - 18.0f - seg_w;
+    const float seg_y = top_y;
+    const ImVec2 seg_min(win_pos.x + seg_x, win_pos.y + seg_y);
+    const ImVec2 seg_max(seg_min.x + seg_w, seg_min.y + seg_h);
+    draw_list->AddRectFilled(seg_min, seg_max, ImGui::GetColorU32(ImVec4(0.18f, 0.20f, 0.29f, 0.96f)), 8.0f);
+    draw_list->AddLine(ImVec2(seg_min.x + seg_btn_w, seg_min.y + 4.0f), ImVec2(seg_min.x + seg_btn_w, seg_max.y - 4.0f), ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.10f)), 1.0f);
+    draw_list->AddLine(ImVec2(seg_min.x + seg_btn_w * 2.0f, seg_min.y + 4.0f), ImVec2(seg_min.x + seg_btn_w * 2.0f, seg_max.y - 4.0f), ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.10f)), 1.0f);
+
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 1.0f, 1.0f, 0.03f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 1.0f, 1.0f, 0.05f));
+
+    ImGui::SetCursorPos(ImVec2(seg_x, seg_y));
+    if (render_mic_exposure_button(bridge, "##output_mic_exposure", expose_as_microphone, ImVec2(seg_btn_w, seg_h), 9.0f)) {
         bus.expose_as_microphone = expose_as_microphone ? 0 : 1;
     }
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("%s as virtual microphone", expose_as_microphone ? "Stop exposing this output" : "Expose this output");
     }
-    ImGui::SameLine();
-    if (render_web_exposure_button(bridge, "##output_web_exposure", expose_on_web)) {
+
+    ImGui::SetCursorPos(ImVec2(seg_x + seg_btn_w, seg_y));
+    if (render_web_exposure_button(bridge, "##output_web_exposure", expose_on_web, ImVec2(seg_btn_w, seg_h), 9.0f)) {
         bus.expose_on_web = expose_on_web ? 0 : 1;
     }
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("%s over HTTP", expose_on_web ? "Stop exposing this output" : "Expose this output");
     }
-    //ImGui::Dummy(ImVec2(0.0f, 1.0f));
-    //ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.72f, 0.78f, 0.84f, 1.0f));
-    //ImGui::Text(assigned_inputs == 1 ? "1 source feed" : "%d source feeds", assigned_inputs);
-    //ImGui::SameLine();
-    //ImGui::TextDisabled("|");
-    //ImGui::SameLine();
-    //ImGui::Text(selected_destinations == 1 ? "1 device" : "%d devices", selected_destinations);
-    //ImGui::PopStyleColor();
 
-    ImGui::Dummy(ImVec2(0.0f, 6.0f));
-    ImGui::TextDisabled("Physical Destinations");
-    render_output_destination_dropdown(snapshot, bus);
-
-    //ImGui::Dummy(ImVec2(0.0f, 6.0f));
-    //ImGui::TextDisabled("Route");
-    //if (selected_destinations == 0) {
-    //    ImGui::TextUnformatted("No destination selected");
-    //} else {
-    //    const std::string preview = output_destination_preview(snapshot, bus.id);
-    //    ImGui::TextWrapped("%s", preview.c_str());
-    //}
-
-    ImGui::Dummy(ImVec2(0.0f, 6.0f));
-    ImGui::TextDisabled("Signal");
-    render_source_stereo_meter(bridge, bus.id, meter_left, meter_right, ImVec2(ImGui::GetContentRegionAvail().x, 26.0f));
-
-    ImGui::Dummy(ImVec2(0.0f, 6.0f));
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.64f, 0.16f, 0.16f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.78f, 0.20f, 0.20f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.52f, 0.12f, 0.12f, 1.0f));
-    if (ImGui::Button("Delete", ImVec2(-1.0f, 0.0f))) {
+    ImGui::SetCursorPos(ImVec2(seg_x + seg_btn_w * 2.0f, seg_y));
+    if (render_delete_icon_button(bridge, "##output_delete", ImVec2(seg_btn_w, seg_h), 5.5f)) {
         queue_output_delete(snapshot, bus.id);
     }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Delete output");
+    }
     ImGui::PopStyleColor(3);
-    ImGui::PopStyleVar(2);
+    ImGui::PopStyleVar();
+
+    const float row2_y = 40.0f;
+    ImGui::SetCursorPos(ImVec2(pad_x, row2_y));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.66f, 0.68f, 0.77f, 0.72f));
+    ImGui::TextUnformatted("Physical destination");
+    ImGui::PopStyleColor();
+
+    const float combo_y = 56.0f;
+    const float combo_x = pad_x;
+    const float combo_w = win_size.x - pad_x * 2.0f;
+    const float combo_h = 24.0f;
+    const ImVec2 combo_min(win_pos.x + combo_x, win_pos.y + combo_y);
+    const ImVec2 combo_max(combo_min.x + combo_w, combo_min.y + combo_h);
+    draw_list->AddRectFilled(combo_min, combo_max, ImGui::GetColorU32(ImVec4(0.12f, 0.14f, 0.20f, 0.96f)), 8.0f);
+    draw_list->AddRect(combo_min, combo_max, ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.05f)), 8.0f);
+    draw_list->AddRectFilled(ImVec2(combo_max.x - 24.0f, combo_min.y), combo_max, ImGui::GetColorU32(ImVec4(0.22f, 0.35f, 0.55f, 0.85f)), 8.0f);
+
+    const std::string preview = output_destination_preview(snapshot, bus.id);
+    ImGui::SetCursorPos(ImVec2(combo_x + 10.0f, combo_y + 3.0f));
+    ImGui::TextUnformatted(preview.c_str());
+    draw_list->AddText(ImVec2(combo_max.x - 16.0f, combo_min.y + 4.0f), ImGui::GetColorU32(ImVec4(0.96f, 0.97f, 0.99f, 0.92f)), "\xE2\x96\xBE");
+
+    ImGui::SetCursorPos(ImVec2(combo_x, combo_y));
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    if (ImGui::Button("##destinations", ImVec2(combo_w, combo_h))) {
+        ImGui::OpenPopup("destinations_popup");
+    }
+    ImGui::PopStyleColor(3);
+
+    if (ImGui::BeginPopup("destinations_popup")) {
+        std::string current_group;
+        for (int i = 0; i < snapshot->destination_count; ++i) {
+            WireDeckUiDestination& destination = snapshot->destinations[i];
+            WireDeckUiBusDestination* bus_destination = find_bus_destination(snapshot, bus.id, destination.id);
+            if (bus_destination == nullptr) continue;
+            const char* subtitle = (destination.subtitle != nullptr and destination.subtitle[0] != 0) ? destination.subtitle : "Other";
+            if (current_group != subtitle) {
+                if (!current_group.empty()) ImGui::Spacing();
+                current_group = subtitle;
+                ImGui::TextDisabled("%s", subtitle);
+            }
+            bool enabled = bus_destination->enabled != 0;
+            ImGui::PushID(destination.id);
+            if (ImGui::Selectable(destination.label, enabled, ImGuiSelectableFlags_DontClosePopups)) {
+                bus_destination->enabled = enabled ? 0 : 1;
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndPopup();
+    }
+
+    const float sep_y = 84.0f;
+    draw_list->AddLine(ImVec2(win_pos.x + 16.0f, win_pos.y + sep_y), ImVec2(win_pos.x + win_size.x - 16.0f, win_pos.y + sep_y), ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.06f)), 1.0f);
+
+    const float meter_x = pad_x;
+    const float meter_y = 91.0f;
+    const float meter_w = win_size.x - pad_x * 2.0f;
+    const float label_w = 12.0f;
+    const float gap = 6.0f;
+    const float track_h = 5.0f;
+    const float row_gap = 6.0f;
+    const float track_x0 = win_pos.x + meter_x + label_w + gap;
+    const float track_x1 = win_pos.x + meter_x + meter_w;
+    const float track_w = std::max(0.0f, track_x1 - track_x0);
+    const auto draw_meter_row = [&](float y, const char* label, float value) {
+        draw_list->AddText(ImVec2(win_pos.x + meter_x, y - 6.0f), ImGui::GetColorU32(ImVec4(0.72f, 0.74f, 0.82f, 0.72f)), label);
+        draw_list->AddRectFilled(ImVec2(track_x0, y), ImVec2(track_x1, y + track_h), ImGui::GetColorU32(ImVec4(0.15f, 0.16f, 0.24f, 0.95f)), 999.0f);
+        const float clamped = std::clamp(value, 0.0f, 1.0f);
+        draw_list->AddRectFilled(ImVec2(track_x0, y), ImVec2(track_x0 + track_w * clamped, y + track_h), ImGui::GetColorU32(meter_color(clamped)), 999.0f);
+    };
+    draw_meter_row(win_pos.y + meter_y, "L", meter_left);
+    draw_meter_row(win_pos.y + meter_y + track_h + row_gap, "R", meter_right);
+
+    ImGui::PopStyleVar(3);
     ImGui::EndChild();
     ImGui::PopID();
 }
@@ -2602,7 +2959,7 @@ void render_mixer_bus_card(WireDeckImGuiBridge* bridge, WireDeckUiSnapshot* snap
             ImGui::SetCursorPosX(action_x);
         }
     }
-    if (render_mute_icon_button(bridge, "##mixer_bus_mute_toggle", muted)) {
+    if (render_mute_icon_button(bridge, "##mixer_bus_mute_toggle", muted, ImVec2(30.0f, 30.0f), 2.0f)) {
         bus.muted = muted ? 0 : 1;
     }
 
@@ -2633,22 +2990,54 @@ void render_mixer_bus_card(WireDeckImGuiBridge* bridge, WireDeckUiSnapshot* snap
 }
 
 void render_add_output_card(WireDeckUiSnapshot* snapshot, float card_width, float card_height) {
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 12.0f));
     ImGui::BeginChild(
         "add_output_card",
         ImVec2(card_width, card_height),
         ImGuiChildFlags_Borders,
         ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse
     );
-    ImGui::Dummy(ImVec2(0.0f, 32.0f));
-    ImGui::SetCursorPosX((card_width - 48.0f) * 0.5f);
-    if (ImGui::Button("+", ImVec2(48.0f, 48.0f))) {
+
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    const ImVec2 win_pos = ImGui::GetWindowPos();
+    const ImVec2 win_size = ImGui::GetWindowSize();
+    const ImVec2 card_min = win_pos;
+    const ImVec2 card_max(win_pos.x + win_size.x, win_pos.y + win_size.y);
+    const char* label = "Add output";
+    const ImVec2 text_size = ImGui::CalcTextSize(label);
+    const float plus_box = 26.0f;
+    const float gap = 10.0f;
+    const float content_w = plus_box + gap + text_size.x;
+    const float start_x = (win_size.x - content_w) * 0.5f;
+    const float center_y = win_size.y * 0.5f;
+
+    draw_list->AddRectFilled(card_min, card_max, ImGui::GetColorU32(ImVec4(0.08f, 0.09f, 0.14f, 0.96f)), 18.0f);
+    draw_list->AddRect(card_min, card_max, ImGui::GetColorU32(ImVec4(0.60f, 0.66f, 0.86f, 0.10f)), 18.0f);
+
+    ImGui::SetCursorPos(ImVec2(0.0f, 0.0f));
+    ImGui::InvisibleButton("add_output_btn", ImVec2(win_size.x, win_size.y));
+    const bool hovered = ImGui::IsItemHovered();
+    const bool active = ImGui::IsItemActive();
+    if (ImGui::IsItemClicked()) {
         snapshot->request_add_output = 1;
     }
-    ImGui::Dummy(ImVec2(0.0f, 18.0f));
-    ImGui::SetCursorPosX((card_width - 112.0f) * 0.5f);
-    ImGui::TextDisabled("OUTPUT %d", snapshot->bus_count + 1);
-    ImGui::SetCursorPosX((card_width - 96.0f) * 0.5f);
-    ImGui::TextUnformatted("Add output");
+
+    const ImVec2 plus_min(win_pos.x + start_x, win_pos.y + center_y - plus_box * 0.5f);
+    const ImVec2 plus_max(plus_min.x + plus_box, plus_min.y + plus_box);
+    const float plus_cx = (plus_min.x + plus_max.x) * 0.5f;
+    const float plus_cy = (plus_min.y + plus_max.y) * 0.5f;
+    ImVec4 plus_bg = ImVec4(0.18f, 0.20f, 0.29f, 0.96f);
+    if (hovered) plus_bg = ImVec4(0.22f, 0.24f, 0.34f, 1.0f);
+    if (active) plus_bg = ImVec4(0.25f, 0.28f, 0.38f, 1.0f);
+    const ImU32 plus_fg = ImGui::GetColorU32(ImVec4(0.92f, 0.93f, 0.97f, 0.94f));
+    const ImU32 text_col = ImGui::GetColorU32(ImVec4(0.92f, 0.93f, 0.97f, 0.95f));
+
+    draw_list->AddRectFilled(plus_min, plus_max, ImGui::GetColorU32(plus_bg), 8.0f);
+    draw_list->AddLine(ImVec2(plus_cx - 5.0f, plus_cy), ImVec2(plus_cx + 5.0f, plus_cy), plus_fg, 2.0f);
+    draw_list->AddLine(ImVec2(plus_cx, plus_cy - 5.0f), ImVec2(plus_cx, plus_cy + 5.0f), plus_fg, 2.0f);
+    draw_list->AddText(ImVec2(win_pos.x + start_x + plus_box + gap, win_pos.y + center_y - text_size.y * 0.5f), text_col, label);
+
+    ImGui::PopStyleVar();
     ImGui::EndChild();
 }
 
@@ -2686,9 +3075,9 @@ void render_ui(WireDeckImGuiBridge* bridge, WireDeckUiSnapshot* snapshot) {
     const float full_height = ImGui::GetContentRegionAvail().y;
     const float left_width = 316.0f;
     const float right_width = 308.0f;
-    const float source_card_width = 292.0f;
-    const float source_card_height = 188.0f;
-    const float output_card_height = 202.0f;
+    const float source_card_width = 300.0f;
+    const float source_card_height = 110.0f;
+    const float output_card_height = 120.0f;
 
     if (ImGui::BeginTable("wiredeck_main_columns", 3, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_NoPadOuterX)) {
         ImGui::TableSetupColumn("Sources", ImGuiTableColumnFlags_WidthFixed, left_width);
@@ -2696,21 +3085,21 @@ void render_ui(WireDeckImGuiBridge* bridge, WireDeckUiSnapshot* snapshot) {
         ImGui::TableSetupColumn("Outputs", ImGuiTableColumnFlags_WidthFixed, right_width);
 
         ImGui::TableNextColumn();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.97f, 0.82f, 0.32f, 1.0f));
+        //ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.97f, 0.82f, 0.32f, 1.0f));
         //ImGui::TextUnformatted("Sources");
-        ImGui::PopStyleColor();
+        //ImGui::PopStyleColor();
         //ImGui::TextDisabled("Capture strips you care about, kept visible and adjustable.");
         //ImGui::Dummy(ImVec2(0.0f, 10.0f));
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
         ImGui::BeginChild("sources_column", ImVec2(0.0f, full_height - 10.0f), ImGuiChildFlags_None, ImGuiWindowFlags_None);
-        ImGui::Dummy(ImVec2(0.0f, 5.0f));
         for (int i = 0; i < snapshot->channel_count; ++i) {
-            ImGui::SetCursorPosX(std::max(0.0f, (ImGui::GetContentRegionAvail().x - source_card_width) * 0.5f));
-            render_input_card(bridge, snapshot, snapshot->channels[i], i, source_card_width, source_card_height);
-            ImGui::Dummy(ImVec2(0.0f, 5.0f));
+            const float available_card_width = std::max(220.0f, ImGui::GetContentRegionAvail().x);
+            render_input_card(bridge, snapshot, snapshot->channels[i], i, available_card_width, source_card_height);
         }
-        ImGui::SetCursorPosX(std::max(0.0f, (ImGui::GetContentRegionAvail().x - source_card_width) * 0.5f));
-        render_add_input_card(snapshot, source_card_width, 124.0f);
+        const float available_card_width = std::max(220.0f, ImGui::GetContentRegionAvail().x);
+        render_add_input_card(snapshot, available_card_width, 40.0f);
         ImGui::EndChild();
+        ImGui::PopStyleColor();
 
         ImGui::TableNextColumn();
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.97f, 0.82f, 0.32f, 1.0f));
@@ -2766,13 +3155,16 @@ void render_ui(WireDeckImGuiBridge* bridge, WireDeckUiSnapshot* snapshot) {
         ImGui::PopStyleColor();
         //ImGui::TextDisabled("Choose where each bus should be heard in the real world.");
         //ImGui::Dummy(ImVec2(0.0f, 10.0f));
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
         ImGui::BeginChild("outputs_column", ImVec2(0.0f, full_height - 10.0f), ImGuiChildFlags_None, ImGuiWindowFlags_None);
         for (int i = 0; i < snapshot->bus_count; ++i) {
-            render_output_card(bridge, snapshot, snapshot->buses[i], i, right_width - 18.0f, output_card_height);
-            ImGui::Dummy(ImVec2(0.0f, 10.0f));
+            const float available_output_card_width = std::max(220.0f, ImGui::GetContentRegionAvail().x);
+            render_output_card(bridge, snapshot, snapshot->buses[i], i, available_output_card_width, output_card_height);
         }
-        render_add_output_card(snapshot, right_width - 18.0f, 124.0f);
+        const float available_output_card_width = std::max(220.0f, ImGui::GetContentRegionAvail().x);
+        render_add_output_card(snapshot, available_output_card_width, 40.0f);
         ImGui::EndChild();
+        ImGui::PopStyleColor();
 
         ImGui::EndTable();
     }
@@ -2999,8 +3391,10 @@ extern "C" void wiredeck_imgui_destroy(WireDeckImGuiBridge* bridge) {
         destroy_icon_texture(bridge, &bridge->volume_off_icon);
         destroy_icon_texture(bridge, &bridge->fx_icon);
         destroy_icon_texture(bridge, &bridge->mic_icon);
+        destroy_icon_texture(bridge, &bridge->mic_off_icon);
         destroy_icon_texture(bridge, &bridge->world_icon);
         destroy_icon_texture(bridge, &bridge->world_off_icon);
+        destroy_icon_texture(bridge, &bridge->trash_icon);
         destroy_icon_texture(bridge, &bridge->headset_icon);
         destroy_icon_texture(bridge, &bridge->generic_app_icon);
         for (auto& icon : bridge->source_icons) {
