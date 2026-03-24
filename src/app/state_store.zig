@@ -164,6 +164,10 @@ pub const StateStore = struct {
         try self.bus_destinations.append(self.allocator, .{
             .bus_id = try self.allocator.dupe(u8, bus_destination.bus_id),
             .destination_id = try self.allocator.dupe(u8, bus_destination.destination_id),
+            .destination_sink_name = try self.allocator.dupe(u8, bus_destination.destination_sink_name),
+            .destination_label = try self.allocator.dupe(u8, bus_destination.destination_label),
+            .destination_subtitle = try self.allocator.dupe(u8, bus_destination.destination_subtitle),
+            .destination_kind = bus_destination.destination_kind,
             .enabled = bus_destination.enabled,
         });
     }
@@ -380,6 +384,9 @@ pub const StateStore = struct {
         for (self.bus_destinations.items) |item| {
             self.allocator.free(item.bus_id);
             self.allocator.free(item.destination_id);
+            self.allocator.free(item.destination_sink_name);
+            self.allocator.free(item.destination_label);
+            self.allocator.free(item.destination_subtitle);
         }
         self.bus_destinations.clearRetainingCapacity();
     }

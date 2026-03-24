@@ -1138,6 +1138,9 @@ pub const App = struct {
         var preserved_bus_destinations = std.ArrayList(PreservedBusDestination).empty;
         defer freePreservedBusDestinations(self.allocator, &preserved_bus_destinations);
         try collectPreservedBusDestinations(self.allocator, &preserved_bus_destinations, self.state_store);
+        const restored_preserved = try self.allocator.alloc(bool, preserved_bus_destinations.items.len);
+        defer self.allocator.free(restored_preserved);
+        @memset(restored_preserved, false);
 
         self.state_store.clearSources();
         self.state_store.clearChannelSources();
@@ -1156,12 +1159,31 @@ pub const App = struct {
         self.state_store.destination_feed = if (self.state_store.destinations.items.len > 0) .pipewire else .unavailable;
         for (self.state_store.buses.items) |bus| {
             for (self.state_store.destinations.items) |destination| {
+                const preserved_index = findPreservedBusDestinationIndex(preserved_bus_destinations.items, bus.id, destination);
+                if (preserved_index) |index| restored_preserved[index] = true;
                 try self.state_store.addBusDestination(.{
                     .bus_id = bus.id,
                     .destination_id = destination.id,
-                    .enabled = shouldRestoreBusDestination(preserved_bus_destinations.items, bus.id, destination),
+                    .destination_sink_name = destination.pulse_sink_name,
+                    .destination_label = destination.label,
+                    .destination_subtitle = destination.subtitle,
+                    .destination_kind = destination.kind,
+                    .enabled = if (preserved_index) |index| preserved_bus_destinations.items[index].enabled else false,
                 });
             }
+        }
+        for (preserved_bus_destinations.items, 0..) |item, index| {
+            if (restored_preserved[index]) continue;
+            if (findStateBus(self.state_store, item.bus_id) == null) continue;
+            try self.state_store.addBusDestination(.{
+                .bus_id = item.bus_id,
+                .destination_id = item.destination_id,
+                .destination_sink_name = item.destination_sink_name,
+                .destination_label = item.destination_label,
+                .destination_subtitle = item.destination_subtitle,
+                .destination_kind = item.destination_kind,
+                .enabled = item.enabled,
+            });
         }
 
         self.pulse_peak.sync(refresh.meter_specs) catch |err| {
@@ -1586,8 +1608,12 @@ fn appendDestinationsToList(
 
 const PreservedBusDestination = struct {
     bus_id: []const u8,
+    destination_id: []const u8,
+    destination_sink_name: []const u8,
     destination_label: []const u8,
     destination_subtitle: []const u8,
+    destination_kind: ?destinations_mod.DestinationKind,
+    enabled: bool,
 };
 
 fn collectPreservedBusDestinations(
@@ -1596,13 +1622,20 @@ fn collectPreservedBusDestinations(
     state_store: *const StateStore,
 ) !void {
     for (state_store.bus_destinations.items) |bus_destination| {
-        if (!bus_destination.enabled) continue;
-        const destination = findStateDestination(state_store.destinations.items, bus_destination.destination_id) orelse continue;
-        if (isWiredeckManagedSinkName(destination.pulse_sink_name)) continue;
+        const destination = findStateDestination(state_store.destinations.items, bus_destination.destination_id);
+        const destination_sink_name = if (destination) |item| item.pulse_sink_name else bus_destination.destination_sink_name;
+        const destination_label = if (destination) |item| item.label else bus_destination.destination_label;
+        const destination_subtitle = if (destination) |item| item.subtitle else bus_destination.destination_subtitle;
+        const destination_kind = if (destination) |item| item.kind else bus_destination.destination_kind;
+        if (isWiredeckManagedSinkName(destination_sink_name)) continue;
         try out.append(allocator, .{
             .bus_id = try allocator.dupe(u8, bus_destination.bus_id),
-            .destination_label = try allocator.dupe(u8, destination.label),
-            .destination_subtitle = try allocator.dupe(u8, destination.subtitle),
+            .destination_id = try allocator.dupe(u8, bus_destination.destination_id),
+            .destination_sink_name = try allocator.dupe(u8, destination_sink_name),
+            .destination_label = try allocator.dupe(u8, destination_label),
+            .destination_subtitle = try allocator.dupe(u8, destination_subtitle),
+            .destination_kind = destination_kind,
+            .enabled = bus_destination.enabled,
         });
     }
 }
@@ -1610,24 +1643,26 @@ fn collectPreservedBusDestinations(
 fn freePreservedBusDestinations(allocator: std.mem.Allocator, items: *std.ArrayList(PreservedBusDestination)) void {
     for (items.items) |item| {
         allocator.free(item.bus_id);
+        allocator.free(item.destination_id);
+        allocator.free(item.destination_sink_name);
         allocator.free(item.destination_label);
         allocator.free(item.destination_subtitle);
     }
     items.deinit(allocator);
 }
 
-fn shouldRestoreBusDestination(
+fn findPreservedBusDestinationIndex(
     preserved: []const PreservedBusDestination,
     bus_id: []const u8,
     destination: destinations_mod.Destination,
-) bool {
-    for (preserved) |item| {
+) ?usize {
+    for (preserved, 0..) |item, index| {
         if (!std.mem.eql(u8, item.bus_id, bus_id)) continue;
-        if (sameText(item.destination_label, destination.label) and sameText(item.destination_subtitle, destination.subtitle)) {
-            return true;
-        }
+        if (std.mem.eql(u8, item.destination_id, destination.id)) return index;
+        if (item.destination_sink_name.len != 0 and destination.pulse_sink_name.len != 0 and sameText(item.destination_sink_name, destination.pulse_sink_name)) return index;
+        if (sameText(item.destination_label, destination.label) and sameText(item.destination_subtitle, destination.subtitle)) return index;
     }
-    return false;
+    return null;
 }
 
 fn inventoryRefreshMatchesState(state_store: *const StateStore, refresh: App.InventoryRefresh) bool {
@@ -1658,6 +1693,13 @@ fn inventoryRefreshMatchesState(state_store: *const StateStore, refresh: App.Inv
 fn findStateDestination(items: []const destinations_mod.Destination, id: []const u8) ?destinations_mod.Destination {
     for (items) |item| {
         if (std.mem.eql(u8, item.id, id)) return item;
+    }
+    return null;
+}
+
+fn findStateBus(state_store: *const StateStore, id: []const u8) ?usize {
+    for (state_store.buses.items, 0..) |bus, index| {
+        if (std.mem.eql(u8, bus.id, id)) return index;
     }
     return null;
 }

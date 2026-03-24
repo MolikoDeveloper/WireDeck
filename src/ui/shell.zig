@@ -535,6 +535,7 @@ pub const UiShell = struct {
         var visible_bus_destination_index: usize = 0;
         for (state_store.bus_destinations.items) |*bus_destination| {
             if (!isVisibleBus(state_store, bus_destination.bus_id)) continue;
+            if (findDestination(state_store, bus_destination.destination_id) == null) continue;
             const next_enabled = snapshot.bus_destinations[visible_bus_destination_index].enabled != 0;
             const bus_destination_changed = bus_destination.enabled != next_enabled;
             result.changed = result.changed or bus_destination_changed;
@@ -1175,6 +1176,9 @@ fn freeChannelSource(allocator: std.mem.Allocator, channel_source: channel_sourc
 fn freeBusDestination(allocator: std.mem.Allocator, bus_destination: bus_destinations_mod.BusDestination) void {
     allocator.free(bus_destination.bus_id);
     allocator.free(bus_destination.destination_id);
+    allocator.free(bus_destination.destination_sink_name);
+    allocator.free(bus_destination.destination_label);
+    allocator.free(bus_destination.destination_subtitle);
 }
 
 fn findDestination(state_store: *const StateStore, id: []const u8) ?destinations_mod.Destination {

@@ -233,10 +233,10 @@ fn makeStoredConfig(allocator: std.mem.Allocator, state_store: *const StateStore
             bus_destinations[index] = .{
                 .bus_id = item.bus_id,
                 .destination_id = item.destination_id,
-                .destination_sink_name = if (destination) |value| value.pulse_sink_name else null,
-                .destination_label = if (destination) |value| value.label else null,
-                .destination_subtitle = if (destination) |value| value.subtitle else null,
-                .destination_kind = if (destination) |value| value.kind else null,
+                .destination_sink_name = if (destination) |value| value.pulse_sink_name else item.destination_sink_name,
+                .destination_label = if (destination) |value| value.label else item.destination_label,
+                .destination_subtitle = if (destination) |value| value.subtitle else item.destination_subtitle,
+                .destination_kind = if (destination) |value| value.kind else item.destination_kind,
                 .enabled = item.enabled,
             };
             index += 1;
@@ -496,14 +496,38 @@ fn rebuildChannelSources(state_store: *StateStore) !void {
 }
 
 fn rebuildBusDestinations(state_store: *StateStore, stored: []const StoredBusDestination) !void {
+    const restored = try state_store.allocator.alloc(bool, stored.len);
+    defer state_store.allocator.free(restored);
+    @memset(restored, false);
+
     for (state_store.buses.items) |bus| {
         for (state_store.destinations.items) |destination| {
+            const stored_index = findStoredBusDestinationIndex(stored, bus.id, destination);
+            if (stored_index) |index| restored[index] = true;
             try state_store.addBusDestination(.{
                 .bus_id = bus.id,
                 .destination_id = destination.id,
-                .enabled = findStoredBusDestination(stored, bus.id, destination),
+                .destination_sink_name = destination.pulse_sink_name,
+                .destination_label = destination.label,
+                .destination_subtitle = destination.subtitle,
+                .destination_kind = destination.kind,
+                .enabled = if (stored_index) |index| stored[index].enabled else false,
             });
         }
+    }
+
+    for (stored, 0..) |item, index| {
+        if (restored[index]) continue;
+        if (!hasBus(state_store, item.bus_id)) continue;
+        try state_store.addBusDestination(.{
+            .bus_id = item.bus_id,
+            .destination_id = item.destination_id,
+            .destination_sink_name = item.destination_sink_name orelse "",
+            .destination_label = item.destination_label orelse "",
+            .destination_subtitle = item.destination_subtitle orelse "",
+            .destination_kind = item.destination_kind,
+            .enabled = item.enabled,
+        });
     }
 }
 
@@ -520,18 +544,18 @@ fn ensureSendMatrix(state_store: *StateStore) !void {
     }
 }
 
-fn findStoredBusDestination(
+fn findStoredBusDestinationIndex(
     stored: []const StoredBusDestination,
     bus_id: []const u8,
     destination: destinations_mod.Destination,
-) bool {
-    if (isWiredeckManagedSinkName(destination.pulse_sink_name)) return false;
-    for (stored) |item| {
+) ?usize {
+    if (isWiredeckManagedSinkName(destination.pulse_sink_name)) return null;
+    for (stored, 0..) |item, index| {
         if (!std.mem.eql(u8, item.bus_id, bus_id)) continue;
-        if (std.mem.eql(u8, item.destination_id, destination.id)) return item.enabled;
+        if (std.mem.eql(u8, item.destination_id, destination.id)) return index;
         if (item.destination_sink_name) |sink_name| {
             if (isWiredeckManagedSinkName(sink_name)) continue;
-            if (destination.pulse_sink_name.len != 0 and std.mem.eql(u8, destination.pulse_sink_name, sink_name)) return item.enabled;
+            if (destination.pulse_sink_name.len != 0 and std.mem.eql(u8, destination.pulse_sink_name, sink_name)) return index;
         }
         if (item.destination_label) |label| {
             if (!std.mem.eql(u8, destination.label, label)) continue;
@@ -541,10 +565,10 @@ fn findStoredBusDestination(
             if (item.destination_kind) |kind| {
                 if (destination.kind != kind) continue;
             }
-            return item.enabled;
+            return index;
         }
     }
-    return false;
+    return null;
 }
 
 fn resolveStoredChannelSource(state_store: *const StateStore, channel: StoredChannel) ?[]const u8 {
