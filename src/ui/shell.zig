@@ -106,6 +106,8 @@ pub const UiShell = struct {
             .request_rename_input_label = zeroedBuffer(64),
             .request_rename_output_id = zeroedBuffer(64),
             .request_rename_output_label = zeroedBuffer(64),
+            .request_pick_input_icon_id = zeroedBuffer(64),
+            .request_clear_input_icon_id = zeroedBuffer(64),
             .request_delete_input_id = zeroedBuffer(64),
             .request_delete_output_id = zeroedBuffer(64),
             .request_add_plugin_channel_id = zeroedBuffer(64),
@@ -597,6 +599,29 @@ pub const UiShell = struct {
             clearBuffer(&snapshot.request_rename_output_id);
             clearBuffer(&snapshot.request_rename_output_label);
         }
+        if (snapshot.request_pick_input_icon_id[0] != 0) {
+            const id = cStringSlice(&snapshot.request_pick_input_icon_id);
+            if (findChannel(state_store, id)) |channel| {
+                if (try chooseCustomIconForChannel(state_store.allocator, channel.id)) |custom_icon_path| {
+                    defer state_store.allocator.free(custom_icon_path);
+                    try replaceOwnedString(state_store.allocator, &channel.custom_icon_path, custom_icon_path);
+                    try replaceOwnedString(state_store.allocator, &channel.custom_icon_name, "custom-icon");
+                    try replaceOwnedString(state_store.allocator, &channel.icon_path, custom_icon_path);
+                    try replaceOwnedString(state_store.allocator, &channel.icon_name, "custom-icon");
+                    result.changed = true;
+                }
+            }
+            clearBuffer(&snapshot.request_pick_input_icon_id);
+        }
+        if (snapshot.request_clear_input_icon_id[0] != 0) {
+            const id = cStringSlice(&snapshot.request_clear_input_icon_id);
+            if (findChannel(state_store, id)) |channel| {
+                try replaceOwnedString(state_store.allocator, &channel.custom_icon_path, "");
+                try replaceOwnedString(state_store.allocator, &channel.custom_icon_name, "");
+                result.changed = true;
+            }
+            clearBuffer(&snapshot.request_clear_input_icon_id);
+        }
         if (snapshot.request_delete_input_id[0] != 0) {
             try deleteChannel(state_store, cStringSlice(&snapshot.request_delete_input_id));
             clearBuffer(&snapshot.request_delete_input_id);
@@ -726,6 +751,8 @@ fn addChannelFromSource(state_store: *StateStore, source_id: []const u8) !void {
         .source_kind = @intFromEnum(selected_source.kind),
         .icon_name = selected_source.icon_name,
         .icon_path = selected_source.icon_path,
+        .custom_icon_name = "",
+        .custom_icon_path = "",
         .input_bus_id = input_bus_id,
         .meter_stage = .input,
     });
@@ -968,12 +995,14 @@ fn syncChannelBindingSelections(state_store: *StateStore) !bool {
                 try replaceOwnedString(state_store.allocator, &channel.subtitle, source.subtitle);
                 changed = true;
             }
-            if (!std.mem.eql(u8, channel.icon_name, source.icon_name)) {
-                try replaceOwnedString(state_store.allocator, &channel.icon_name, source.icon_name);
+            const desired_icon_name = if (channel.custom_icon_name.len > 0) channel.custom_icon_name else source.icon_name;
+            const desired_icon_path = if (channel.custom_icon_path.len > 0) channel.custom_icon_path else source.icon_path;
+            if (!std.mem.eql(u8, channel.icon_name, desired_icon_name)) {
+                try replaceOwnedString(state_store.allocator, &channel.icon_name, desired_icon_name);
                 changed = true;
             }
-            if (!std.mem.eql(u8, channel.icon_path, source.icon_path)) {
-                try replaceOwnedString(state_store.allocator, &channel.icon_path, source.icon_path);
+            if (!std.mem.eql(u8, channel.icon_path, desired_icon_path)) {
+                try replaceOwnedString(state_store.allocator, &channel.icon_path, desired_icon_path);
                 changed = true;
             }
             if (channel.source_kind != @intFromEnum(source.kind)) {
@@ -1080,6 +1109,112 @@ fn replaceOwnedOptionalString(allocator: std.mem.Allocator, field: *?[]const u8,
     field.* = replacement;
 }
 
+fn wiredeckConfigHome(allocator: std.mem.Allocator) ![]u8 {
+    return std.process.getEnvVarOwned(allocator, "XDG_CONFIG_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => blk: {
+            const home = try std.process.getEnvVarOwned(allocator, "HOME");
+            defer allocator.free(home);
+            break :blk try std.fs.path.join(allocator, &.{ home, ".config" });
+        },
+        else => return err,
+    };
+}
+
+fn chooseCustomIconForChannel(allocator: std.mem.Allocator, channel_id: []const u8) !?[]u8 {
+    const selected_path = (try openPngFileDialog(allocator)) orelse return null;
+    defer allocator.free(selected_path);
+
+    if (!hasPngExtension(selected_path)) return error.InvalidIconFormat;
+
+    const config_home = try wiredeckConfigHome(allocator);
+    defer allocator.free(config_home);
+    const wiredeck_dir = try std.fs.path.join(allocator, &.{ config_home, "wiredeck" });
+    defer allocator.free(wiredeck_dir);
+    std.fs.makeDirAbsolute(wiredeck_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    const icons_dir = try std.fs.path.join(allocator, &.{ wiredeck_dir, "icons" });
+    defer allocator.free(icons_dir);
+    std.fs.makeDirAbsolute(icons_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    const sanitized_id = try allocSanitizedFileName(allocator, channel_id);
+    defer allocator.free(sanitized_id);
+    const file_name = try std.fmt.allocPrint(allocator, "{s}.png", .{sanitized_id});
+    defer allocator.free(file_name);
+    const target_path = try std.fs.path.join(allocator, &.{ icons_dir, file_name });
+    errdefer allocator.free(target_path);
+
+    try copyFileAbsolute(selected_path, target_path);
+    return target_path;
+}
+
+fn openPngFileDialog(allocator: std.mem.Allocator) !?[]u8 {
+    if (try runFileDialogCommand(allocator, &.{ "zenity", "--file-selection", "--title=Choose PNG Icon", "--file-filter=PNG images | *.png *.PNG" })) |path| {
+        return path;
+    }
+    if (try runFileDialogCommand(allocator, &.{ "qarma", "--file-selection", "--title=Choose PNG Icon", "--file-filter=PNG images | *.png *.PNG" })) |path| {
+        return path;
+    }
+    if (try runFileDialogCommand(allocator, &.{ "kdialog", "--getopenfilename", ".", "*.png *.PNG|PNG images" })) |path| {
+        return path;
+    }
+    return null;
+}
+
+fn runFileDialogCommand(allocator: std.mem.Allocator, argv: []const []const u8) !?[]u8 {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(result.stderr);
+    defer allocator.free(result.stdout);
+
+    switch (result.term) {
+        .Exited => |code| if (code != 0) return null,
+        else => return null,
+    }
+
+    const trimmed = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
+    if (trimmed.len == 0) return null;
+    return try allocator.dupe(u8, trimmed);
+}
+
+fn hasPngExtension(path: []const u8) bool {
+    if (path.len < 4) return false;
+    return std.ascii.eqlIgnoreCase(path[path.len - 4 ..], ".png");
+}
+
+fn allocSanitizedFileName(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    var out = try allocator.alloc(u8, value.len);
+    errdefer allocator.free(out);
+    for (value, 0..) |char, index| {
+        out[index] = if (std.ascii.isAlphanumeric(char)) std.ascii.toLower(char) else '_';
+    }
+    return out;
+}
+
+fn copyFileAbsolute(source_path: []const u8, target_path: []const u8) !void {
+    const source = try std.fs.openFileAbsolute(source_path, .{});
+    defer source.close();
+    const target = try std.fs.createFileAbsolute(target_path, .{ .truncate = true });
+    defer target.close();
+
+    var buffer: [8192]u8 = undefined;
+    while (true) {
+        const read_len = try source.read(&buffer);
+        if (read_len == 0) break;
+        try target.writeAll(buffer[0..read_len]);
+    }
+}
+
 fn freeChannel(allocator: std.mem.Allocator, channel: channels_mod.Channel) void {
     allocator.free(channel.id);
     allocator.free(channel.label);
@@ -1087,6 +1222,8 @@ fn freeChannel(allocator: std.mem.Allocator, channel: channels_mod.Channel) void
     if (channel.bound_source_id) |value| allocator.free(value);
     allocator.free(channel.icon_name);
     allocator.free(channel.icon_path);
+    allocator.free(channel.custom_icon_name);
+    allocator.free(channel.custom_icon_path);
     if (channel.input_bus_id) |value| allocator.free(value);
 }
 

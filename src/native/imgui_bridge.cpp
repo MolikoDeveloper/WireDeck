@@ -1540,6 +1540,14 @@ void queue_input_rename(WireDeckUiSnapshot* snapshot, const char* id, const char
     set_request_text(snapshot->request_rename_input_label, sizeof(snapshot->request_rename_input_label), label);
 }
 
+void queue_input_icon_pick(WireDeckUiSnapshot* snapshot, const char* id) {
+    set_request_text(snapshot->request_pick_input_icon_id, sizeof(snapshot->request_pick_input_icon_id), id);
+}
+
+void queue_input_icon_clear(WireDeckUiSnapshot* snapshot, const char* id) {
+    set_request_text(snapshot->request_clear_input_icon_id, sizeof(snapshot->request_clear_input_icon_id), id);
+}
+
 void queue_output_rename(WireDeckUiSnapshot* snapshot, const char* id, const char* label) {
     set_request_text(snapshot->request_rename_output_id, sizeof(snapshot->request_rename_output_id), id);
     set_request_text(snapshot->request_rename_output_label, sizeof(snapshot->request_rename_output_label), label);
@@ -1622,6 +1630,19 @@ WireDeckUiSource* find_source(WireDeckUiSnapshot* snapshot, const char* source_i
     return nullptr;
 }
 
+WireDeckUiChannel* find_channel(WireDeckUiSnapshot* snapshot, const char* channel_id) {
+    if (snapshot == nullptr || channel_id == nullptr) {
+        return nullptr;
+    }
+    for (int i = 0; i < snapshot->channel_count; ++i) {
+        WireDeckUiChannel& channel = snapshot->channels[i];
+        if (safe_streq(channel.id, channel_id)) {
+            return &channel;
+        }
+    }
+    return nullptr;
+}
+
 WireDeckUiSource* find_bound_source_for_channel(WireDeckUiSnapshot* snapshot, const WireDeckUiChannel& channel) {
     if (snapshot == nullptr || channel.id == nullptr) {
         return nullptr;
@@ -1643,6 +1664,22 @@ WireDeckUiSource* find_bound_source_for_channel(WireDeckUiSnapshot* snapshot, co
     }
 
     return nullptr;
+}
+
+const char* preferred_source_label_for_channel(
+    WireDeckUiSnapshot* snapshot,
+    const char* channel_id,
+    const WireDeckUiSource& source
+) {
+    WireDeckUiChannel* channel = find_channel(snapshot, channel_id);
+    if (channel == nullptr) return source.label;
+    if (channel->label != nullptr && channel->label[0] != '\0' &&
+        channel->bound_source_id != nullptr && channel->bound_source_id[0] != '\0' &&
+        safe_streq(channel->bound_source_id, source.id))
+    {
+        return channel->label;
+    }
+    return source.label;
 }
 
 bool source_is_already_added(WireDeckUiSnapshot* snapshot, const char* source_id) {
@@ -2043,7 +2080,7 @@ std::string input_source_preview(WireDeckUiSnapshot* snapshot, const char* chann
         enabled_count += 1;
         if (enabled_count == 1) {
             if (WireDeckUiSource* source = find_source(snapshot, channel_source.source_id)) {
-                single_label = source->label;
+                single_label = preferred_source_label_for_channel(snapshot, channel_id, *source);
             }
         }
     }
@@ -2080,7 +2117,7 @@ void render_input_sources_popup(WireDeckUiSnapshot* snapshot, const char* channe
             }
             ImGui::SameLine();
             ImGui::BeginGroup();
-            ImGui::TextUnformatted(source.label);
+            ImGui::TextUnformatted(preferred_source_label_for_channel(snapshot, channel_id, source));
             ImGui::TextDisabled("%s", subtitle);
             ImGui::EndGroup();
             ImGui::PopID();
@@ -2316,7 +2353,7 @@ void render_input_card(WireDeckImGuiBridge* bridge, WireDeckUiSnapshot* snapshot
     const float display_meter_left = std::clamp(meter_left, 0.0f, 1.0f);
     const float display_meter_right = std::clamp(meter_right, 0.0f, 1.0f);
     const int fx_count = count_channel_plugins(snapshot, channel.id);
-    const char* title = bound_source != nullptr ? bound_source->label : channel.label;
+    const char* title = channel.label;
     const char* subtitle = bound_source != nullptr ? bound_source->subtitle : channel.subtitle;
     const bool muted = channel.muted != 0 || (bound_source != nullptr && bound_source->muted != 0);
 
@@ -2331,9 +2368,7 @@ void render_input_card(WireDeckImGuiBridge* bridge, WireDeckUiSnapshot* snapshot
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 5.0f));
 
-    WireDeckIconTexture* icon_texture = bound_source != nullptr
-        ? resolve_source_icon_texture(bridge, bound_source)
-        : resolve_channel_icon_texture(bridge, channel);
+    WireDeckIconTexture* icon_texture = resolve_channel_icon_texture(bridge, channel);
     if (icon_texture != nullptr && icon_texture->descriptor_set != VK_NULL_HANDLE) {
         const ImVec4 tint = source_active ? ImVec4(1.0f, 1.0f, 1.0f, 1.0f) : ImVec4(0.58f, 0.58f, 0.60f, 1.0f);
         ImGui::Image(icon_texture->descriptor_set, ImVec2(34.0f, 34.0f), ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f), tint, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
@@ -2344,6 +2379,25 @@ void render_input_card(WireDeckImGuiBridge* bridge, WireDeckUiSnapshot* snapshot
     ImGui::BeginGroup();
     ImGui::TextUnformatted(title);
     render_rename_popup(bridge, "rename_input_popup", snapshot, channel.id, title, true);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Icon")) {
+        const std::string popup_id = std::string("input_icon_popup##") + channel.id;
+        ImGui::OpenPopup(popup_id.c_str());
+    }
+    {
+        const std::string popup_id = std::string("input_icon_popup##") + channel.id;
+        if (ImGui::BeginPopup(popup_id.c_str())) {
+            if (ImGui::MenuItem("Choose PNG")) {
+                queue_input_icon_pick(snapshot, channel.id);
+                ImGui::CloseCurrentPopup();
+            }
+            if (ImGui::MenuItem("Reset Detected Icon")) {
+                queue_input_icon_clear(snapshot, channel.id);
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+    }
     if (subtitle != nullptr && subtitle[0] != '\0') {
         ImGui::TextDisabled("%s", subtitle);
     }

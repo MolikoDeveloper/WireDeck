@@ -97,6 +97,8 @@ pub const StateStore = struct {
             .source_kind = channel.source_kind,
             .icon_name = try self.allocator.dupe(u8, channel.icon_name),
             .icon_path = try self.allocator.dupe(u8, channel.icon_path),
+            .custom_icon_name = try self.allocator.dupe(u8, channel.custom_icon_name),
+            .custom_icon_path = try self.allocator.dupe(u8, channel.custom_icon_path),
             .input_bus_id = if (channel.input_bus_id) |value| try self.allocator.dupe(u8, value) else null,
             .meter_stage = channel.meter_stage,
             .level_left = channel.level_left,
@@ -336,6 +338,8 @@ pub const StateStore = struct {
             if (item.bound_source_id) |value| self.allocator.free(value);
             self.allocator.free(item.icon_name);
             self.allocator.free(item.icon_path);
+            self.allocator.free(item.custom_icon_name);
+            self.allocator.free(item.custom_icon_path);
             if (item.input_bus_id) |value| self.allocator.free(value);
         }
         self.channels.clearRetainingCapacity();

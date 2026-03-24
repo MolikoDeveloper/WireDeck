@@ -151,6 +151,8 @@ pub const UiSnapshot = extern struct {
     request_rename_input_label: [64]u8,
     request_rename_output_id: [64]u8,
     request_rename_output_label: [64]u8,
+    request_pick_input_icon_id: [64]u8,
+    request_clear_input_icon_id: [64]u8,
     request_delete_input_id: [64]u8,
     request_delete_output_id: [64]u8,
     request_add_plugin_channel_id: [64]u8,

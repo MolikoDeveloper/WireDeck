@@ -158,6 +158,8 @@ typedef struct WireDeckUiSnapshot {
     char request_rename_input_label[64];
     char request_rename_output_id[64];
     char request_rename_output_label[64];
+    char request_pick_input_icon_id[64];
+    char request_clear_input_icon_id[64];
     char request_delete_input_id[64];
     char request_delete_output_id[64];
     char request_add_plugin_channel_id[64];
