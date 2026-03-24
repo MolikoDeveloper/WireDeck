@@ -2104,6 +2104,11 @@ fn buildGroupedAppSourceId(
     owner: binder.BoundOwner,
     resolved: icon.ResolveResult,
 ) ![]u8 {
+    if (owner.process_binary) |binary| {
+        if (binary.len > 0) {
+            return std.fmt.allocPrint(allocator, "appgrp-{s}", .{sanitizeId(binary)});
+        }
+    }
     if (resolved.desktop_file_id) |desktop_file_id| {
         return std.fmt.allocPrint(allocator, "appgrp-{s}", .{sanitizeId(desktop_file_id)});
     }
@@ -2112,9 +2117,6 @@ fn buildGroupedAppSourceId(
     }
     if (resolved.icon_name) |icon_name| {
         return std.fmt.allocPrint(allocator, "appgrp-{s}", .{sanitizeId(icon_name)});
-    }
-    if (owner.process_binary) |binary| {
-        return std.fmt.allocPrint(allocator, "appgrp-{s}", .{sanitizeId(binary)});
     }
     if (owner.app_name) |app_name| {
         return std.fmt.allocPrint(allocator, "appgrp-{s}", .{sanitizeId(app_name)});
@@ -2201,11 +2203,11 @@ fn findFxOutputLoopbackModuleIndex(items: []const App.RoutedFxOutputLoopbackModu
 
 fn buildGroupedSourceIdForDiscovered(allocator: std.mem.Allocator, source: sources_mod.Source) ![]u8 {
     if (source.kind != .app) return allocator.dupe(u8, source.id);
-    if (source.icon_name.len > 0 and !std.mem.eql(u8, source.icon_name, "application-x-executable")) {
-        return std.fmt.allocPrint(allocator, "appgrp-{s}", .{sanitizeId(source.icon_name)});
-    }
     if (source.process_binary.len > 0) {
         return std.fmt.allocPrint(allocator, "appgrp-{s}", .{sanitizeId(source.process_binary)});
+    }
+    if (source.icon_name.len > 0 and !std.mem.eql(u8, source.icon_name, "application-x-executable")) {
+        return std.fmt.allocPrint(allocator, "appgrp-{s}", .{sanitizeId(source.icon_name)});
     }
     if (source.label.len > 0) {
         return std.fmt.allocPrint(allocator, "appgrp-{s}", .{sanitizeId(source.label)});
