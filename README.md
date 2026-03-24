@@ -1,9 +1,8 @@
 # WireDeck
 
-<img width="1478" height="690" alt="image" src="https://github.com/user-attachments/assets/0b570eb2-0af8-4512-9660-20d73a772547" />
-
-
 WireDeck is a desktop audio routing tool built on Zig, SDL3, PipeWire, Vulkan, and LV2/Lilv.
+
+<img width="1478" height="690" alt="image" src="https://github.com/user-attachments/assets/0b570eb2-0af8-4512-9660-20d73a772547" />
 
 ## Requirements
 
