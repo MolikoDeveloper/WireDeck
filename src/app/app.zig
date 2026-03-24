@@ -69,6 +69,7 @@ pub const App = struct {
         channel_id: []u8,
         sink_input_index: u32,
         original_sink_index: u32,
+        original_muted: bool,
     };
 
     const RoutedSourceOutput = struct {
@@ -627,14 +628,25 @@ pub const App = struct {
         for (desired.items) |move| {
             const sink_input = findPulseSinkInput(refreshed_pulse_snapshot.sink_inputs, move.sink_input_index) orelse continue;
             const original_sink_index = sink_input.sink_index orelse continue;
-            const keep_routed = try self.moveSinkInputWithRecheck(pulsectx, move.sink_input_index, move.target_sink_index);
-            if (!keep_routed) continue;
             if (!hasRecordedOriginal(self.routed_sink_inputs.items, move.sink_input_index)) {
                 try self.routed_sink_inputs.append(self.allocator, .{
                     .channel_id = try self.allocator.dupe(u8, move.channel_id),
                     .sink_input_index = move.sink_input_index,
                     .original_sink_index = original_sink_index,
+                    .original_muted = sink_input.muted,
                 });
+            }
+
+            if (move.target_sink_index) |target_sink_index| {
+                const keep_routed = try self.moveSinkInputWithRecheck(pulsectx, move.sink_input_index, target_sink_index);
+                if (!keep_routed) continue;
+            }
+
+            if (sink_input.muted != move.muted) {
+                pulsectx.setSinkInputMuteByIndex(move.sink_input_index, move.muted) catch |err| switch (err) {
+                    error.PulseSetSinkInputMuteFailed, error.PulseOperationTimedOut => continue,
+                    else => return err,
+                };
             }
         }
 
@@ -658,6 +670,7 @@ pub const App = struct {
                 continue;
             }
             pulsectx.moveSinkInputToSink(routed.sink_input_index, routed.original_sink_index) catch {};
+            pulsectx.setSinkInputMuteByIndex(routed.sink_input_index, routed.original_muted) catch {};
             self.allocator.free(routed.channel_id);
             _ = self.routed_sink_inputs.orderedRemove(index);
         }
@@ -704,6 +717,7 @@ pub const App = struct {
 
         for (self.routed_sink_inputs.items) |routed| {
             pulsectx.moveSinkInputToSink(routed.sink_input_index, routed.original_sink_index) catch {};
+            pulsectx.setSinkInputMuteByIndex(routed.sink_input_index, routed.original_muted) catch {};
             self.allocator.free(routed.channel_id);
         }
         self.routed_sink_inputs.clearRetainingCapacity();
@@ -818,19 +832,30 @@ pub const App = struct {
             const bound_source_id = channel.bound_source_id orelse continue;
             const source = findStateSource(state_store.sources.items, bound_source_id) orelse continue;
             if (source.kind != .app) continue;
-            const target_sink = try resolveCaptureSinkForChannel(self, state_store, channel.id, pulse_snapshot, pulsectx, containsChannel(fx_channels, channel.id)) orelse continue;
             for (owners) |owner| {
                 if (!try ownerMatchesGroupedSourceId(self.allocator, owner, bound_source_id)) continue;
                 for (owner.pulse_sink_input_indexes) |sink_input_index| {
                     const sink_input = findPulseSinkInput(pulse_snapshot.sink_inputs, sink_input_index) orelse continue;
-                    const current_sink_index = sink_input.sink_index orelse continue;
-                    if (current_sink_index == target_sink.sink_index) continue;
                     if (!containsDesiredMove(out.items, sink_input_index)) {
-                        try out.append(self.allocator, .{
-                            .channel_id = channel.id,
-                            .sink_input_index = sink_input_index,
-                            .target_sink_index = target_sink.sink_index,
-                        });
+                        const target_sink = try resolveCaptureSinkForChannel(self, state_store, channel.id, pulse_snapshot, pulsectx, containsChannel(fx_channels, channel.id));
+                        if (target_sink) |target| {
+                            const current_sink_index = sink_input.sink_index orelse continue;
+                            if (current_sink_index == target.sink_index and !sink_input.muted) continue;
+                            try out.append(self.allocator, .{
+                                .channel_id = channel.id,
+                                .sink_input_index = sink_input_index,
+                                .target_sink_index = target.sink_index,
+                                .muted = false,
+                            });
+                        } else {
+                            if (sink_input.muted) continue;
+                            try out.append(self.allocator, .{
+                                .channel_id = channel.id,
+                                .sink_input_index = sink_input_index,
+                                .target_sink_index = null,
+                                .muted = true,
+                            });
+                        }
                     }
                 }
             }
@@ -844,6 +869,9 @@ pub const App = struct {
         pulse_snapshot: pulse.PulseSnapshot,
         pulsectx: *pulse.PulseContext,
     ) !?ChannelTargetSink {
+        const channel = findStateChannel(state_store, channel_id) orelse return null;
+        if (channel.muted) return null;
+
         var sinks = std.ArrayList(ChannelTargetSink).empty;
         defer sinks.deinit(self.allocator);
 
@@ -2080,7 +2108,8 @@ const GroupedAppSource = struct {
 const DesiredSinkMove = struct {
     channel_id: []const u8,
     sink_input_index: u32,
-    target_sink_index: u32,
+    target_sink_index: ?u32,
+    muted: bool,
 };
 
 fn buildSourceId(allocator: std.mem.Allocator, owner: binder.BoundOwner) ![]u8 {

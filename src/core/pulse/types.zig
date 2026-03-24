@@ -50,6 +50,7 @@ pub const PulseSinkInput = struct {
     index: u32,
     client_index: ?u32 = null,
     sink_index: ?u32 = null,
+    muted: bool = false,
     app_name: ?[]const u8 = null,
     process_id: ?u32 = null,
     process_binary: ?[]const u8 = null,

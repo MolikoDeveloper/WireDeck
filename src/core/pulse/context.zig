@@ -156,6 +156,21 @@ pub const PulseContext = struct {
         if (self.failed or !request.success) return error.PulseMoveSinkInputFailed;
     }
 
+    pub fn setSinkInputMuteByIndex(self: *PulseContext, sink_input_index: u32, muted: bool) !void {
+        var request = OperationRequest{};
+        const start_ns = std.time.nanoTimestamp();
+        const op = c.pa_context_set_sink_input_mute(self.context, sink_input_index, @intFromBool(muted), successCb, &request);
+        if (op == null) return error.PulseSetSinkInputMuteFailed;
+        defer c.pa_operation_unref(op);
+
+        while (!request.done and !self.failed) {
+            if (deadlineReached(start_ns, operation_timeout_ns)) return error.PulseOperationTimedOut;
+            try self.iterateOnce();
+            std.Thread.sleep(poll_interval_ns);
+        }
+        if (self.failed or !request.success) return error.PulseSetSinkInputMuteFailed;
+    }
+
     pub fn moveSourceOutputToSource(self: *PulseContext, source_output_index: u32, source_index: u32) !void {
         var request = OperationRequest{};
         const start_ns = std.time.nanoTimestamp();
@@ -581,6 +596,7 @@ fn sinkInputInfoCb(
         .index = i.index,
         .client_index = if (i.client != c.PA_INVALID_INDEX) i.client else null,
         .sink_index = if (i.sink != c.PA_INVALID_INDEX) i.sink else null,
+        .muted = i.mute != 0,
         .app_name = dupProp(self.allocator, i.proplist, c.PA_PROP_APPLICATION_NAME),
         .process_id = parseU32Maybe(getProp(i.proplist, c.PA_PROP_APPLICATION_PROCESS_ID)),
         .process_binary = dupProp(self.allocator, i.proplist, c.PA_PROP_APPLICATION_PROCESS_BINARY),
