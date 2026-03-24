@@ -3128,11 +3128,45 @@ namespace
             text_col,
             label);
 
+        ImGui::SetNextWindowSizeConstraints(ImVec2(300.0f, 0.0f), ImVec2(420.0f, 420.0f));
         if (ImGui::BeginPopup("add_source_popup"))
         {
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 12.0f));
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 8.0f));
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 6.0f));
+
+            ImDrawList *popup_draw_list = ImGui::GetWindowDrawList();
+            const ImVec2 popup_pos = ImGui::GetWindowPos();
+            const ImVec2 popup_size = ImGui::GetWindowSize();
+            popup_draw_list->AddRectFilled(
+                popup_pos,
+                ImVec2(popup_pos.x + popup_size.x, popup_pos.y + popup_size.y),
+                ImGui::GetColorU32(ImVec4(0.08f, 0.09f, 0.14f, 0.98f)),
+                14.0f);
+            popup_draw_list->AddRect(
+                popup_pos,
+                ImVec2(popup_pos.x + popup_size.x, popup_pos.y + popup_size.y),
+                ImGui::GetColorU32(ImVec4(0.60f, 0.66f, 0.86f, 0.10f)),
+                14.0f);
+
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.93f, 0.94f, 0.98f, 0.98f));
             ImGui::TextUnformatted("Add source");
-            ImGui::TextDisabled("Choose which detected device or app should appear in Sources.");
-            ImGui::Separator();
+            ImGui::PopStyleColor();
+
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.66f, 0.68f, 0.77f, 0.72f));
+            ImGui::TextWrapped("Choose which detected device or app should appear in Sources.");
+            ImGui::PopStyleColor();
+
+            {
+                const float y = ImGui::GetCursorScreenPos().y + 4.0f;
+                popup_draw_list->AddLine(
+                    ImVec2(popup_pos.x + 12.0f, y),
+                    ImVec2(popup_pos.x + popup_size.x - 12.0f, y),
+                    ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.06f)),
+                    1.0f);
+            }
+
+            ImGui::Dummy(ImVec2(0.0f, 10.0f));
             bool drew_selectable = false;
             for (int i = 0; i < snapshot->source_count; ++i)
             {
@@ -3142,19 +3176,76 @@ namespace
                     continue;
                 }
                 drew_selectable = true;
+
+                const float item_h = 42.0f;
+                const float item_w = ImGui::GetContentRegionAvail().x;
+                const ImVec2 item_pos = ImGui::GetCursorScreenPos();
+                const ImVec2 item_min(item_pos.x, item_pos.y);
+                const ImVec2 item_max(item_pos.x + item_w, item_pos.y + item_h);
+
+                ImGui::SetCursorScreenPos(item_pos);
                 ImGui::PushID(source.id);
-                if (ImGui::Selectable(source.label, false))
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 1.0f, 1.0f, 0.03f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 1.0f, 1.0f, 0.05f));
+                const bool clicked = ImGui::Button("##source_item", ImVec2(item_w, item_h));
+                const bool hovered_item = ImGui::IsItemHovered();
+                ImGui::PopStyleColor(3);
+                ImGui::PopStyleVar();
+
+                const char *item_label = (source.label != nullptr && source.label[0] != '\0') ? source.label : source.id;
+                const char *item_subtitle = (source.subtitle != nullptr && source.subtitle[0] != '\0') ? source.subtitle : "Other";
+                popup_draw_list->AddText(
+                    ImVec2(item_min.x + 12.0f, item_min.y + 8.0f),
+                    ImGui::GetColorU32(hovered_item ? ImVec4(0.97f, 0.98f, 1.0f, 1.0f) : ImVec4(0.93f, 0.94f, 0.98f, 0.96f)),
+                    item_label);
+                popup_draw_list->AddText(
+                    ImVec2(item_min.x + 12.0f, item_min.y + 24.0f),
+                    ImGui::GetColorU32(hovered_item ? ImVec4(0.76f, 0.78f, 0.86f, 0.82f) : ImVec4(0.66f, 0.68f, 0.77f, 0.72f)),
+                    item_subtitle);
+                popup_draw_list->AddText(
+                    ImVec2(item_max.x - 16.0f, item_min.y + 12.0f),
+                    ImGui::GetColorU32(hovered_item ? ImVec4(0.90f, 0.92f, 0.98f, 0.92f) : ImVec4(0.78f, 0.80f, 0.88f, 0.78f)),
+                    ">");
+
+                if (i < snapshot->source_count - 1)
+                {
+                    popup_draw_list->AddLine(
+                        ImVec2(item_min.x, item_max.y),
+                        ImVec2(item_max.x, item_max.y),
+                        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.08f)),
+                        1.0f);
+                }
+
+                ImGui::SetCursorScreenPos(ImVec2(item_pos.x, item_pos.y + item_h));
+                if (clicked)
                 {
                     queue_select_source(snapshot, source.id);
                     ImGui::CloseCurrentPopup();
                 }
-                ImGui::TextDisabled("%s", source.subtitle);
                 ImGui::PopID();
             }
             if (!drew_selectable)
             {
-                ImGui::TextDisabled("All detected sources are already visible.");
+                const float empty_h = 44.0f;
+                const float item_w = ImGui::GetContentRegionAvail().x;
+                const ImVec2 item_pos = ImGui::GetCursorScreenPos();
+                const ImVec2 item_min(item_pos.x, item_pos.y);
+                const ImVec2 item_max(item_pos.x + item_w, item_pos.y + empty_h);
+
+                popup_draw_list->AddRectFilled(
+                    item_min,
+                    item_max,
+                    ImGui::GetColorU32(ImVec4(0.12f, 0.13f, 0.19f, 0.92f)),
+                    10.0f);
+                popup_draw_list->AddText(
+                    ImVec2(item_min.x + 12.0f, item_min.y + 13.0f),
+                    ImGui::GetColorU32(ImVec4(0.66f, 0.68f, 0.77f, 0.72f)),
+                    "All detected sources are already visible.");
+                ImGui::Dummy(ImVec2(item_w, empty_h));
             }
+            ImGui::PopStyleVar(3);
             ImGui::EndPopup();
         }
         ImGui::PopStyleVar();
@@ -3274,8 +3365,6 @@ namespace
         const std::string preview = output_destination_preview(snapshot, bus.id);
         ImGui::SetCursorPos(ImVec2(combo_x + 10.0f, combo_y + 3.0f));
         ImGui::TextUnformatted(preview.c_str());
-        draw_list->AddText(ImVec2(combo_max.x - 16.0f, combo_min.y + 4.0f), ImGui::GetColorU32(ImVec4(0.96f, 0.97f, 0.99f, 0.92f)), "\xE2\x96\xBE");
-
         ImGui::SetCursorPos(ImVec2(combo_x, combo_y));
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
@@ -3286,31 +3375,143 @@ namespace
         }
         ImGui::PopStyleColor(3);
 
+        ImGui::SetNextWindowSizeConstraints(ImVec2(300.0f, 0.0f), ImVec2(420.0f, 420.0f));
         if (ImGui::BeginPopup("destinations_popup"))
         {
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 12.0f));
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 8.0f));
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 6.0f));
+
+            ImDrawList *popup_draw_list = ImGui::GetWindowDrawList();
+            const ImVec2 popup_pos = ImGui::GetWindowPos();
+            const ImVec2 popup_size = ImGui::GetWindowSize();
+
+            popup_draw_list->AddRectFilled(
+                popup_pos,
+                ImVec2(popup_pos.x + popup_size.x, popup_pos.y + popup_size.y),
+                ImGui::GetColorU32(ImVec4(0.08f, 0.09f, 0.14f, 0.98f)),
+                14.0f);
+            popup_draw_list->AddRect(
+                popup_pos,
+                ImVec2(popup_pos.x + popup_size.x, popup_pos.y + popup_size.y),
+                ImGui::GetColorU32(ImVec4(0.60f, 0.66f, 0.86f, 0.10f)),
+                14.0f);
+
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.93f, 0.94f, 0.98f, 0.98f));
+            ImGui::TextUnformatted("Physical destination");
+            ImGui::PopStyleColor();
+
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.66f, 0.68f, 0.77f, 0.72f));
+            ImGui::TextWrapped("Choose where this output should be heard.");
+            ImGui::PopStyleColor();
+
+            {
+                const float y = ImGui::GetCursorScreenPos().y + 4.0f;
+                popup_draw_list->AddLine(
+                    ImVec2(popup_pos.x + 12.0f, y),
+                    ImVec2(popup_pos.x + popup_size.x - 12.0f, y),
+                    ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.06f)),
+                    1.0f);
+            }
+
+            ImGui::Dummy(ImVec2(0.0f, 10.0f));
+
             std::string current_group;
+            bool drew_any = false;
             for (int i = 0; i < snapshot->destination_count; ++i)
             {
                 WireDeckUiDestination &destination = snapshot->destinations[i];
                 WireDeckUiBusDestination *bus_destination = find_bus_destination(snapshot, bus.id, destination.id);
                 if (bus_destination == nullptr)
                     continue;
-                const char *subtitle = (destination.subtitle != nullptr and destination.subtitle[0] != 0) ? destination.subtitle : "Other";
+                drew_any = true;
+
+                const char *subtitle = (destination.subtitle != nullptr && destination.subtitle[0] != 0) ? destination.subtitle : "Other";
                 if (current_group != subtitle)
                 {
                     if (!current_group.empty())
-                        ImGui::Spacing();
+                    {
+                        ImGui::Dummy(ImVec2(0.0f, 6.0f));
+                    }
                     current_group = subtitle;
-                    ImGui::TextDisabled("%s", subtitle);
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.66f, 0.68f, 0.77f, 0.72f));
+                    ImGui::TextUnformatted(subtitle);
+                    ImGui::PopStyleColor();
                 }
-                bool enabled = bus_destination->enabled != 0;
+
+                const float item_h = 42.0f;
+                const float item_w = ImGui::GetContentRegionAvail().x;
+                const ImVec2 item_pos = ImGui::GetCursorScreenPos();
+                const ImVec2 item_min(item_pos.x, item_pos.y);
+                const ImVec2 item_max(item_pos.x + item_w, item_pos.y + item_h);
+
+                ImGui::SetCursorScreenPos(item_pos);
                 ImGui::PushID(destination.id);
-                if (ImGui::Selectable(destination.label, enabled, ImGuiSelectableFlags_DontClosePopups))
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 1.0f, 1.0f, 0.03f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 1.0f, 1.0f, 0.05f));
+                const bool clicked = ImGui::Button("##destination_item", ImVec2(item_w, item_h));
+                const bool hovered_item = ImGui::IsItemHovered();
+                ImGui::PopStyleColor(3);
+                ImGui::PopStyleVar();
+
+                const bool enabled = bus_destination->enabled != 0;
+                if (enabled)
+                {
+                    popup_draw_list->AddRectFilled(
+                        ImVec2(item_min.x + 6.0f, item_min.y + 8.0f),
+                        ImVec2(item_min.x + 10.0f, item_max.y - 8.0f),
+                        ImGui::GetColorU32(ImVec4(0.36f, 0.86f, 0.42f, 1.0f)),
+                        999.0f);
+                }
+
+                const char *item_label = (destination.label != nullptr && destination.label[0] != '\0') ? destination.label : destination.id;
+                popup_draw_list->AddText(
+                    ImVec2(item_min.x + 18.0f, item_min.y + 8.0f),
+                    ImGui::GetColorU32(hovered_item ? ImVec4(0.97f, 0.98f, 1.0f, 1.0f) : ImVec4(0.93f, 0.94f, 0.98f, 0.96f)),
+                    item_label);
+                popup_draw_list->AddText(
+                    ImVec2(item_min.x + 18.0f, item_min.y + 24.0f),
+                    ImGui::GetColorU32(hovered_item ? ImVec4(0.76f, 0.78f, 0.86f, 0.82f) : ImVec4(0.66f, 0.68f, 0.77f, 0.72f)),
+                    enabled ? "Enabled" : "Disabled");
+                if (i < snapshot->destination_count - 1)
+                {
+                    popup_draw_list->AddLine(
+                        ImVec2(item_min.x, item_max.y),
+                        ImVec2(item_max.x, item_max.y),
+                        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.08f)),
+                        1.0f);
+                }
+
+                ImGui::SetCursorScreenPos(ImVec2(item_pos.x, item_pos.y + item_h));
+                if (clicked)
                 {
                     bus_destination->enabled = enabled ? 0 : 1;
                 }
                 ImGui::PopID();
             }
+
+            if (!drew_any)
+            {
+                const float empty_h = 44.0f;
+                const float item_w = ImGui::GetContentRegionAvail().x;
+                const ImVec2 item_pos = ImGui::GetCursorScreenPos();
+                const ImVec2 item_min(item_pos.x, item_pos.y);
+                const ImVec2 item_max(item_pos.x + item_w, item_pos.y + empty_h);
+                popup_draw_list->AddRectFilled(
+                    item_min,
+                    item_max,
+                    ImGui::GetColorU32(ImVec4(0.12f, 0.13f, 0.19f, 0.92f)),
+                    10.0f);
+                popup_draw_list->AddText(
+                    ImVec2(item_min.x + 12.0f, item_min.y + 13.0f),
+                    ImGui::GetColorU32(ImVec4(0.66f, 0.68f, 0.77f, 0.72f)),
+                    "No destinations available.");
+                ImGui::Dummy(ImVec2(item_w, empty_h));
+            }
+
+            ImGui::PopStyleVar(3);
             ImGui::EndPopup();
         }
 
@@ -3530,17 +3731,37 @@ namespace
             ImGui::PopStyleColor();
             // ImGui::TextDisabled("Shape each bus first, then patch it to your playback targets.");
             // ImGui::Dummy(ImVec2(0.0f, 10.0f));
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
             ImGui::BeginChild("mixer_column", ImVec2(0.0f, full_height - 10.0f), ImGuiChildFlags_None, ImGuiWindowFlags_None);
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.10f, 0.12f, 0.15f, 0.96f));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 12.0f));
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
             ImGui::BeginChild("routing_matrix_placeholder", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders, ImGuiWindowFlags_None);
+            {
+                ImDrawList *matrix_draw_list = ImGui::GetWindowDrawList();
+                const ImVec2 matrix_pos = ImGui::GetWindowPos();
+                const ImVec2 matrix_size = ImGui::GetWindowSize();
+                matrix_draw_list->AddRectFilled(
+                    matrix_pos,
+                    ImVec2(matrix_pos.x + matrix_size.x, matrix_pos.y + matrix_size.y),
+                    ImGui::GetColorU32(ImVec4(0.08f, 0.09f, 0.14f, 0.96f)),
+                    18.0f);
+                matrix_draw_list->AddRect(
+                    matrix_pos,
+                    ImVec2(matrix_pos.x + matrix_size.x, matrix_pos.y + matrix_size.y),
+                    ImGui::GetColorU32(ImVec4(0.60f, 0.66f, 0.86f, 0.10f)),
+                    18.0f,
+                    0,
+                    1.0f);
+            }
             ImGui::TextDisabled("Routing matrix");
             ImGui::Dummy(ImVec2(0.0f, 6.0f));
-            if (ImGui::BeginTable("routing_matrix", snapshot->bus_count + 1, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchSame))
+            ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(12.0f, 6.0f));
+            if (ImGui::BeginTable("routing_matrix", snapshot->bus_count + 1, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
             {
-                ImGui::TableSetupColumn("Source");
+                ImGui::TableSetupColumn("Source", ImGuiTableColumnFlags_WidthStretch, 1.2f);
                 for (int i = 0; i < snapshot->bus_count; ++i)
                 {
-                    ImGui::TableSetupColumn(snapshot->buses[i].label);
+                    ImGui::TableSetupColumn(snapshot->buses[i].label, ImGuiTableColumnFlags_WidthStretch, 1.0f);
                 }
                 ImGui::TableHeadersRow();
                 for (int channel_index = 0; channel_index < snapshot->channel_count; ++channel_index)
@@ -3575,9 +3796,12 @@ namespace
                 }
                 ImGui::EndTable();
             }
+            ImGui::PopStyleVar();
             ImGui::EndChild();
             ImGui::PopStyleColor();
+            ImGui::PopStyleVar();
             ImGui::EndChild();
+            ImGui::PopStyleColor();
 
             ImGui::TableNextColumn();
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.97f, 0.82f, 0.32f, 1.0f));
