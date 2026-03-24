@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cctype>
 #include <cstdlib>
 #include <cstdio>
 #include <cstdint>
@@ -97,6 +98,7 @@ struct WireDeckImGuiBridge
     int frame_index = 0;
     std::array<float, 180> activity_history{};
     std::array<char, 64> rename_buffer{};
+    std::array<char, 256> fx_plugin_filter{};
     bool focus_rename_input = false;
     bool tray_autostart_enabled = false;
     bool pending_autostart_change = false;
@@ -109,10 +111,14 @@ struct WireDeckImGuiBridge
     WireDeckIconTexture world_icon{};
     WireDeckIconTexture world_off_icon{};
     WireDeckIconTexture trash_icon{};
+    WireDeckIconTexture toggle_left_icon{};
+    WireDeckIconTexture toggle_right_icon{};
+    WireDeckIconTexture config_icon{};
     WireDeckIconTexture headset_icon{};
     WireDeckIconTexture generic_app_icon{};
     std::vector<WireDeckCachedIcon> source_icons{};
     std::unordered_map<std::string, WireDeckMeterVisualState> source_meter_states{};
+    std::unordered_map<std::string, bool> fx_group_open{};
 };
 
 namespace
@@ -937,6 +943,9 @@ namespace
         const auto world_path = find_wiredeck_asset_path("assets/icons/world.png");
         const auto world_off_path = find_wiredeck_asset_path("assets/icons/world-off.png");
         const auto trash_path = find_wiredeck_asset_path("assets/icons/trash.png");
+        const auto toggle_left_path = find_wiredeck_asset_path("assets/icons/toggle-left.png");
+        const auto toggle_right_path = find_wiredeck_asset_path("assets/icons/toggle-right.png");
+        const auto config_path = find_wiredeck_asset_path("assets/icons/config.png");
         const auto headset_path = find_wiredeck_asset_path("assets/icons/headset.png");
         const auto generic_app_path = find_wiredeck_asset_path("assets/icons/generic-app.png");
 
@@ -948,9 +957,14 @@ namespace
         const bool loaded_world = !world_path.empty() && load_icon_texture(bridge, world_path.c_str(), &bridge->world_icon);
         const bool loaded_world_off = !world_off_path.empty() && load_icon_texture(bridge, world_off_path.c_str(), &bridge->world_off_icon);
         const bool loaded_trash = !trash_path.empty() && load_icon_texture(bridge, trash_path.c_str(), &bridge->trash_icon);
+        const bool loaded_toggle_left = !toggle_left_path.empty() && load_icon_texture(bridge, toggle_left_path.c_str(), &bridge->toggle_left_icon);
+        const bool loaded_toggle_right = !toggle_right_path.empty() && load_icon_texture(bridge, toggle_right_path.c_str(), &bridge->toggle_right_icon);
+        const bool loaded_config = !config_path.empty() && load_icon_texture(bridge, config_path.c_str(), &bridge->config_icon);
         const bool loaded_headset = !headset_path.empty() && load_icon_texture(bridge, headset_path.c_str(), &bridge->headset_icon);
         const bool loaded_generic_app = !generic_app_path.empty() && load_icon_texture(bridge, generic_app_path.c_str(), &bridge->generic_app_icon);
-        return loaded_volume && loaded_volume_off && loaded_fx && loaded_mic && loaded_mic_off && loaded_world && loaded_world_off && loaded_trash && loaded_headset && loaded_generic_app;
+        return loaded_volume && loaded_volume_off && loaded_fx && loaded_mic && loaded_mic_off &&
+               loaded_world && loaded_world_off && loaded_trash && loaded_toggle_left &&
+               loaded_toggle_right && loaded_config && loaded_headset && loaded_generic_app;
     }
 
     WireDeckIconTexture *find_cached_source_icon(WireDeckImGuiBridge *bridge, const std::string &cache_key)
@@ -1260,6 +1274,9 @@ namespace
             destroy_icon_texture(bridge, &bridge->world_icon);
             destroy_icon_texture(bridge, &bridge->world_off_icon);
             destroy_icon_texture(bridge, &bridge->trash_icon);
+            destroy_icon_texture(bridge, &bridge->toggle_left_icon);
+            destroy_icon_texture(bridge, &bridge->toggle_right_icon);
+            destroy_icon_texture(bridge, &bridge->config_icon);
             destroy_icon_texture(bridge, &bridge->headset_icon);
             destroy_icon_texture(bridge, &bridge->generic_app_icon);
             for (auto &icon : bridge->source_icons)
@@ -1680,6 +1697,40 @@ namespace
                                   : hovered ? ImVec4(0.96f, 0.96f, 0.98f, 1.0f)
                                             : ImVec4(0.82f, 0.84f, 0.88f, 1.0f);
         const WireDeckIconTexture &texture = enabled ? active_texture : inactive_texture;
+        if (texture.descriptor_set != VK_NULL_HANDLE)
+        {
+            const float draw_w = std::min(icon_extent, size.x);
+            const float draw_h = std::min(icon_extent, size.y);
+            const float x0 = min.x + (size.x - draw_w) * 0.5f;
+            const float y0 = min.y + (size.y - draw_h) * 0.5f;
+            draw_list->AddImage(
+                texture.descriptor_set,
+                ImVec2(x0, y0),
+                ImVec2(x0 + draw_w, y0 + draw_h),
+                ImVec2(0.0f, 0.0f),
+                ImVec2(1.0f, 1.0f),
+                ImGui::GetColorU32(icon_color));
+        }
+        return pressed;
+    }
+
+    bool render_fixed_icon_button(
+        const WireDeckIconTexture &texture,
+        const char *id,
+        const ImVec2 &size,
+        float icon_extent,
+        const ImVec4 &base_color)
+    {
+        const bool pressed = ImGui::InvisibleButton(id, size);
+        const ImVec2 min = ImGui::GetItemRectMin();
+        const ImVec2 max = ImGui::GetItemRectMax();
+        const bool hovered = ImGui::IsItemHovered();
+        const bool active = ImGui::IsItemActive();
+        ImDrawList *draw_list = ImGui::GetWindowDrawList();
+
+        const ImVec4 icon_color = active ? ImVec4(std::min(base_color.x + 0.08f, 1.0f), std::min(base_color.y + 0.08f, 1.0f), std::min(base_color.z + 0.08f, 1.0f), base_color.w)
+                                  : hovered ? ImVec4(std::min(base_color.x + 0.04f, 1.0f), std::min(base_color.y + 0.04f, 1.0f), std::min(base_color.z + 0.04f, 1.0f), base_color.w)
+                                            : base_color;
         if (texture.descriptor_set != VK_NULL_HANDLE)
         {
             const float draw_w = std::min(icon_extent, size.x);
@@ -2189,6 +2240,29 @@ namespace
         }
     }
 
+    std::string lower_copy(const char *text)
+    {
+        if (text == nullptr)
+        {
+            return {};
+        }
+        std::string result(text);
+        std::transform(result.begin(), result.end(), result.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return result;
+    }
+
+    bool plugin_matches_filter(const WireDeckUiPluginDescriptor &descriptor, const std::string &filter)
+    {
+        if (filter.empty())
+        {
+            return true;
+        }
+        return lower_copy(descriptor.label).find(filter) != std::string::npos ||
+               lower_copy(descriptor.bundle_name).find(filter) != std::string::npos;
+    }
+
     bool render_plugin_descriptor_button(WireDeckUiSnapshot *snapshot, const char *channel_id, const WireDeckUiPluginDescriptor &descriptor)
     {
         ImGui::PushID(descriptor.id);
@@ -2290,22 +2364,61 @@ namespace
         }
     }
 
-    void render_input_fx_popup(WireDeckUiSnapshot *snapshot, const char *channel_id)
+    void render_input_fx_popup(WireDeckImGuiBridge *bridge, WireDeckUiSnapshot *snapshot, const char *channel_id)
     {
         const std::string popup_id = std::string("input_fx_popup##") + channel_id;
-        ImGui::SetNextWindowSizeConstraints(ImVec2(320.0f, 0.0f), ImVec2(420.0f, 560.0f));
+        ImGui::SetNextWindowSize(ImVec2(420.0f, 520.0f), ImGuiCond_FirstUseEver);
         if (!ImGui::BeginPopup(popup_id.c_str()))
         {
             return;
         }
 
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 12.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 8.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 6.0f));
+
+        ImDrawList *draw_list = ImGui::GetWindowDrawList();
+        const ImVec2 win_pos = ImGui::GetWindowPos();
+        const ImVec2 win_size = ImGui::GetWindowSize();
+        draw_list->AddRectFilled(
+            win_pos,
+            ImVec2(win_pos.x + win_size.x, win_pos.y + win_size.y),
+            ImGui::GetColorU32(ImVec4(0.08f, 0.09f, 0.14f, 0.98f)),
+            14.0f);
+        draw_list->AddRect(
+            win_pos,
+            ImVec2(win_pos.x + win_size.x, win_pos.y + win_size.y),
+            ImGui::GetColorU32(ImVec4(0.60f, 0.66f, 0.86f, 0.10f)),
+            14.0f,
+            0,
+            1.0f);
+
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.93f, 0.94f, 0.98f, 0.98f));
         ImGui::TextUnformatted("Input FX");
-        ImGui::TextDisabled("Chain for this input group.");
-        ImGui::Separator();
+        ImGui::PopStyleColor();
+
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.66f, 0.68f, 0.77f, 0.72f));
+        ImGui::TextWrapped("Chain for this input group.");
+        ImGui::PopStyleColor();
+
+        {
+            const float y = ImGui::GetCursorScreenPos().y + 4.0f;
+            draw_list->AddLine(
+                ImVec2(win_pos.x + 12.0f, y),
+                ImVec2(win_pos.x + win_size.x - 12.0f, y),
+                ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.06f)),
+                1.0f);
+        }
+
+        ImGui::Dummy(ImVec2(0.0f, 8.0f));
+
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.93f, 0.94f, 0.98f, 0.98f));
+        ImGui::TextUnformatted("Active plugins");
+        ImGui::PopStyleColor();
+
+        ImGui::Dummy(ImVec2(0.0f, 2.0f));
 
         bool has_plugins = false;
-        int channel_plugin_rank = 0;
-        const int channel_plugin_total = count_channel_plugins(snapshot, channel_id);
         for (int i = 0; i < snapshot->channel_plugin_count; ++i)
         {
             WireDeckUiChannelPlugin &channel_plugin = snapshot->channel_plugins[i];
@@ -2316,104 +2429,322 @@ namespace
 
             has_plugins = true;
             ImGui::PushID(channel_plugin.id);
-            bool enabled = channel_plugin.enabled != 0;
-            if (ImGui::Checkbox("##enabled", &enabled))
-            {
-                channel_plugin.enabled = enabled ? 1 : 0;
-            }
-            ImGui::SameLine();
-            const bool can_move_up = channel_plugin_rank > 0;
-            const bool can_move_down = channel_plugin_rank + 1 < channel_plugin_total;
-            if (!can_move_up)
-                ImGui::BeginDisabled();
-            if (ImGui::ArrowButton("##move_up", ImGuiDir_Up))
-            {
-                queue_move_plugin(snapshot, channel_plugin.id, -1);
-            }
-            if (!can_move_up)
-                ImGui::EndDisabled();
-            ImGui::SameLine();
-            if (!can_move_down)
-                ImGui::BeginDisabled();
-            if (ImGui::ArrowButton("##move_down", ImGuiDir_Down))
-            {
-                queue_move_plugin(snapshot, channel_plugin.id, 1);
-            }
-            if (!can_move_down)
-                ImGui::EndDisabled();
-            ImGui::SameLine();
-            ImGui::BeginGroup();
-            ImGui::TextUnformatted(channel_plugin.label);
-            ImGui::TextDisabled("%s", plugin_backend_label(channel_plugin.backend));
-            ImGui::EndGroup();
-            ImGui::SameLine();
             const WireDeckUiPluginDescriptor *descriptor = find_plugin_descriptor(snapshot, channel_plugin.descriptor_id);
             const bool has_custom_ui = descriptor != nullptr && descriptor->has_custom_ui != 0;
-            const float trailing_width = has_custom_ui ? 58.0f : 28.0f;
-            const float button_x = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - trailing_width;
-            if (button_x > ImGui::GetCursorPosX())
+            const bool enabled = channel_plugin.enabled != 0;
+            const float row_h = 46.0f;
+            const float row_w = ImGui::GetContentRegionAvail().x;
+            const ImVec2 row_pos = ImGui::GetCursorScreenPos();
+            const ImVec2 row_min(row_pos.x, row_pos.y);
+            const ImVec2 row_max(row_pos.x + row_w, row_pos.y + row_h);
+
+            draw_list->AddRectFilled(
+                row_min,
+                row_max,
+                ImGui::GetColorU32(ImVec4(0.12f, 0.14f, 0.20f, 0.94f)),
+                10.0f);
+            draw_list->AddRect(
+                row_min,
+                row_max,
+                ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.05f)),
+                10.0f,
+                0,
+                1.0f);
+
+            draw_list->AddText(
+                ImVec2(row_min.x + 12.0f, row_min.y + 8.0f),
+                ImGui::GetColorU32(ImVec4(0.93f, 0.94f, 0.98f, 0.96f)),
+                channel_plugin.label);
+            draw_list->AddText(
+                ImVec2(row_min.x + 12.0f, row_min.y + 25.0f),
+                ImGui::GetColorU32(ImVec4(0.66f, 0.68f, 0.77f, 0.72f)),
+                plugin_backend_label(channel_plugin.backend));
+
+            const float btn_y = row_min.y + 8.0f;
+            const float btn_h = 28.0f;
+            const float btn_w = 28.0f;
+            const float remove_w = 28.0f;
+            const float remove_x = row_max.x - 10.0f - remove_w;
+            const float ui_x = remove_x - btn_w;
+            const float bypass_x = ui_x - btn_w;
+            const ImU32 flat_button_col = ImGui::GetColorU32(ImVec4(0.18f, 0.20f, 0.29f, 0.96f));
+
+            draw_list->AddRectFilled(
+                ImVec2(bypass_x, btn_y),
+                ImVec2(remove_x + remove_w, btn_y + btn_h),
+                flat_button_col,
+                8.0f);
+            draw_list->AddLine(
+                ImVec2(ui_x, btn_y + 4.0f),
+                ImVec2(ui_x, btn_y + btn_h - 4.0f),
+                ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.10f)),
+                1.0f);
+            draw_list->AddLine(
+                ImVec2(remove_x, btn_y + 4.0f),
+                ImVec2(remove_x, btn_y + btn_h - 4.0f),
+                ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.10f)),
+                1.0f);
+            ImGui::SetCursorScreenPos(ImVec2(bypass_x, btn_y));
+            const bool toggle_clicked = render_fixed_icon_button(
+                enabled ? bridge->toggle_right_icon : bridge->toggle_left_icon,
+                "##toggle",
+                ImVec2(btn_w, btn_h),
+                13.0f,
+                enabled ? ImVec4(0.88f, 0.80f, 0.18f, 1.0f) : ImVec4(0.92f, 0.45f, 0.72f, 1.0f));
+            if (toggle_clicked)
             {
-                ImGui::SetCursorPosX(button_x);
+                channel_plugin.enabled = enabled ? 0 : 1;
             }
-            if (has_custom_ui)
+            ImGui::SetCursorScreenPos(ImVec2(ui_x, btn_y));
+            const bool ui_clicked = render_fixed_icon_button(
+                bridge->config_icon,
+                "##ui",
+                ImVec2(btn_w, btn_h),
+                13.0f,
+                has_custom_ui ? ImVec4(0.95f, 0.96f, 0.98f, 0.95f) : ImVec4(0.56f, 0.60f, 0.68f, 0.78f));
+            const bool ui_hovered = ImGui::IsItemHovered();
+            if (ui_clicked && has_custom_ui)
             {
-                if (ImGui::SmallButton("UI"))
-                {
-                    queue_open_plugin_ui(snapshot, channel_plugin.id);
-                }
-                if (ImGui::IsItemHovered() && descriptor->primary_ui_uri != nullptr && descriptor->primary_ui_uri[0] != '\0')
-                {
-                    ImGui::SetTooltip("%s", descriptor->primary_ui_uri);
-                }
-                ImGui::SameLine();
+                queue_open_plugin_ui(snapshot, channel_plugin.id);
             }
-            if (ImGui::SmallButton("x"))
+            if (ui_hovered && has_custom_ui && descriptor != nullptr && descriptor->primary_ui_uri != nullptr && descriptor->primary_ui_uri[0] != '\0')
+            {
+                ImGui::SetTooltip("%s", descriptor->primary_ui_uri);
+            }
+
+            ImGui::SetCursorScreenPos(ImVec2(remove_x, btn_y));
+            if (render_delete_icon_button(bridge, "##remove", ImVec2(remove_w, btn_h), 0.0f))
             {
                 queue_remove_plugin(snapshot, channel_plugin.id);
             }
-            render_plugin_param_controls(snapshot, channel_plugin, descriptor);
+
+            ImGui::SetCursorScreenPos(row_pos);
+            ImGui::Dummy(ImVec2(row_w, row_h));
             ImGui::PopID();
-            channel_plugin_rank += 1;
         }
 
         if (!has_plugins)
         {
-            ImGui::TextDisabled("No FX in this input.");
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.66f, 0.68f, 0.77f, 0.72f));
+            ImGui::TextUnformatted("No FX in this input.");
+            ImGui::PopStyleColor();
         }
 
-        ImGui::Separator();
-        ImGui::TextUnformatted("Add effect");
-        bool drew_lv2 = false;
-        const char *last_lv2_bundle = nullptr;
-        for (int i = 0; i < snapshot->plugin_descriptor_count; ++i)
+        ImGui::Dummy(ImVec2(0.0f, 6.0f));
         {
-            const WireDeckUiPluginDescriptor &descriptor = snapshot->plugin_descriptors[i];
-            if (descriptor.backend == 2)
+            const float y = ImGui::GetCursorScreenPos().y + 2.0f;
+            draw_list->AddLine(
+                ImVec2(win_pos.x + 12.0f, y),
+                ImVec2(win_pos.x + win_size.x - 12.0f, y),
+                ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.06f)),
+                1.0f);
+        }
+        ImGui::Dummy(ImVec2(0.0f, 8.0f));
+
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.93f, 0.94f, 0.98f, 0.98f));
+        ImGui::TextUnformatted("Add plugin");
+        ImGui::PopStyleColor();
+
+        const float filter_w = 170.0f;
+        const float filter_x = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - filter_w;
+        ImGui::SameLine();
+        if (filter_x > ImGui::GetCursorPosX())
+        {
+            ImGui::SetCursorPosX(filter_x);
+        }
+        ImGui::SetNextItemWidth(filter_w);
+        ImGui::InputTextWithHint("##fx_plugin_filter", "Search plugins...", bridge->fx_plugin_filter.data(), bridge->fx_plugin_filter.size());
+
+        const std::string filter = lower_copy(bridge->fx_plugin_filter.data());
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.66f, 0.68f, 0.77f, 0.72f));
+        ImGui::TextUnformatted(filter.empty() ? "Available plugins" : "Filtered results");
+        ImGui::PopStyleColor();
+
+        ImGui::Dummy(ImVec2(0.0f, 4.0f));
+
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
+        ImGui::BeginChild("available_plugins_list", ImVec2(0.0f, 230.0f), ImGuiChildFlags_Borders, ImGuiWindowFlags_None);
+        ImDrawList *list_draw = ImGui::GetWindowDrawList();
+
+        bool drew_any = false;
+        if (!filter.empty())
+        {
+            int filtered_index = 0;
+            for (int i = 0; i < snapshot->plugin_descriptor_count; ++i)
             {
-                if (!drew_lv2)
-                {
-                    ImGui::Dummy(ImVec2(0.0f, 4.0f));
-                    ImGui::TextDisabled("LV2");
-                    drew_lv2 = true;
-                }
-                const char *bundle_name = (descriptor.bundle_name != nullptr && descriptor.bundle_name[0] != '\0') ? descriptor.bundle_name : "lv2";
-                if (last_lv2_bundle != nullptr && std::strcmp(last_lv2_bundle, bundle_name) == 0)
+                const WireDeckUiPluginDescriptor &descriptor = snapshot->plugin_descriptors[i];
+                if (!plugin_matches_filter(descriptor, filter))
                 {
                     continue;
                 }
-                render_plugin_bundle_group(snapshot, channel_id, 2, bundle_name);
-                last_lv2_bundle = bundle_name;
+
+                drew_any = true;
+                const float row_h = 34.0f;
+                const float row_w = ImGui::GetContentRegionAvail().x;
+                const ImVec2 row_pos = ImGui::GetCursorScreenPos();
+                const ImVec2 row_min(row_pos.x, row_pos.y);
+                const ImVec2 row_max(row_pos.x + row_w, row_pos.y + row_h);
+
+                ImGui::SetCursorScreenPos(row_pos);
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1, 1, 1, 0.03f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1, 1, 1, 0.05f));
+                const bool clicked = ImGui::Button(("##filtered_plugin_" + std::to_string(filtered_index)).c_str(), ImVec2(row_w, row_h));
+                const bool hovered = ImGui::IsItemHovered();
+                ImGui::PopStyleColor(3);
+                ImGui::PopStyleVar();
+
+                list_draw->AddText(
+                    ImVec2(row_min.x + 10.0f, row_min.y + 5.0f),
+                    ImGui::GetColorU32(hovered ? ImVec4(0.97f, 0.98f, 1.0f, 1.0f) : ImVec4(0.90f, 0.91f, 0.96f, 0.92f)),
+                    descriptor.label);
+                const char *subtitle = (descriptor.bundle_name != nullptr && descriptor.bundle_name[0] != '\0') ? descriptor.bundle_name : plugin_backend_label(descriptor.backend);
+                list_draw->AddText(
+                    ImVec2(row_min.x + 10.0f, row_min.y + 18.0f),
+                    ImGui::GetColorU32(hovered ? ImVec4(0.78f, 0.80f, 0.88f, 0.82f) : ImVec4(0.66f, 0.68f, 0.77f, 0.70f)),
+                    subtitle);
+
+                list_draw->AddLine(
+                    ImVec2(row_min.x, row_max.y),
+                    ImVec2(row_max.x, row_max.y),
+                    ImGui::GetColorU32(ImVec4(1, 1, 1, 0.06f)),
+                    1.0f);
+
+                ImGui::SetCursorScreenPos(ImVec2(row_pos.x, row_pos.y + row_h));
+                if (clicked)
+                {
+                    queue_add_plugin(snapshot, channel_id, descriptor.id);
+                }
+                filtered_index += 1;
             }
-        }
-        if (!drew_lv2)
-        {
-            ImGui::TextDisabled("No LV2 plugins found in standard LV2 paths");
         }
         else
         {
-            ImGui::Dummy(ImVec2(0.0f, 4.0f));
-            ImGui::TextDisabled("[UI] means the plugin declares a custom LV2 UI");
+            std::vector<std::string> groups{};
+            groups.reserve(snapshot->plugin_descriptor_count);
+            for (int i = 0; i < snapshot->plugin_descriptor_count; ++i)
+            {
+                const WireDeckUiPluginDescriptor &descriptor = snapshot->plugin_descriptors[i];
+                const char *bundle_name = (descriptor.bundle_name != nullptr && descriptor.bundle_name[0] != '\0') ? descriptor.bundle_name : plugin_backend_label(descriptor.backend);
+                const std::string key(bundle_name);
+                if (std::find(groups.begin(), groups.end(), key) == groups.end())
+                {
+                    groups.push_back(key);
+                }
+            }
+
+            for (std::size_t group_index = 0; group_index < groups.size(); ++group_index)
+            {
+                const std::string &group = groups[group_index];
+                bool &is_open = bridge->fx_group_open[group];
+
+                const float header_h = 30.0f;
+                const float header_w = ImGui::GetContentRegionAvail().x;
+                const ImVec2 header_pos = ImGui::GetCursorScreenPos();
+                const ImVec2 header_min(header_pos.x, header_pos.y);
+                const ImVec2 header_max(header_pos.x + header_w, header_pos.y + header_h);
+
+                ImGui::SetCursorScreenPos(header_pos);
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1, 1, 1, 0.03f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1, 1, 1, 0.05f));
+                const bool clicked_header = ImGui::Button(("##group_" + std::to_string(group_index)).c_str(), ImVec2(header_w, header_h));
+                const bool hovered_header = ImGui::IsItemHovered();
+                ImGui::PopStyleColor(3);
+                ImGui::PopStyleVar();
+
+                if (clicked_header)
+                {
+                    is_open = !is_open;
+                }
+
+                list_draw->AddText(
+                    ImVec2(header_min.x + 8.0f, header_min.y + 7.0f),
+                    ImGui::GetColorU32(hovered_header ? ImVec4(0.92f, 0.93f, 0.98f, 0.92f) : ImVec4(0.74f, 0.76f, 0.84f, 0.78f)),
+                    is_open ? "v" : ">");
+                list_draw->AddText(
+                    ImVec2(header_min.x + 24.0f, header_min.y + 7.0f),
+                    ImGui::GetColorU32(hovered_header ? ImVec4(0.92f, 0.93f, 0.98f, 0.95f) : ImVec4(0.72f, 0.74f, 0.82f, 0.78f)),
+                    group.c_str());
+                list_draw->AddLine(
+                    ImVec2(header_min.x, header_max.y),
+                    ImVec2(header_max.x, header_max.y),
+                    ImGui::GetColorU32(ImVec4(1, 1, 1, 0.05f)),
+                    1.0f);
+
+                ImGui::SetCursorScreenPos(ImVec2(header_pos.x, header_pos.y + header_h));
+
+                if (is_open)
+                {
+                    for (int i = 0; i < snapshot->plugin_descriptor_count; ++i)
+                    {
+                        const WireDeckUiPluginDescriptor &descriptor = snapshot->plugin_descriptors[i];
+                        const char *bundle_name = (descriptor.bundle_name != nullptr && descriptor.bundle_name[0] != '\0') ? descriptor.bundle_name : plugin_backend_label(descriptor.backend);
+                        if (group != bundle_name)
+                        {
+                            continue;
+                        }
+
+                        drew_any = true;
+                        const float row_h = 30.0f;
+                        const float row_w = ImGui::GetContentRegionAvail().x;
+                        const ImVec2 row_pos = ImGui::GetCursorScreenPos();
+                        const ImVec2 row_min(row_pos.x, row_pos.y);
+                        const ImVec2 row_max(row_pos.x + row_w, row_pos.y + row_h);
+
+                        ImGui::SetCursorScreenPos(row_pos);
+                        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1, 1, 1, 0.03f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1, 1, 1, 0.05f));
+                        const bool clicked = ImGui::Button(("##plugin_" + std::string(descriptor.id)).c_str(), ImVec2(row_w, row_h));
+                        const bool hovered = ImGui::IsItemHovered();
+                        ImGui::PopStyleColor(3);
+                        ImGui::PopStyleVar();
+
+                        list_draw->AddText(
+                            ImVec2(row_min.x + 28.0f, row_min.y + 7.0f),
+                            ImGui::GetColorU32(hovered ? ImVec4(0.97f, 0.98f, 1.0f, 1.0f) : ImVec4(0.90f, 0.91f, 0.96f, 0.92f)),
+                            descriptor.label);
+
+                        list_draw->AddLine(
+                            ImVec2(row_min.x + 24.0f, row_max.y),
+                            ImVec2(row_max.x, row_max.y),
+                            ImGui::GetColorU32(ImVec4(1, 1, 1, 0.05f)),
+                            1.0f);
+
+                        ImGui::SetCursorScreenPos(ImVec2(row_pos.x, row_pos.y + row_h));
+                        if (clicked)
+                        {
+                            queue_add_plugin(snapshot, channel_id, descriptor.id);
+                        }
+                    }
+                }
+
+                if (group_index + 1 < groups.size())
+                {
+                    list_draw->AddLine(
+                        ImVec2(header_min.x, ImGui::GetCursorScreenPos().y + 2.0f),
+                        ImVec2(header_max.x, ImGui::GetCursorScreenPos().y + 2.0f),
+                        ImGui::GetColorU32(ImVec4(1, 1, 1, 0.04f)),
+                        1.0f);
+                    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+                }
+            }
         }
+
+        if (!drew_any)
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.66f, 0.68f, 0.77f, 0.72f));
+            ImGui::TextUnformatted(filter.empty() ? "No plugins found." : "No plugins match your search.");
+            ImGui::PopStyleColor();
+        }
+
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleVar(3);
         ImGui::EndPopup();
     }
 
@@ -3016,7 +3347,7 @@ namespace
         }
         ImGui::PopStyleColor(3);
         ImGui::PopStyleVar();
-        render_input_fx_popup(snapshot, channel.id);
+        render_input_fx_popup(bridge, snapshot, channel.id);
 
         const float meter_x = btn_x + joined_w + 18.0f;
         const float meter_y = body_y;
@@ -4086,6 +4417,9 @@ extern "C" void wiredeck_imgui_destroy(WireDeckImGuiBridge *bridge)
         destroy_icon_texture(bridge, &bridge->world_icon);
         destroy_icon_texture(bridge, &bridge->world_off_icon);
         destroy_icon_texture(bridge, &bridge->trash_icon);
+        destroy_icon_texture(bridge, &bridge->toggle_left_icon);
+        destroy_icon_texture(bridge, &bridge->toggle_right_icon);
+        destroy_icon_texture(bridge, &bridge->config_icon);
         destroy_icon_texture(bridge, &bridge->headset_icon);
         destroy_icon_texture(bridge, &bridge->generic_app_icon);
         for (auto &icon : bridge->source_icons)
