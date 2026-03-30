@@ -7,6 +7,7 @@ const Allocator = std.mem.Allocator;
 
 pub const PipewireContext = struct {
     allocator: Allocator,
+    pipewire_initialized: bool,
     loop: *c.struct_pw_main_loop,
     pw_loop: *c.struct_pw_loop,
     context: *c.struct_pw_context,
@@ -22,12 +23,14 @@ pub const PipewireContext = struct {
 
     pub fn init(allocator: Allocator) !*PipewireContext {
         c.pw_init(null, null);
+        errdefer c.pw_deinit();
 
         const self = try allocator.create(PipewireContext);
         errdefer allocator.destroy(self);
 
         self.* = .{
             .allocator = allocator,
+            .pipewire_initialized = true,
             .loop = undefined,
             .pw_loop = undefined,
             .context = undefined,
@@ -88,6 +91,10 @@ pub const PipewireContext = struct {
         _ = c.pw_core_disconnect(self.core);
         c.pw_context_destroy(self.context);
         c.pw_main_loop_destroy(self.loop);
+        if (self.pipewire_initialized) {
+            c.pw_deinit();
+            self.pipewire_initialized = false;
+        }
 
         self.allocator.destroy(self);
     }
