@@ -906,13 +906,17 @@ fn isManagedWireDeckNode(props: *const c.struct_spa_dict) bool {
     if (lookupProp(props, "node.name")) |name| {
         if (std.mem.startsWith(u8, name, "wiredeck_input_")) return true;
         if (std.mem.startsWith(u8, name, "wiredeck_output_")) return true;
+        if (std.mem.startsWith(u8, name, "wiredeck_busmic_")) return true;
         if (std.mem.startsWith(u8, name, "wiredeck_fx_")) return true;
+        if (std.mem.startsWith(u8, name, "wiredeck_parking_sink")) return true;
         if (std.mem.startsWith(u8, name, "wiredeck_meter_")) return true;
     }
     if (lookupProp(props, "object.path")) |path| {
         if (std.mem.startsWith(u8, path, "wiredeck_input_")) return true;
         if (std.mem.startsWith(u8, path, "wiredeck_output_")) return true;
+        if (std.mem.startsWith(u8, path, "wiredeck_busmic_")) return true;
         if (std.mem.startsWith(u8, path, "wiredeck_fx_")) return true;
+        if (std.mem.startsWith(u8, path, "wiredeck_parking_sink")) return true;
         if (std.mem.startsWith(u8, path, "wiredeck_meter_")) return true;
     }
     return false;

@@ -18,6 +18,7 @@ pub const PulseContext = struct {
     const connect_timeout_ns = 2 * std.time.ns_per_s;
     const query_timeout_ns = 1200 * std.time.ns_per_ms;
     const operation_timeout_ns = 900 * std.time.ns_per_ms;
+    const cancel_drain_timeout_ns = 250 * std.time.ns_per_ms;
 
     allocator: Allocator,
     mainloop: *c.pa_mainloop,
@@ -143,47 +144,55 @@ pub const PulseContext = struct {
 
     pub fn moveSinkInputToSink(self: *PulseContext, sink_input_index: u32, sink_index: u32) !void {
         var request = OperationRequest{};
-        const start_ns = std.time.nanoTimestamp();
-        const op = c.pa_context_move_sink_input_by_index(self.context, sink_input_index, sink_index, successCb, &request);
-        if (op == null) return error.PulseMoveSinkInputFailed;
+        const op = c.pa_context_move_sink_input_by_index(self.context, sink_input_index, sink_index, successCb, &request) orelse
+            return error.PulseMoveSinkInputFailed;
         defer c.pa_operation_unref(op);
-
-        while (!request.done and !self.failed) {
-            if (deadlineReached(start_ns, operation_timeout_ns)) return error.PulseOperationTimedOut;
-            try self.iterateOnce();
-            std.Thread.sleep(poll_interval_ns);
+        switch (try self.waitForOperationRequest(op, &request, operation_timeout_ns)) {
+            .success => {},
+            .timeout => return error.PulseOperationTimedOut,
+            .failed => return error.PulseMoveSinkInputFailed,
         }
-        if (self.failed or !request.success) return error.PulseMoveSinkInputFailed;
     }
 
     pub fn setSinkInputMuteByIndex(self: *PulseContext, sink_input_index: u32, muted: bool) !void {
         var request = OperationRequest{};
-        const start_ns = std.time.nanoTimestamp();
-        const op = c.pa_context_set_sink_input_mute(self.context, sink_input_index, @intFromBool(muted), successCb, &request);
-        if (op == null) return error.PulseSetSinkInputMuteFailed;
+        const op = c.pa_context_set_sink_input_mute(self.context, sink_input_index, @intFromBool(muted), successCb, &request) orelse
+            return error.PulseSetSinkInputMuteFailed;
         defer c.pa_operation_unref(op);
-
-        while (!request.done and !self.failed) {
-            if (deadlineReached(start_ns, operation_timeout_ns)) return error.PulseOperationTimedOut;
-            try self.iterateOnce();
-            std.Thread.sleep(poll_interval_ns);
+        switch (try self.waitForOperationRequest(op, &request, operation_timeout_ns)) {
+            .success => {},
+            .timeout => return error.PulseOperationTimedOut,
+            .failed => return error.PulseSetSinkInputMuteFailed,
         }
-        if (self.failed or !request.success) return error.PulseSetSinkInputMuteFailed;
+    }
+
+    pub fn setSinkInputVolumeByIndex(self: *PulseContext, sink_input_index: u32, channels: u8, linear_volume: f32) !void {
+        var request = OperationRequest{};
+        const clamped = std.math.clamp(linear_volume, 0.0, 4.0);
+        const channel_count: u8 = @max(@as(u8, 1), channels);
+        const pa_volume = c.pa_sw_volume_from_linear(clamped);
+        var cvolume: c.pa_cvolume = undefined;
+        _ = c.pa_cvolume_set(&cvolume, channel_count, pa_volume);
+        const op = c.pa_context_set_sink_input_volume(self.context, sink_input_index, &cvolume, successCb, &request) orelse
+            return error.PulseSetSinkInputVolumeFailed;
+        defer c.pa_operation_unref(op);
+        switch (try self.waitForOperationRequest(op, &request, operation_timeout_ns)) {
+            .success => {},
+            .timeout => return error.PulseOperationTimedOut,
+            .failed => return error.PulseSetSinkInputVolumeFailed,
+        }
     }
 
     pub fn moveSourceOutputToSource(self: *PulseContext, source_output_index: u32, source_index: u32) !void {
         var request = OperationRequest{};
-        const start_ns = std.time.nanoTimestamp();
-        const op = c.pa_context_move_source_output_by_index(self.context, source_output_index, source_index, successCb, &request);
-        if (op == null) return error.PulseMoveSourceOutputFailed;
+        const op = c.pa_context_move_source_output_by_index(self.context, source_output_index, source_index, successCb, &request) orelse
+            return error.PulseMoveSourceOutputFailed;
         defer c.pa_operation_unref(op);
-
-        while (!request.done and !self.failed) {
-            if (deadlineReached(start_ns, operation_timeout_ns)) return error.PulseOperationTimedOut;
-            try self.iterateOnce();
-            std.Thread.sleep(poll_interval_ns);
+        switch (try self.waitForOperationRequest(op, &request, operation_timeout_ns)) {
+            .success => {},
+            .timeout => return error.PulseOperationTimedOut,
+            .failed => return error.PulseMoveSourceOutputFailed,
         }
-        if (self.failed or !request.success) return error.PulseMoveSourceOutputFailed;
     }
 
     pub fn loadModule(self: *PulseContext, name: []const u8, argument: []const u8) !u32 {
@@ -193,33 +202,26 @@ pub const PulseContext = struct {
         defer self.allocator.free(argument_z);
 
         var request = ModuleRequest{};
-        const start_ns = std.time.nanoTimestamp();
-        const op = c.pa_context_load_module(self.context, name_z.ptr, argument_z.ptr, moduleIndexCb, &request);
-        if (op == null) return error.PulseLoadModuleFailed;
+        const op = c.pa_context_load_module(self.context, name_z.ptr, argument_z.ptr, moduleIndexCb, &request) orelse
+            return error.PulseLoadModuleFailed;
         defer c.pa_operation_unref(op);
-
-        while (!request.done and !self.failed) {
-            if (deadlineReached(start_ns, operation_timeout_ns)) return error.PulseOperationTimedOut;
-            try self.iterateOnce();
-            std.Thread.sleep(poll_interval_ns);
+        switch (try self.waitForModuleRequest(op, &request, operation_timeout_ns)) {
+            .success => |module_index| return module_index,
+            .timeout => return error.PulseOperationTimedOut,
+            .failed => return error.PulseLoadModuleFailed,
         }
-        if (self.failed or request.module_index == null) return error.PulseLoadModuleFailed;
-        return request.module_index.?;
     }
 
     pub fn unloadModule(self: *PulseContext, module_index: u32) !void {
         var request = OperationRequest{};
-        const start_ns = std.time.nanoTimestamp();
-        const op = c.pa_context_unload_module(self.context, module_index, successCb, &request);
-        if (op == null) return error.PulseUnloadModuleFailed;
+        const op = c.pa_context_unload_module(self.context, module_index, successCb, &request) orelse
+            return error.PulseUnloadModuleFailed;
         defer c.pa_operation_unref(op);
-
-        while (!request.done and !self.failed) {
-            if (deadlineReached(start_ns, operation_timeout_ns)) return error.PulseOperationTimedOut;
-            try self.iterateOnce();
-            std.Thread.sleep(poll_interval_ns);
+        switch (try self.waitForOperationRequest(op, &request, operation_timeout_ns)) {
+            .success => {},
+            .timeout => return error.PulseOperationTimedOut,
+            .failed => return error.PulseUnloadModuleFailed,
         }
-        if (self.failed or !request.success) return error.PulseUnloadModuleFailed;
     }
 
     pub fn listModules(self: *PulseContext, allocator: Allocator) ![]PulseModule {
@@ -265,17 +267,14 @@ pub const PulseContext = struct {
         defer self.allocator.free(profile_z);
 
         var request = OperationRequest{};
-        const start_ns = std.time.nanoTimestamp();
-        const op = c.pa_context_set_card_profile_by_index(self.context, card_index, profile_z.ptr, successCb, &request);
-        if (op == null) return error.PulseSetCardProfileFailed;
+        const op = c.pa_context_set_card_profile_by_index(self.context, card_index, profile_z.ptr, successCb, &request) orelse
+            return error.PulseSetCardProfileFailed;
         defer c.pa_operation_unref(op);
-
-        while (!request.done and !self.failed) {
-            if (deadlineReached(start_ns, operation_timeout_ns)) return error.PulseOperationTimedOut;
-            try self.iterateOnce();
-            std.Thread.sleep(poll_interval_ns);
+        switch (try self.waitForOperationRequest(op, &request, operation_timeout_ns)) {
+            .success => {},
+            .timeout => return error.PulseOperationTimedOut,
+            .failed => return error.PulseSetCardProfileFailed,
         }
-        if (self.failed or !request.success) return error.PulseSetCardProfileFailed;
     }
 
     pub fn defaultSinkName(self: *PulseContext, allocator: Allocator) !?[]u8 {
@@ -301,6 +300,21 @@ pub const PulseContext = struct {
         return null;
     }
 
+    pub fn setDefaultSinkName(self: *PulseContext, sink_name: []const u8) !void {
+        const sink_name_z = try self.allocator.dupeZ(u8, sink_name);
+        defer self.allocator.free(sink_name_z);
+
+        var request = OperationRequest{};
+        const op = c.pa_context_set_default_sink(self.context, sink_name_z.ptr, successCb, &request) orelse
+            return error.PulseSetDefaultSinkFailed;
+        defer c.pa_operation_unref(op);
+        switch (try self.waitForOperationRequest(op, &request, operation_timeout_ns)) {
+            .success => {},
+            .timeout => return error.PulseOperationTimedOut,
+            .failed => return error.PulseSetDefaultSinkFailed,
+        }
+    }
+
     fn waitUntilReady(self: *PulseContext) !void {
         const start_ns = std.time.nanoTimestamp();
         while (!self.ready and !self.failed) {
@@ -321,6 +335,54 @@ pub const PulseContext = struct {
             c.PA_CONTEXT_READY => self.ready = true,
             c.PA_CONTEXT_FAILED, c.PA_CONTEXT_TERMINATED => self.failed = true,
             else => {},
+        }
+    }
+
+    fn waitForOperationRequest(
+        self: *PulseContext,
+        op: *c.pa_operation,
+        request: *OperationRequest,
+        timeout_ns: i128,
+    ) !RequestWaitResult {
+        const start_ns = std.time.nanoTimestamp();
+        while (!request.done and !self.failed) {
+            if (deadlineReached(start_ns, timeout_ns)) {
+                self.cancelOperationAndDrain(op);
+                return .timeout;
+            }
+            try self.iterateOnce();
+            std.Thread.sleep(poll_interval_ns);
+        }
+        if (self.failed or !request.success) return .failed;
+        return .success;
+    }
+
+    fn waitForModuleRequest(
+        self: *PulseContext,
+        op: *c.pa_operation,
+        request: *ModuleRequest,
+        timeout_ns: i128,
+    ) !ModuleWaitResult {
+        const start_ns = std.time.nanoTimestamp();
+        while (!request.done and !self.failed) {
+            if (deadlineReached(start_ns, timeout_ns)) {
+                self.cancelOperationAndDrain(op);
+                return .timeout;
+            }
+            try self.iterateOnce();
+            std.Thread.sleep(poll_interval_ns);
+        }
+        if (self.failed or request.module_index == null) return .failed;
+        return .{ .success = request.module_index.? };
+    }
+
+    fn cancelOperationAndDrain(self: *PulseContext, op: *c.pa_operation) void {
+        c.pa_operation_cancel(op);
+        const start_ns = std.time.nanoTimestamp();
+        while (!self.failed and c.pa_operation_get_state(op) == c.PA_OPERATION_RUNNING) {
+            self.iterateOnce() catch break;
+            if (deadlineReached(start_ns, cancel_drain_timeout_ns)) break;
+            std.Thread.sleep(poll_interval_ns);
         }
     }
 
@@ -421,6 +483,18 @@ const OperationRequest = struct {
 const ModuleRequest = struct {
     done: bool = false,
     module_index: ?u32 = null,
+};
+
+const RequestWaitResult = enum {
+    success,
+    failed,
+    timeout,
+};
+
+const ModuleWaitResult = union(enum) {
+    success: u32,
+    failed,
+    timeout,
 };
 
 fn contextStateCb(_: ?*c.pa_context, userdata: ?*anyopaque) callconv(.c) void {
@@ -596,7 +670,9 @@ fn sinkInputInfoCb(
         .index = i.index,
         .client_index = if (i.client != c.PA_INVALID_INDEX) i.client else null,
         .sink_index = if (i.sink != c.PA_INVALID_INDEX) i.sink else null,
+        .corked = parseBoolMaybe(getProp(i.proplist, "pulse.corked")) orelse false,
         .muted = i.mute != 0,
+        .volume = pulseLinearVolume(&i.volume),
         .app_name = dupProp(self.allocator, i.proplist, c.PA_PROP_APPLICATION_NAME),
         .process_id = parseU32Maybe(getProp(i.proplist, c.PA_PROP_APPLICATION_PROCESS_ID)),
         .process_binary = dupProp(self.allocator, i.proplist, c.PA_PROP_APPLICATION_PROCESS_BINARY),
@@ -624,6 +700,7 @@ fn sourceOutputInfoCb(
 
     const item = PulseSourceOutput{
         .index = i.index,
+        .module_index = if (i.owner_module != c.PA_INVALID_INDEX) i.owner_module else null,
         .client_index = if (i.client != c.PA_INVALID_INDEX) i.client else null,
         .source_index = if (i.source != c.PA_INVALID_INDEX) i.source else null,
         .app_name = dupProp(self.allocator, i.proplist, c.PA_PROP_APPLICATION_NAME),
@@ -656,6 +733,18 @@ fn dupCStr(allocator: Allocator, value: ?[*:0]const u8) ?[]const u8 {
 fn parseU32Maybe(value: ?[]const u8) ?u32 {
     const s = value orelse return null;
     return std.fmt.parseUnsigned(u32, s, 10) catch null;
+}
+
+fn parseBoolMaybe(value: ?[]const u8) ?bool {
+    const s = value orelse return null;
+    if (std.ascii.eqlIgnoreCase(s, "true")) return true;
+    if (std.ascii.eqlIgnoreCase(s, "false")) return false;
+    return null;
+}
+
+fn pulseLinearVolume(value: *const c.pa_cvolume) f32 {
+    const average = c.pa_cvolume_avg(value);
+    return @floatCast(c.pa_sw_volume_to_linear(average));
 }
 
 fn freeOpt(allocator: Allocator, value: ?[]const u8) void {

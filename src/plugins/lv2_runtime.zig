@@ -2,6 +2,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const chain = @import("chain.zig");
 const host = @import("host.zig");
+const lv2_discovery = @import("lv2.zig");
 const lv2_c = if (build_options.enable_lilv) @cImport({
     @cInclude("lilv/lilv.h");
     @cInclude("lv2/atom/atom.h");
@@ -408,7 +409,19 @@ pub const Lv2Runtime = if (build_options.enable_lilv) struct {
         if (self.world != null) return;
         const world = c.lilv_world_new() orelse return error.OutOfMemory;
         errdefer c.lilv_world_free(world);
-        c.lilv_world_load_all(world);
+        const search_roots = try lv2_discovery.collectSearchRoots(self.allocator);
+        defer freeOwnedStrings(self.allocator, search_roots);
+        const bundle_paths = try lv2_discovery.collectBundlePaths(self.allocator, search_roots);
+        defer freeOwnedStrings(self.allocator, bundle_paths);
+
+        c.lilv_world_load_specifications(world);
+        for (bundle_paths) |bundle_path| {
+            const bundle_path_z = try self.allocator.dupeZ(u8, bundle_path);
+            defer self.allocator.free(bundle_path_z);
+            const bundle_uri = c.lilv_new_file_uri(world, null, bundle_path_z.ptr) orelse continue;
+            defer c.lilv_node_free(bundle_uri);
+            c.lilv_world_load_bundle(world, bundle_uri);
+        }
         self.world = world;
     }
 
@@ -541,6 +554,11 @@ pub const Lv2Runtime = if (build_options.enable_lilv) struct {
             .audio_port_is_output = try audio_port_is_output.toOwnedSlice(self.allocator),
             .atom_buffers = try atom_buffers.toOwnedSlice(self.allocator),
         };
+    }
+
+    fn freeOwnedStrings(allocator: std.mem.Allocator, items: [][]u8) void {
+        for (items) |item| allocator.free(item);
+        allocator.free(items);
     }
 
     fn ensureActivated(self: *Lv2Runtime, instance: *ManagedInstance) void {

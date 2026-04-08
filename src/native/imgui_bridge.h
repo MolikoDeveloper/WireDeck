@@ -35,7 +35,7 @@ typedef struct WireDeckUiBus {
     float volume;
     int muted;
     int expose_as_microphone;
-    int expose_on_web;
+    int share_on_network;
 } WireDeckUiBus;
 
 typedef struct WireDeckUiSend {
@@ -153,21 +153,21 @@ typedef struct WireDeckUiSnapshot {
     int event_count;
     int request_add_input;
     int request_add_output;
-    char request_select_source_id[64];
-    char request_rename_input_id[64];
-    char request_rename_input_label[64];
-    char request_rename_output_id[64];
-    char request_rename_output_label[64];
-    char request_pick_input_icon_id[64];
-    char request_clear_input_icon_id[64];
-    char request_delete_input_id[64];
-    char request_delete_output_id[64];
-    char request_add_plugin_channel_id[64];
-    char request_add_plugin_descriptor_id[64];
-    char request_remove_plugin_id[64];
-    char request_move_plugin_id[64];
+    char request_select_source_id[256];
+    char request_rename_input_id[256];
+    char request_rename_input_label[256];
+    char request_rename_output_id[256];
+    char request_rename_output_label[256];
+    char request_pick_input_icon_id[256];
+    char request_clear_input_icon_id[256];
+    char request_delete_input_id[256];
+    char request_delete_output_id[256];
+    char request_add_plugin_channel_id[256];
+    char request_add_plugin_descriptor_id[256];
+    char request_remove_plugin_id[256];
+    char request_move_plugin_id[256];
     int request_move_plugin_delta;
-    char request_open_plugin_ui_id[64];
+    char request_open_plugin_ui_id[256];
     char request_select_noise_model_path[512];
 } WireDeckUiSnapshot;
 

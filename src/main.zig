@@ -20,6 +20,7 @@ const CliOptions = struct {
 
 pub fn main() !void {
     const options = try parseArgs(std.heap.page_allocator);
+    wiredeck.RuntimeShutdown.installSignalHandlers();
 
     var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
     defer {
@@ -47,6 +48,12 @@ pub fn main() !void {
     defer state_store.deinit();
 
     var app = wiredeck.App.init(gpa, &state_store);
+    defer {
+        std.log.info("shutdown: final managed audio cleanup sweep", .{});
+        cleanupManagedAudioState(gpa) catch |err| {
+            std.log.warn("shutdown cleanup sweep failed: {s}", .{@errorName(err)});
+        };
+    }
     defer app.deinit();
 
     var config_store = try wiredeck.ConfigStore.init(gpa);
@@ -243,6 +250,7 @@ fn runCleanupWatchdog(allocator: std.mem.Allocator, pid: u32) !void {
 }
 
 fn cleanupManagedAudioState(allocator: std.mem.Allocator) !void {
+    std.log.info("shutdown cleanup: probing managed audio state", .{});
     var state_store = wiredeck.StateStore.init(allocator);
     defer state_store.deinit();
 
@@ -250,9 +258,11 @@ fn cleanupManagedAudioState(allocator: std.mem.Allocator) !void {
     defer app.deinit();
 
     try app.cleanupStartupBindings();
+    std.log.info("shutdown cleanup: startup bindings cleared", .{});
     wiredeck.OutputExposure.cleanupDefaultAudioSource(allocator) catch |err| {
         std.log.warn("default audio source cleanup failed: {s}", .{@errorName(err)});
     };
+    std.log.info("shutdown cleanup: default audio source restored", .{});
 }
 
 fn convertAppIcon(state_store: *const wiredeck.StateStore, app_name: []const u8) !void {
@@ -329,8 +339,75 @@ fn printSourceActivity(
                     channel.muted,
                 },
             );
+            if (app.audio_engine.channelLevels(channel.id, .post_fx)) |levels| {
+                var post_fx_left_db_buf: [24]u8 = undefined;
+                var post_fx_right_db_buf: [24]u8 = undefined;
+                var post_fx_peak_db_buf: [24]u8 = undefined;
+                std.debug.print(
+                    "    engine.post_fx L={d:.4} {s} R={d:.4} {s} peak={d:.4} {s}\n",
+                    .{
+                        levels.left,
+                        dbLabel(&post_fx_left_db_buf, levels.left),
+                        levels.right,
+                        dbLabel(&post_fx_right_db_buf, levels.right),
+                        levels.level,
+                        dbLabel(&post_fx_peak_db_buf, levels.level),
+                    },
+                );
+            }
+            if (app.audio_engine.channelLevels(channel.id, .post_fader)) |levels| {
+                var post_fader_left_db_buf: [24]u8 = undefined;
+                var post_fader_right_db_buf: [24]u8 = undefined;
+                var post_fader_peak_db_buf: [24]u8 = undefined;
+                std.debug.print(
+                    "    engine.post_fader L={d:.4} {s} R={d:.4} {s} peak={d:.4} {s}\n",
+                    .{
+                        levels.left,
+                        dbLabel(&post_fader_left_db_buf, levels.left),
+                        levels.right,
+                        dbLabel(&post_fader_right_db_buf, levels.right),
+                        levels.level,
+                        dbLabel(&post_fader_peak_db_buf, levels.level),
+                    },
+                );
+            }
         }
         if (!matched_channels) {
+            std.debug.print("  none\n", .{});
+        }
+
+        var matched_buses = false;
+        std.debug.print("engine buses\n", .{});
+        for (state_store.buses.items) |bus| {
+            const needle = source_filter orelse "";
+            const matches = source_filter == null or
+                containsIgnoreCase(bus.id, needle) or
+                containsIgnoreCase(bus.label, needle);
+            if (!matches) continue;
+            matched_buses = true;
+            if (app.audio_engine.busLevels(bus.id)) |levels| {
+                var bus_left_db_buf: [24]u8 = undefined;
+                var bus_right_db_buf: [24]u8 = undefined;
+                var bus_peak_db_buf: [24]u8 = undefined;
+                std.debug.print(
+                    "  bus={s}\n    label={s}\n    contributors={d}\n    L={d:.4} {s}\n    R={d:.4} {s}\n    peak={d:.4} {s}\n",
+                    .{
+                        bus.id,
+                        bus.label,
+                        levels.contributor_count,
+                        levels.mix.left,
+                        dbLabel(&bus_left_db_buf, levels.mix.left),
+                        levels.mix.right,
+                        dbLabel(&bus_right_db_buf, levels.mix.right),
+                        levels.mix.level,
+                        dbLabel(&bus_peak_db_buf, levels.mix.level),
+                    },
+                );
+            } else {
+                std.debug.print("  bus={s}\n    label={s}\n    no engine levels yet\n", .{ bus.id, bus.label });
+            }
+        }
+        if (!matched_buses) {
             std.debug.print("  none\n", .{});
         }
 

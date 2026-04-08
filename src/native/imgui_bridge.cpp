@@ -1901,6 +1901,10 @@ namespace
         {
             return;
         }
+        if (value != nullptr && std::strlen(value) >= dst_len)
+        {
+            std::fprintf(stderr, "wiredeck imgui request truncated: len=%zu capacity=%zu value=%s\n", std::strlen(value), dst_len, value);
+        }
         std::snprintf(dst, dst_len, "%s", value ? value : "");
     }
 
@@ -3604,7 +3608,7 @@ namespace
         const float meter_left = bus.muted != 0 ? 0.0f : std::clamp(bus.level_left, 0.0f, 1.0f);
         const float meter_right = bus.muted != 0 ? 0.0f : std::clamp(bus.level_right, 0.0f, 1.0f);
         bool expose_as_microphone = bus.expose_as_microphone != 0;
-        bool expose_on_web = bus.expose_on_web != 0;
+        bool share_on_network = bus.share_on_network != 0;
         ImGui::PushID(bus.id);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 12.0f));
         ImGui::BeginChild(
@@ -3656,13 +3660,13 @@ namespace
         }
 
         ImGui::SetCursorPos(ImVec2(seg_x + seg_btn_w, seg_y));
-        if (render_web_exposure_button(bridge, "##output_web_exposure", expose_on_web, ImVec2(seg_btn_w, seg_h), 9.0f))
+        if (render_web_exposure_button(bridge, "##output_network_share", share_on_network, ImVec2(seg_btn_w, seg_h), 9.0f))
         {
-            bus.expose_on_web = expose_on_web ? 0 : 1;
+            bus.share_on_network = share_on_network ? 0 : 1;
         }
         if (ImGui::IsItemHovered())
         {
-            ImGui::SetTooltip("%s over HTTP", expose_on_web ? "Stop exposing this output" : "Expose this output");
+            ImGui::SetTooltip("%s to the OBS network plugin", share_on_network ? "Hide this output" : "Share this output");
         }
 
         ImGui::SetCursorPos(ImVec2(seg_x + seg_btn_w * 2.0f, seg_y));

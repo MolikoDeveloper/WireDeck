@@ -1,16 +1,34 @@
-const builtin = @import("builtin");
 const std = @import("std");
 const StateStore = @import("../app/state_store.zig").StateStore;
+const audio_engine_mod = @import("audio/engine.zig");
+const bus_buffer_mod = @import("audio/bus_consumer_buffer.zig");
 const buses_mod = @import("audio/buses.zig");
 const destinations_mod = @import("audio/destinations.zig");
+const bus_playback_mod = @import("pulse/bus_playback.zig");
+const virtual_mic_source_mod = @import("pipewire/virtual_mic_source.zig");
 const pulse = @import("pulse.zig");
 
 const default_http_port: u16 = 8787;
 const output_sink_prefix = "wiredeck_output_";
-const null_sink_prefix = "wiredeck_busmic_sink_";
 const remap_source_prefix = "wiredeck_busmic_";
 const mic_description_prefix = "WireDeck Mic ";
 const output_description_prefix = "WireDeck Output ";
+
+pub const BusTargetSummary = struct {
+    count: usize = 0,
+    single_sink: ?pulse.PulseSink = null,
+
+    pub fn usesDirectSink(self: BusTargetSummary, bus: buses_mod.Bus) bool {
+        _ = self;
+        _ = bus;
+        return false;
+    }
+
+    pub fn needsVirtualBus(self: BusTargetSummary, bus: buses_mod.Bus) bool {
+        _ = bus;
+        return self.count > 0;
+    }
+};
 
 pub const OutputExposureManager = struct {
     const config_revision: u32 = 1;
@@ -43,29 +61,27 @@ pub const OutputExposureManager = struct {
 
     const ManagedVirtualMic = struct {
         bus_id: []u8,
-        target_monitor_source_name: []u8,
-        sink_name: []u8,
+        bus_label: []u8,
         source_name: []u8,
-        sink_module_id: u32,
-        remap_source_module_id: u32,
-        loopback_module_id: u32,
+        source: *virtual_mic_source_mod.VirtualMicSource,
 
         fn deinit(self: *ManagedVirtualMic, allocator: std.mem.Allocator) void {
             allocator.free(self.bus_id);
-            allocator.free(self.target_monitor_source_name);
-            allocator.free(self.sink_name);
+            allocator.free(self.bus_label);
             allocator.free(self.source_name);
         }
     };
 
     const ManagedOutputBus = struct {
         bus_id: []u8,
-        sink_name: []u8,
-        module_id: u32,
+        bus_label: []u8,
+        source_name: []u8,
+        source: *virtual_mic_source_mod.VirtualMicSource,
 
         fn deinit(self: *ManagedOutputBus, allocator: std.mem.Allocator) void {
             allocator.free(self.bus_id);
-            allocator.free(self.sink_name);
+            allocator.free(self.bus_label);
+            allocator.free(self.source_name);
         }
     };
 
@@ -76,24 +92,22 @@ pub const OutputExposureManager = struct {
 
     const ManagedBusDestinationLoopback = struct {
         bus_id: []u8,
-        sink_name: []u8,
         target_sink_name: []u8,
-        module_id: u32,
+        consumer_id: []u8,
+        stream: *bus_playback_mod.BusPlayback,
 
         fn deinit(self: *ManagedBusDestinationLoopback, allocator: std.mem.Allocator) void {
             allocator.free(self.bus_id);
-            allocator.free(self.sink_name);
             allocator.free(self.target_sink_name);
+            allocator.free(self.consumer_id);
         }
     };
 
     const DesiredBusDestinationLoopback = struct {
         bus_id: []const u8,
-        sink_name: []u8,
         target_sink_name: []u8,
 
         fn deinit(self: *DesiredBusDestinationLoopback, allocator: std.mem.Allocator) void {
-            allocator.free(self.sink_name);
             allocator.free(self.target_sink_name);
         }
     };
@@ -101,11 +115,6 @@ pub const OutputExposureManager = struct {
     const DesiredVirtualMic = struct {
         bus_id: []const u8,
         bus_label: []const u8,
-        target_monitor_source_name: []u8,
-
-        fn deinit(self: *DesiredVirtualMic, allocator: std.mem.Allocator) void {
-            allocator.free(self.target_monitor_source_name);
-        }
     };
 
     allocator: std.mem.Allocator,
@@ -117,8 +126,10 @@ pub const OutputExposureManager = struct {
     output_buses: std.ArrayList(ManagedOutputBus),
     bus_destination_loopbacks: std.ArrayList(ManagedBusDestinationLoopback),
     virtual_mics: std.ArrayList(ManagedVirtualMic),
+    engine: ?*audio_engine_mod.AudioEngine,
     default_virtual_mic_source_name: ?[]u8,
     did_initial_recovery_cleanup: bool,
+    last_plan_signature: u64,
 
     pub fn init(allocator: std.mem.Allocator) OutputExposureManager {
         return .{
@@ -131,8 +142,10 @@ pub const OutputExposureManager = struct {
             .output_buses = .empty,
             .bus_destination_loopbacks = .empty,
             .virtual_mics = .empty,
+            .engine = null,
             .default_virtual_mic_source_name = null,
             .did_initial_recovery_cleanup = false,
+            .last_plan_signature = 0,
         };
     }
 
@@ -152,19 +165,16 @@ pub const OutputExposureManager = struct {
         if (self.default_virtual_mic_source_name) |value| self.allocator.free(value);
     }
 
+    pub fn attachEngine(self: *OutputExposureManager, engine: *audio_engine_mod.AudioEngine) void {
+        self.engine = engine;
+    }
+
     pub fn start(self: *OutputExposureManager) !void {
-        if (builtin.is_test or self.server_thread != null) return;
-        self.stop_requested.store(false, .monotonic);
-        self.server_thread = try std.Thread.spawn(.{}, serverMain, .{self});
+        _ = self;
     }
 
     pub fn stopServer(self: *OutputExposureManager) void {
-        self.stop_requested.store(true, .monotonic);
-        wakeServer(self.port);
-        if (self.server_thread) |thread| {
-            thread.join();
-            self.server_thread = null;
-        }
+        _ = self;
     }
 
     pub fn resetAudioState(self: *OutputExposureManager) !void {
@@ -192,24 +202,14 @@ pub const OutputExposureManager = struct {
             self.did_initial_recovery_cleanup = true;
         }
 
-        var desired_output_buses = std.ArrayList(DesiredOutputBus).empty;
-        defer desired_output_buses.deinit(self.allocator);
-
         var desired_bus_destination_loopbacks = std.ArrayList(DesiredBusDestinationLoopback).empty;
         defer {
             for (desired_bus_destination_loopbacks.items) |*item| item.deinit(self.allocator);
             desired_bus_destination_loopbacks.deinit(self.allocator);
         }
 
-        var desired_routes = std.ArrayList(DesiredWebRoute).empty;
-        defer {
-            for (desired_routes.items) |*route| route.deinit(self.allocator);
-            desired_routes.deinit(self.allocator);
-        }
-
         var desired_mics = std.ArrayList(DesiredVirtualMic).empty;
         defer {
-            for (desired_mics.items) |*mic| mic.deinit(self.allocator);
             desired_mics.deinit(self.allocator);
         }
 
@@ -217,14 +217,17 @@ pub const OutputExposureManager = struct {
             self.allocator,
             state_store,
             pulse_snapshot,
-            &desired_output_buses,
             &desired_bus_destination_loopbacks,
-            &desired_routes,
             &desired_mics,
         );
-        try self.syncOutputBuses(desired_output_buses.items, pulsectx);
-        try self.syncBusDestinationLoopbacks(desired_bus_destination_loopbacks.items, pulsectx);
-        try self.replaceRoutes(desired_routes.items);
+        const plan_signature = computeExposurePlanSignature(state_store, pulse_snapshot);
+        if (plan_signature != self.last_plan_signature) {
+            self.last_plan_signature = plan_signature;
+            logExposurePlan(state_store, pulse_snapshot);
+        }
+        try self.syncOutputBuses(&.{}, pulsectx);
+        try self.syncBusDestinationLoopbacks(desired_bus_destination_loopbacks.items);
+        self.clearRoutes();
         try self.syncVirtualMics(desired_mics.items, pulsectx);
         self.syncDefaultVirtualMicSource() catch |err| {
             std.log.warn("virtual mic default source sync failed: {s}", .{@errorName(err)});
@@ -280,7 +283,7 @@ pub const OutputExposureManager = struct {
         while (index < self.virtual_mics.items.len) {
             const existing = self.virtual_mics.items[index];
             const desired_item = findDesiredMic(desired, existing.bus_id);
-            if (desired_item == null or !std.mem.eql(u8, existing.target_monitor_source_name, desired_item.?.target_monitor_source_name)) {
+            if (desired_item == null or !std.mem.eql(u8, existing.bus_label, desired_item.?.bus_label)) {
                 try unloadVirtualMic(self, existing, pulsectx);
                 var removed = self.virtual_mics.orderedRemove(index);
                 removed.deinit(self.allocator);
@@ -300,8 +303,9 @@ pub const OutputExposureManager = struct {
         var index: usize = 0;
         while (index < self.output_buses.items.len) {
             const existing = self.output_buses.items[index];
-            if (findDesiredOutputBus(desired, existing.bus_id) == null) {
-                pulsectx.unloadModule(existing.module_id) catch {};
+            const desired_item = findDesiredOutputBus(desired, existing.bus_id);
+            if (desired_item == null or !std.mem.eql(u8, existing.bus_label, desired_item.?.bus_label)) {
+                try unloadOutputBus(self, existing, pulsectx);
                 var removed = self.output_buses.orderedRemove(index);
                 removed.deinit(self.allocator);
                 continue;
@@ -316,12 +320,15 @@ pub const OutputExposureManager = struct {
         }
     }
 
-    fn syncBusDestinationLoopbacks(self: *OutputExposureManager, desired: []const DesiredBusDestinationLoopback, pulsectx: *pulse.PulseContext) !void {
+    fn syncBusDestinationLoopbacks(
+        self: *OutputExposureManager,
+        desired: []const DesiredBusDestinationLoopback,
+    ) !void {
         var index: usize = 0;
         while (index < self.bus_destination_loopbacks.items.len) {
             const existing = self.bus_destination_loopbacks.items[index];
             if (!containsDesiredBusLoopback(desired, existing.bus_id, existing.target_sink_name)) {
-                pulsectx.unloadModule(existing.module_id) catch {};
+                existing.stream.deinit();
                 var removed = self.bus_destination_loopbacks.orderedRemove(index);
                 removed.deinit(self.allocator);
                 continue;
@@ -331,7 +338,7 @@ pub const OutputExposureManager = struct {
 
         for (desired) |item| {
             if (findManagedBusLoopback(self.bus_destination_loopbacks.items, item.bus_id, item.target_sink_name) != null) continue;
-            const managed = try loadBusDestinationLoopback(self, item, pulsectx);
+            const managed = try loadBusDestinationLoopback(self, item);
             try self.bus_destination_loopbacks.append(self.allocator, managed);
         }
     }
@@ -368,15 +375,13 @@ pub const OutputExposureManager = struct {
         const pulsectx = try pulse.PulseContext.init(self.allocator);
         defer pulsectx.deinit();
         for (self.output_buses.items) |bus| {
-            pulsectx.unloadModule(bus.module_id) catch {};
+            unloadOutputBus(self, bus, pulsectx) catch {};
         }
     }
 
     fn unloadAllBusDestinationLoopbacks(self: *OutputExposureManager) !void {
-        const pulsectx = try pulse.PulseContext.init(self.allocator);
-        defer pulsectx.deinit();
         for (self.bus_destination_loopbacks.items) |item| {
-            pulsectx.unloadModule(item.module_id) catch {};
+            item.stream.deinit();
         }
     }
 };
@@ -505,8 +510,8 @@ fn writeRouteIndexResponse(manager: *OutputExposureManager, stream: std.net.Stre
     } else {
         try body.writer(manager.allocator).writeAll("Active routes:\n");
         for (manager.routes.items) |route| {
-        try body.writer(manager.allocator).print("- {s} -> {s}\n", .{ route.label, route.path });
-        try body.writer(manager.allocator).print("  stream: {s}/stream.pcm\n", .{route.path});
+            try body.writer(manager.allocator).print("- {s} -> {s}\n", .{ route.label, route.path });
+            try body.writer(manager.allocator).print("  stream: {s}/stream.pcm\n", .{route.path});
         }
     }
 
@@ -642,7 +647,7 @@ fn writeRouteHtmlResponse(manager: *OutputExposureManager, stream: std.net.Strea
     defer body.deinit(manager.allocator);
     try body.writer(manager.allocator).writeAll(
         "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" ++
-        "<title>",
+            "<title>",
     );
     try appendHtmlEscaped(manager.allocator, &body, route.label);
     if (no_ui) {
@@ -652,9 +657,9 @@ fn writeRouteHtmlResponse(manager: *OutputExposureManager, stream: std.net.Strea
     } else {
         try body.writer(manager.allocator).writeAll(
             "</title><style>body{font-family:sans-serif;max-width:720px;margin:40px auto;padding:0 16px;background:#0f1115;color:#f3f4f6}" ++
-            ".card{background:#171a21;border:1px solid #2b3140;border-radius:16px;padding:20px}" ++
-            "button{margin-top:16px;background:#1f8f5f;color:#fff;border:0;border-radius:10px;padding:12px 16px;font:inherit;cursor:pointer}" ++
-            "button[disabled]{opacity:.55;cursor:default}code{background:#0b0d12;padding:2px 6px;border-radius:6px;color:#9bd1ff}.status{margin-top:12px;color:#b9c0cd}</style></head><body><div class=\"card\"><h1>",
+                ".card{background:#171a21;border:1px solid #2b3140;border-radius:16px;padding:20px}" ++
+                "button{margin-top:16px;background:#1f8f5f;color:#fff;border:0;border-radius:10px;padding:12px 16px;font:inherit;cursor:pointer}" ++
+                "button[disabled]{opacity:.55;cursor:default}code{background:#0b0d12;padding:2px 6px;border-radius:6px;color:#9bd1ff}.status{margin-top:12px;color:#b9c0cd}</style></head><body><div class=\"card\"><h1>",
         );
         try appendHtmlEscaped(manager.allocator, &body, route.label);
         try body.writer(manager.allocator).writeAll("</h1><p>Live output stream</p><p>Stream endpoint: <code>");
@@ -670,86 +675,86 @@ fn writeRouteHtmlResponse(manager: *OutputExposureManager, stream: std.net.Strea
     try body.writer(manager.allocator).print(";const noUi={s};", .{if (no_ui) "true" else "false"});
     try body.writer(manager.allocator).writeAll(
         "" ++
-        "const startBtn=document.getElementById('start');" ++
-        "const statusEl=document.getElementById('status');" ++
-        "let audioCtx=null;" ++
-        "let nextTime=0;" ++
-        "let started=false;" ++
-        "let reconnectTimer=0;" ++
-        "let reconnectDelay=1000;" ++
-        "function setStatus(t){if(statusEl)statusEl.textContent=t;}" ++
-        "function scheduleReconnect(){" ++
-        "if(reconnectTimer)return;" ++
-        "setStatus('Disconnected, retrying...');" ++
-        "reconnectTimer=window.setTimeout(()=>{reconnectTimer=0;connect().catch(handleDisconnect);},reconnectDelay);" ++
-        "reconnectDelay=Math.min(reconnectDelay*3/2,5000);" ++
-        "}" ++
-        "function handleDisconnect(err){" ++
-        "console.warn(err);" ++
-        "started=false;" ++
-        "if(startBtn)startBtn.disabled=false;" ++
-        "scheduleReconnect();" ++
-        "}" ++
-        "async function ensureAudio(){" ++
-        "if(!audioCtx)audioCtx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:48000});" ++
-        "if(audioCtx.state!=='running')await audioCtx.resume();" ++
-        "}" ++
-        "async function connect(){" ++
-        "if(started)return;" ++
-        "started=true;" ++
-        "if(startBtn)startBtn.disabled=true;" ++
-        "await ensureAudio();" ++
-        "nextTime=audioCtx.currentTime+0.06;" ++
-        "setStatus('Connecting...');" ++
-        "const response=await fetch(streamUrl,{cache:'no-store'});" ++
-        "if(!response.ok||!response.body)throw new Error('stream unavailable');" ++
-        "reconnectDelay=1000;" ++
-        "setStatus('Streaming');" ++
-        "const reader=response.body.getReader();" ++
-        "let pending=new Uint8Array(0);" ++
-        "const framesPerChunk=960;" ++
-        "const bytesPerFrame=4;" ++
-        "const chunkBytes=framesPerChunk*bytesPerFrame;" ++
-        "const lead=0.06;" ++
-        "const maxLead=0.18;" ++
-        "const maxPendingBytes=chunkBytes*6;" ++
-        "let dropping=false;" ++
-        "for(;;){" ++
-        "const result=await reader.read();" ++
-        "if(result.done)break;" ++
-        "const value=result.value;" ++
-        "if(!value||!value.length)continue;" ++
-        "const merged=new Uint8Array(pending.length+value.length);" ++
-        "merged.set(pending,0);" ++
-        "merged.set(value,pending.length);" ++
-        "pending=merged.length>maxPendingBytes?merged.slice(merged.length-maxPendingBytes):merged;" ++
-        "while(pending.length>=chunkBytes){" ++
-        "const chunk=pending.slice(0,chunkBytes);" ++
-        "pending=pending.slice(chunkBytes);" ++
-        "const frameCount=chunk.length/bytesPerFrame;" ++
-        "const now=audioCtx.currentTime;" ++
-        "if(nextTime>now+maxLead){dropping=true;setStatus('Streaming (dropping stale audio)');continue;}" ++
-        "if(dropping&&nextTime<=now+lead){dropping=false;setStatus('Streaming');}" ++
-        "const audioBuffer=audioCtx.createBuffer(2,frameCount,48000);" ++
-        "const left=audioBuffer.getChannelData(0);" ++
-        "const right=audioBuffer.getChannelData(1);" ++
-        "const view=new DataView(chunk.buffer,chunk.byteOffset,chunk.byteLength);" ++
-        "for(let i=0;i<frameCount;i++){left[i]=view.getInt16(i*4,true)/32768;right[i]=view.getInt16(i*4+2,true)/32768;}" ++
-        "const source=audioCtx.createBufferSource();" ++
-        "source.buffer=audioBuffer;" ++
-        "source.connect(audioCtx.destination);" ++
-        "if(nextTime<now+lead)nextTime=now+lead;" ++
-        "source.onended=()=>source.disconnect();" ++
-        "source.start(nextTime);" ++
-        "nextTime+=audioBuffer.duration;" ++
-        "}" ++
-        "}" ++
-        "throw new Error('stream ended');" ++
-        "}" ++
-        "if(startBtn)startBtn.addEventListener('click',()=>{connect().catch(handleDisconnect);});" ++
-        "window.addEventListener('online',()=>{if(!started)connect().catch(handleDisconnect);});" ++
-        "document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&started&&audioCtx&&audioCtx.state!=='running')audioCtx.resume().catch(()=>{});});" ++
-        "if(noUi){connect().catch(handleDisconnect);}",
+            "const startBtn=document.getElementById('start');" ++
+            "const statusEl=document.getElementById('status');" ++
+            "let audioCtx=null;" ++
+            "let nextTime=0;" ++
+            "let started=false;" ++
+            "let reconnectTimer=0;" ++
+            "let reconnectDelay=1000;" ++
+            "function setStatus(t){if(statusEl)statusEl.textContent=t;}" ++
+            "function scheduleReconnect(){" ++
+            "if(reconnectTimer)return;" ++
+            "setStatus('Disconnected, retrying...');" ++
+            "reconnectTimer=window.setTimeout(()=>{reconnectTimer=0;connect().catch(handleDisconnect);},reconnectDelay);" ++
+            "reconnectDelay=Math.min(reconnectDelay*3/2,5000);" ++
+            "}" ++
+            "function handleDisconnect(err){" ++
+            "console.warn(err);" ++
+            "started=false;" ++
+            "if(startBtn)startBtn.disabled=false;" ++
+            "scheduleReconnect();" ++
+            "}" ++
+            "async function ensureAudio(){" ++
+            "if(!audioCtx)audioCtx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:48000});" ++
+            "if(audioCtx.state!=='running')await audioCtx.resume();" ++
+            "}" ++
+            "async function connect(){" ++
+            "if(started)return;" ++
+            "started=true;" ++
+            "if(startBtn)startBtn.disabled=true;" ++
+            "await ensureAudio();" ++
+            "nextTime=audioCtx.currentTime+0.06;" ++
+            "setStatus('Connecting...');" ++
+            "const response=await fetch(streamUrl,{cache:'no-store'});" ++
+            "if(!response.ok||!response.body)throw new Error('stream unavailable');" ++
+            "reconnectDelay=1000;" ++
+            "setStatus('Streaming');" ++
+            "const reader=response.body.getReader();" ++
+            "let pending=new Uint8Array(0);" ++
+            "const framesPerChunk=960;" ++
+            "const bytesPerFrame=4;" ++
+            "const chunkBytes=framesPerChunk*bytesPerFrame;" ++
+            "const lead=0.06;" ++
+            "const maxLead=0.18;" ++
+            "const maxPendingBytes=chunkBytes*6;" ++
+            "let dropping=false;" ++
+            "for(;;){" ++
+            "const result=await reader.read();" ++
+            "if(result.done)break;" ++
+            "const value=result.value;" ++
+            "if(!value||!value.length)continue;" ++
+            "const merged=new Uint8Array(pending.length+value.length);" ++
+            "merged.set(pending,0);" ++
+            "merged.set(value,pending.length);" ++
+            "pending=merged.length>maxPendingBytes?merged.slice(merged.length-maxPendingBytes):merged;" ++
+            "while(pending.length>=chunkBytes){" ++
+            "const chunk=pending.slice(0,chunkBytes);" ++
+            "pending=pending.slice(chunkBytes);" ++
+            "const frameCount=chunk.length/bytesPerFrame;" ++
+            "const now=audioCtx.currentTime;" ++
+            "if(nextTime>now+maxLead){dropping=true;setStatus('Streaming (dropping stale audio)');continue;}" ++
+            "if(dropping&&nextTime<=now+lead){dropping=false;setStatus('Streaming');}" ++
+            "const audioBuffer=audioCtx.createBuffer(2,frameCount,48000);" ++
+            "const left=audioBuffer.getChannelData(0);" ++
+            "const right=audioBuffer.getChannelData(1);" ++
+            "const view=new DataView(chunk.buffer,chunk.byteOffset,chunk.byteLength);" ++
+            "for(let i=0;i<frameCount;i++){left[i]=view.getInt16(i*4,true)/32768;right[i]=view.getInt16(i*4+2,true)/32768;}" ++
+            "const source=audioCtx.createBufferSource();" ++
+            "source.buffer=audioBuffer;" ++
+            "source.connect(audioCtx.destination);" ++
+            "if(nextTime<now+lead)nextTime=now+lead;" ++
+            "source.onended=()=>source.disconnect();" ++
+            "source.start(nextTime);" ++
+            "nextTime+=audioBuffer.duration;" ++
+            "}" ++
+            "}" ++
+            "throw new Error('stream ended');" ++
+            "}" ++
+            "if(startBtn)startBtn.addEventListener('click',()=>{connect().catch(handleDisconnect);});" ++
+            "window.addEventListener('online',()=>{if(!started)connect().catch(handleDisconnect);});" ++
+            "document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&started&&audioCtx&&audioCtx.state!=='running')audioCtx.resume().catch(()=>{});});" ++
+            "if(noUi){connect().catch(handleDisconnect);}",
     );
     if (no_ui) {
         try body.writer(manager.allocator).writeAll("</script></body></html>");
@@ -788,6 +793,14 @@ fn isRouteStillExposed(manager: *OutputExposureManager, bus_id: []const u8) bool
 }
 
 fn streamPcmToClient(manager: *OutputExposureManager, stream: std.net.Stream, route: ResolvedRoute) !void {
+    if (manager.engine) |engine| {
+        try streamBusPcmFromEngine(manager, engine, stream, route);
+        return;
+    }
+    try streamPcmFromMonitorSource(manager, stream, route);
+}
+
+fn streamPcmFromMonitorSource(manager: *OutputExposureManager, stream: std.net.Stream, route: ResolvedRoute) !void {
     const allocator = std.heap.page_allocator;
     const source_arg = try std.fmt.allocPrint(allocator, "--device={s}", .{route.monitor_source_name});
     defer allocator.free(source_arg);
@@ -812,13 +825,13 @@ fn streamPcmToClient(manager: *OutputExposureManager, stream: std.net.Stream, ro
 
     try stream.writeAll(
         "HTTP/1.1 200 OK\r\n" ++
-        "Content-Type: application/octet-stream\r\n" ++
-        "X-WireDeck-Format: pcm_s16le\r\n" ++
-        "X-WireDeck-Rate: 48000\r\n" ++
-        "X-WireDeck-Channels: 2\r\n" ++
-        "Transfer-Encoding: chunked\r\n" ++
-        "Cache-Control: no-store\r\n" ++
-        "Connection: close\r\n\r\n",
+            "Content-Type: application/octet-stream\r\n" ++
+            "X-WireDeck-Format: pcm_s16le\r\n" ++
+            "X-WireDeck-Rate: 48000\r\n" ++
+            "X-WireDeck-Channels: 2\r\n" ++
+            "Transfer-Encoding: chunked\r\n" ++
+            "Cache-Control: no-store\r\n" ++
+            "Connection: close\r\n\r\n",
     );
 
     const stdout = child.stdout.?;
@@ -836,63 +849,159 @@ fn streamPcmToClient(manager: *OutputExposureManager, stream: std.net.Stream, ro
     stream.writeAll("0\r\n\r\n") catch {};
 }
 
+fn streamBusPcmFromEngine(
+    manager: *OutputExposureManager,
+    engine: *audio_engine_mod.AudioEngine,
+    stream: std.net.Stream,
+    route: ResolvedRoute,
+) !void {
+    const consumer_id = try std.fmt.allocPrint(manager.allocator, "web:{s}:{d}", .{ route.path, std.time.nanoTimestamp() });
+    defer manager.allocator.free(consumer_id);
+    defer engine.releaseBusTapConsumer(route.bus_id, consumer_id);
+    var pcm_buffer = bus_buffer_mod.BusConsumerBuffer.init(manager.allocator);
+    defer pcm_buffer.deinit();
+
+    const sample_rate_hz = if (engine.busLevels(route.bus_id)) |bus_metrics|
+        if (bus_metrics.generation != 0) @as(u32, 48_000) else @as(u32, 48_000)
+    else
+        48_000;
+    _ = sample_rate_hz;
+
+    try stream.writeAll(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: application/octet-stream\r\n" ++
+            "X-WireDeck-Format: pcm_s16le\r\n" ++
+            "X-WireDeck-Rate: 48000\r\n" ++
+            "X-WireDeck-Channels: 2\r\n" ++
+            "Transfer-Encoding: chunked\r\n" ++
+            "Cache-Control: no-store\r\n" ++
+            "Connection: close\r\n\r\n",
+    );
+
+    var frame_buffer: [1920]i16 = undefined;
+    var scratch_buffer: [bus_buffer_mod.render_quantum_frames * bus_buffer_mod.stereo_channels]i16 = undefined;
+    var byte_buffer: [3840]u8 = undefined;
+    var chunk_header_buffer: [32]u8 = undefined;
+    const chunk_frames = frame_buffer.len / bus_buffer_mod.stereo_channels;
+
+    while (isRouteStillExposed(manager, route.bus_id)) {
+        _ = pcm_buffer.fillFromEngine(
+            engine,
+            route.bus_id,
+            consumer_id,
+            chunk_frames,
+            scratch_buffer[0..],
+        ) catch {};
+        if (pcm_buffer.availableFrames() < chunk_frames) {
+            std.Thread.sleep(bus_buffer_mod.render_quantum_ns);
+            continue;
+        }
+
+        const read_frames = pcm_buffer.drainFrames(frame_buffer[0..], chunk_frames);
+        if (read_frames == 0) continue;
+
+        const sample_count = read_frames * bus_buffer_mod.stereo_channels;
+        for (frame_buffer[0..sample_count], 0..) |sample, index| {
+            std.mem.writeInt(i16, byte_buffer[index * 2 ..][0..2], sample, .little);
+        }
+        const byte_len = sample_count * @sizeOf(i16);
+        const chunk_header = std.fmt.bufPrint(&chunk_header_buffer, "{x}\r\n", .{byte_len}) catch break;
+        stream.writeAll(chunk_header) catch break;
+        stream.writeAll(byte_buffer[0..byte_len]) catch break;
+        stream.writeAll("\r\n") catch break;
+    }
+    stream.writeAll("0\r\n\r\n") catch {};
+}
+
 fn collectDesiredOutputs(
     allocator: std.mem.Allocator,
     state_store: *const StateStore,
     pulse_snapshot: pulse.PulseSnapshot,
-    desired_output_buses: *std.ArrayList(OutputExposureManager.DesiredOutputBus),
     desired_bus_destination_loopbacks: *std.ArrayList(OutputExposureManager.DesiredBusDestinationLoopback),
-    desired_routes: *std.ArrayList(OutputExposureManager.DesiredWebRoute),
     desired_mics: *std.ArrayList(OutputExposureManager.DesiredVirtualMic),
 ) !void {
-    var used_paths = std.StringHashMap(void).init(allocator);
-    defer used_paths.deinit();
-
     for (state_store.buses.items) |bus| {
         if (bus.hidden or bus.role == .input_stage) continue;
-        try desired_output_buses.append(allocator, .{
-            .bus_id = bus.id,
-            .bus_label = bus.label,
-        });
+        const target_summary = summarizeBusTargets(state_store, pulse_snapshot, bus);
 
-        const sink_name = try allocSafeName(allocator, output_sink_prefix, bus.id);
-        defer allocator.free(sink_name);
-        const monitor_source_name = try std.fmt.allocPrint(allocator, "{s}.monitor", .{sink_name});
-        errdefer allocator.free(monitor_source_name);
+        if (target_summary.needsVirtualBus(bus)) {
+            for (state_store.bus_destinations.items) |bus_destination| {
+                if (!bus_destination.enabled) continue;
+                if (!std.mem.eql(u8, bus_destination.bus_id, bus.id)) continue;
 
-        for (state_store.bus_destinations.items) |bus_destination| {
-            if (!bus_destination.enabled) continue;
-            if (!std.mem.eql(u8, bus_destination.bus_id, bus.id)) continue;
-            const destination = findDestination(state_store.destinations.items, bus_destination.destination_id) orelse continue;
-            const sink = resolvePulseSinkForDestination(pulse_snapshot, destination) orelse continue;
-            const target_sink_name = sink.name orelse continue;
-            try desired_bus_destination_loopbacks.append(allocator, .{
-                .bus_id = bus.id,
-                .sink_name = try allocator.dupe(u8, sink_name),
-                .target_sink_name = try allocator.dupe(u8, target_sink_name),
-            });
-        }
-
-        if (bus.expose_on_web) {
-            const route_path = try uniqueRoutePath(allocator, &used_paths, bus.label, bus.id);
-            errdefer allocator.free(route_path);
-            try desired_routes.append(allocator, .{
-                .bus_id = bus.id,
-                .label = bus.label,
-                .path = route_path,
-                .monitor_source_name = try allocator.dupe(u8, monitor_source_name),
-            });
+                const destination = findDestination(state_store.destinations.items, bus_destination.destination_id) orelse continue;
+                const sink = resolvePulseSinkForDestination(pulse_snapshot, destination) orelse continue;
+                const sink_name = sink.name orelse continue;
+                try desired_bus_destination_loopbacks.append(allocator, .{
+                    .bus_id = bus.id,
+                    .target_sink_name = try allocator.dupe(u8, sink_name),
+                });
+            }
         }
 
         if (bus.expose_as_microphone) {
             try desired_mics.append(allocator, .{
                 .bus_id = bus.id,
                 .bus_label = bus.label,
-                .target_monitor_source_name = try allocator.dupe(u8, monitor_source_name),
             });
         }
+    }
+}
 
-        allocator.free(monitor_source_name);
+pub fn summarizeBusTargets(
+    state_store: *const StateStore,
+    pulse_snapshot: pulse.PulseSnapshot,
+    bus: buses_mod.Bus,
+) BusTargetSummary {
+    var summary = BusTargetSummary{};
+
+    for (state_store.bus_destinations.items) |bus_destination| {
+        if (!bus_destination.enabled) continue;
+        if (!std.mem.eql(u8, bus_destination.bus_id, bus.id)) continue;
+
+        const destination = findDestination(state_store.destinations.items, bus_destination.destination_id) orelse continue;
+        const sink = resolvePulseSinkForDestination(pulse_snapshot, destination) orelse continue;
+
+        if (summary.single_sink) |existing| {
+            if (existing.index == sink.index) continue;
+        }
+
+        summary.count += 1;
+        summary.single_sink = sink;
+        if (summary.count > 1) {
+            summary.single_sink = null;
+            break;
+        }
+    }
+
+    return summary;
+}
+
+fn computeExposurePlanSignature(state_store: *const StateStore, pulse_snapshot: pulse.PulseSnapshot) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    for (state_store.buses.items) |bus| {
+        const summary = summarizeBusTargets(state_store, pulse_snapshot, bus);
+        hasher.update(bus.id);
+        hasher.update(std.mem.asBytes(&bus.share_on_network));
+        hasher.update(std.mem.asBytes(&bus.expose_as_microphone));
+        hasher.update(std.mem.asBytes(&summary.count));
+        if (summary.single_sink) |sink| hasher.update(std.mem.asBytes(&sink.index));
+    }
+    return hasher.final();
+}
+
+fn logExposurePlan(state_store: *const StateStore, pulse_snapshot: pulse.PulseSnapshot) void {
+    for (state_store.buses.items) |bus| {
+        const summary = summarizeBusTargets(state_store, pulse_snapshot, bus);
+        if (summary.needsVirtualBus(bus) or bus.share_on_network or bus.expose_as_microphone) {
+            std.log.info(
+                "routing bus {s}: internal route targets={d} network={any} mic={any}",
+                .{ bus.id, summary.count, bus.share_on_network, bus.expose_as_microphone },
+            );
+            continue;
+        }
+
+        std.log.info("routing bus {s}: no resolved sink targets", .{bus.id});
     }
 }
 
@@ -1059,51 +1168,72 @@ fn loadOutputBus(
     desired: OutputExposureManager.DesiredOutputBus,
     pulsectx: *pulse.PulseContext,
 ) !OutputExposureManager.ManagedOutputBus {
-    const sink_name = try allocSafeName(manager.allocator, output_sink_prefix, desired.bus_id);
-    errdefer manager.allocator.free(sink_name);
+    _ = pulsectx;
+    const engine = manager.engine orelse return error.AudioEngineUnavailable;
+    const source_name = try allocSafeName(manager.allocator, output_sink_prefix, desired.bus_id);
+    errdefer manager.allocator.free(source_name);
 
     const escaped_label = try escapePactlValue(manager.allocator, desired.bus_label);
     defer manager.allocator.free(escaped_label);
     const description = try std.fmt.allocPrint(manager.allocator, "{s}{s}", .{ output_description_prefix, escaped_label });
     defer manager.allocator.free(description);
 
-    const sink_props = try std.fmt.allocPrint(
+    const source = try virtual_mic_source_mod.VirtualMicSource.init(
         manager.allocator,
-        "\"device.description='{s}' node.description='{s}' node.virtual=true node.hidden=true device.class=filter media.class=Audio/Sink\"",
-        .{ description, description },
+        engine,
+        desired.bus_id,
+        source_name,
+        description,
     );
-    defer manager.allocator.free(sink_props);
-    const sink_args = try std.fmt.allocPrint(manager.allocator, "sink_name={s} sink_properties={s} rate=48000 channels=2", .{ sink_name, sink_props });
-    defer manager.allocator.free(sink_args);
-    const module_id = try pulsectx.loadModule("module-null-sink", sink_args);
+    std.log.info("output exposure: created bus source {s} for bus {s}", .{
+        source_name,
+        desired.bus_id,
+    });
 
     return .{
         .bus_id = try manager.allocator.dupe(u8, desired.bus_id),
-        .sink_name = sink_name,
-        .module_id = module_id,
+        .bus_label = try manager.allocator.dupe(u8, desired.bus_label),
+        .source_name = source_name,
+        .source = source,
     };
 }
 
 fn loadBusDestinationLoopback(
     manager: *OutputExposureManager,
     desired: OutputExposureManager.DesiredBusDestinationLoopback,
-    pulsectx: *pulse.PulseContext,
 ) !OutputExposureManager.ManagedBusDestinationLoopback {
-    const source_name = try std.fmt.allocPrint(manager.allocator, "{s}.monitor", .{desired.sink_name});
-    defer manager.allocator.free(source_name);
-    const loopback_args = try std.fmt.allocPrint(
+    const engine = manager.engine orelse return error.AudioEngineUnavailable;
+    const consumer_id = try std.fmt.allocPrint(
         manager.allocator,
-        "source={s} sink={s} source_dont_move=true sink_dont_move=true latency_msec=10 adjust_time=0",
-        .{ source_name, desired.target_sink_name },
+        "wiredeck_busplay_{s}_{d}",
+        .{ desired.bus_id, std.hash.Wyhash.hash(0, desired.target_sink_name) },
     );
-    defer manager.allocator.free(loopback_args);
-    const module_id = try pulsectx.loadModule("module-loopback", loopback_args);
+    errdefer manager.allocator.free(consumer_id);
+    const description = try std.fmt.allocPrint(
+        manager.allocator,
+        "WireDeck Bus {s} -> {s}",
+        .{ desired.bus_id, desired.target_sink_name },
+    );
+    defer manager.allocator.free(description);
+    const stream = try bus_playback_mod.BusPlayback.init(
+        manager.allocator,
+        engine,
+        desired.bus_id,
+        consumer_id,
+        desired.target_sink_name,
+        description,
+    );
+    std.log.info("output exposure: created bus playback {s} for bus {s} -> {s}", .{
+        consumer_id,
+        desired.bus_id,
+        desired.target_sink_name,
+    });
 
     return .{
         .bus_id = try manager.allocator.dupe(u8, desired.bus_id),
-        .sink_name = try manager.allocator.dupe(u8, desired.sink_name),
         .target_sink_name = try manager.allocator.dupe(u8, desired.target_sink_name),
-        .module_id = module_id,
+        .consumer_id = consumer_id,
+        .stream = stream,
     };
 }
 
@@ -1112,8 +1242,8 @@ fn loadVirtualMic(
     desired: OutputExposureManager.DesiredVirtualMic,
     pulsectx: *pulse.PulseContext,
 ) !OutputExposureManager.ManagedVirtualMic {
-    const sink_name = try allocSafeName(manager.allocator, null_sink_prefix, desired.bus_id);
-    errdefer manager.allocator.free(sink_name);
+    _ = pulsectx;
+    const engine = manager.engine orelse return error.AudioEngineUnavailable;
     const source_name = try allocSafeName(manager.allocator, remap_source_prefix, desired.bus_id);
     errdefer manager.allocator.free(source_name);
 
@@ -1122,49 +1252,19 @@ fn loadVirtualMic(
     const description = try std.fmt.allocPrint(manager.allocator, "{s}{s}", .{ mic_description_prefix, escaped_label });
     defer manager.allocator.free(description);
 
-    const sink_props = try std.fmt.allocPrint(
+    const source = try virtual_mic_source_mod.VirtualMicSource.init(
         manager.allocator,
-        "\"device.description='{s}' node.description='{s}' node.virtual=true node.hidden=true device.class=filter media.class=Audio/Sink\"",
-        .{ description, description },
+        engine,
+        desired.bus_id,
+        source_name,
+        description,
     );
-    defer manager.allocator.free(sink_props);
-    const sink_args = try std.fmt.allocPrint(manager.allocator, "sink_name={s} sink_properties={s}", .{ sink_name, sink_props });
-    defer manager.allocator.free(sink_args);
-    const sink_module_id = try pulsectx.loadModule("module-null-sink", sink_args);
-    errdefer pulsectx.unloadModule(sink_module_id) catch {};
-
-    const source_props = try std.fmt.allocPrint(
-        manager.allocator,
-        "\"device.description='{s}' node.description='{s}' device.class=filter media.class=Audio/Source\"",
-        .{ description, description },
-    );
-    defer manager.allocator.free(source_props);
-    const remap_args = try std.fmt.allocPrint(
-        manager.allocator,
-        "source_name={s} master={s} source_properties={s}",
-        .{ source_name, desired.target_monitor_source_name, source_props },
-    );
-    defer manager.allocator.free(remap_args);
-    const remap_source_module_id = try pulsectx.loadModule("module-remap-source", remap_args);
-    errdefer pulsectx.unloadModule(remap_source_module_id) catch {};
-
-    const loopback_args = try std.fmt.allocPrint(
-        manager.allocator,
-        "source={s} sink={s} source_dont_move=true sink_dont_move=true",
-        .{ desired.target_monitor_source_name, sink_name },
-    );
-    defer manager.allocator.free(loopback_args);
-    const loopback_module_id = try pulsectx.loadModule("module-loopback", loopback_args);
-    errdefer pulsectx.unloadModule(loopback_module_id) catch {};
 
     return .{
         .bus_id = try manager.allocator.dupe(u8, desired.bus_id),
-        .target_monitor_source_name = try manager.allocator.dupe(u8, desired.target_monitor_source_name),
-        .sink_name = sink_name,
+        .bus_label = try manager.allocator.dupe(u8, desired.bus_label),
         .source_name = source_name,
-        .sink_module_id = sink_module_id,
-        .remap_source_module_id = remap_source_module_id,
-        .loopback_module_id = loopback_module_id,
+        .source = source,
     };
 }
 
@@ -1174,9 +1274,18 @@ fn unloadVirtualMic(
     pulsectx: *pulse.PulseContext,
 ) !void {
     _ = manager;
-    pulsectx.unloadModule(mic.loopback_module_id) catch {};
-    pulsectx.unloadModule(mic.remap_source_module_id) catch {};
-    pulsectx.unloadModule(mic.sink_module_id) catch {};
+    _ = pulsectx;
+    mic.source.deinit();
+}
+
+fn unloadOutputBus(
+    manager: *OutputExposureManager,
+    bus: OutputExposureManager.ManagedOutputBus,
+    pulsectx: *pulse.PulseContext,
+) !void {
+    _ = manager;
+    _ = pulsectx;
+    bus.source.deinit();
 }
 
 fn allocSafeName(allocator: std.mem.Allocator, prefix: []const u8, id: []const u8) ![]u8 {

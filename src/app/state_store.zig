@@ -6,6 +6,7 @@ const channel_sources_mod = @import("../core/audio/channel_sources.zig");
 const destinations_mod = @import("../core/audio/destinations.zig");
 const bus_destinations_mod = @import("../core/audio/bus_destinations.zig");
 const sends_mod = @import("../core/audio/sends.zig");
+const network_mod = @import("../core/audio/network.zig");
 const plugins_mod = @import("../plugins/chain.zig");
 const plugin_host_mod = @import("../plugins/host.zig");
 
@@ -23,6 +24,7 @@ pub const StateStore = struct {
     allocator: std.mem.Allocator,
     active_profile: []const u8,
     active_profile_owned: bool,
+    network_audio: network_mod.NetworkAudioSettings,
     channel_feed: ChannelFeed,
     destination_feed: DestinationFeed,
     channels: std.ArrayList(channels_mod.Channel),
@@ -41,6 +43,7 @@ pub const StateStore = struct {
             .allocator = allocator,
             .active_profile = "Default",
             .active_profile_owned = false,
+            .network_audio = .{ .enabled = true },
             .channel_feed = .bootstrap,
             .destination_feed = .unavailable,
             .channels = .empty,
@@ -118,7 +121,7 @@ pub const StateStore = struct {
             .volume = bus.volume,
             .muted = bus.muted,
             .expose_as_microphone = bus.expose_as_microphone,
-            .expose_on_web = bus.expose_on_web,
+            .share_on_network = bus.share_on_network,
         });
     }
 

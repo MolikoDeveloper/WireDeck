@@ -175,6 +175,29 @@ case "$command_name" in
     test)
         zig build $zig_args test "$@"
         ;;
+    client)
+        client_mode="build"
+        if [ "$#" -gt 0 ] && [ "$1" = "run" ]; then
+            client_mode="run"
+            shift
+        elif [ "$#" -gt 0 ] && [ "$1" = "build" ]; then
+            shift
+        fi
+
+        case "$client_mode" in
+            build)
+                zig build $zig_args client "$@"
+                ;;
+            run)
+                zig build $zig_args client
+                exec "$ROOT_DIR/zig-out/bin/wiredeck-client" "$@"
+                ;;
+            *)
+                echo "Unknown client mode: $client_mode" >&2
+                exit 1
+                ;;
+        esac
+        ;;
     *)
         echo "Unknown command: $command_name" >&2
         exit 1

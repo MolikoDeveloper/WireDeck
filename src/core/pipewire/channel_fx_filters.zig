@@ -1,8 +1,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
-const channel_sources_mod = @import("../audio/channel_sources.zig");
+const audio_engine_mod = @import("../audio/engine.zig");
 const channels_mod = @import("../audio/channels.zig");
-const sources_mod = @import("../audio/sources.zig");
 const fx_runtime_mod = @import("../../plugins/fx_runtime.zig");
 
 const c = @cImport({
@@ -17,12 +16,22 @@ const c = @cImport({
 });
 
 const input_prefix = "wiredeck_input_";
-const fx_prefix = "wiredeck_fx_";
 const thread_name = "wiredeck-fx";
 const max_block_frames: u32 = 4096;
 const dsp_format = "32 bit float mono audio";
 const node_interface_type = "PipeWire:Interface:Node";
 const port_interface_type = "PipeWire:Interface:Port";
+const filter_node_latency = "128/48000";
+const process_diag_log_interval_ns: i128 = 5 * std.time.ns_per_s;
+const callback_jitter_warn_threshold_ns: i128 = 8 * std.time.ns_per_ms;
+const ansi_red = "\x1b[31m";
+const ansi_reset = "\x1b[0m";
+
+pub const InputPortKind = enum(u8) {
+    monitor,
+    capture,
+    output,
+};
 
 pub const ChannelFxFilterManager = struct {
     const RegistryNode = struct {
@@ -46,8 +55,23 @@ pub const ChannelFxFilterManager = struct {
     };
 
     const ManagedFilter = struct {
+        const OutputTarget = struct {
+            name_z: [:0]u8,
+            left_link: LinkProxy = .{},
+            right_link: LinkProxy = .{},
+
+            fn deinit(self: *OutputTarget, allocator: std.mem.Allocator) void {
+                destroyLinkProxy(&self.left_link);
+                destroyLinkProxy(&self.right_link);
+                allocator.free(self.name_z);
+            }
+        };
+
         manager: *ChannelFxFilterManager,
+        engine: *audio_engine_mod.AudioEngine,
         runtime: *fx_runtime_mod.FxRuntime,
+        requires_external_capture: bool,
+        input_port_kind: InputPortKind,
         thread_loop: *c.struct_pw_thread_loop,
         filter: ?*c.struct_pw_filter = null,
         listener: c.struct_spa_hook = std.mem.zeroes(c.struct_spa_hook),
@@ -55,19 +79,24 @@ pub const ChannelFxFilterManager = struct {
         registry_listener: c.struct_spa_hook = std.mem.zeroes(c.struct_spa_hook),
         channel_id: []u8,
         name_z: [:0]u8,
-        raw_monitor_z: [:0]u8,
-        processed_sink_z: [:0]u8,
+        input_target_z: ?[:0]u8 = null,
+        input_target_node_id: ?u32 = null,
+        output_targets: std.ArrayList(OutputTarget),
         registry_nodes: std.ArrayList(RegistryNode),
         registry_ports: std.ArrayList(RegistryPort),
         ports_linked: bool = false,
         link_in_left: LinkProxy = .{},
         link_in_right: LinkProxy = .{},
-        link_out_left: LinkProxy = .{},
-        link_out_right: LinkProxy = .{},
         in_left: ?*anyopaque = null,
         in_right: ?*anyopaque = null,
         out_left: ?*anyopaque = null,
         out_right: ?*anyopaque = null,
+        last_process_frames: u32 = 0,
+        last_process_sample_rate_hz: u32 = 0,
+        last_process_cycle_token: u64 = 0,
+        last_process_started_ns: i128 = 0,
+        last_process_log_ns: i128 = 0,
+        last_input_signal_present: bool = false,
 
         fn deinit(self: *ManagedFilter, allocator: std.mem.Allocator) void {
             cleanupManagedFilter(self, allocator, true);
@@ -78,8 +107,7 @@ pub const ChannelFxFilterManager = struct {
         c.pw_thread_loop_lock(filter.thread_loop);
         destroyLinkProxy(&filter.link_in_left);
         destroyLinkProxy(&filter.link_in_right);
-        destroyLinkProxy(&filter.link_out_left);
-        destroyLinkProxy(&filter.link_out_right);
+        for (filter.output_targets.items) |*output_target| output_target.deinit(allocator);
         c.spa_hook_remove(&filter.registry_listener);
         c.spa_hook_remove(&filter.listener);
         if (filter.registry) |registry| {
@@ -92,21 +120,20 @@ pub const ChannelFxFilterManager = struct {
             filter.filter = null;
         }
         c.pw_thread_loop_unlock(filter.thread_loop);
-        c.pw_thread_loop_stop(filter.thread_loop);
-        c.pw_thread_loop_destroy(filter.thread_loop);
         for (filter.registry_nodes.items) |node| allocator.free(node.name);
         filter.registry_nodes.deinit(allocator);
         for (filter.registry_ports.items) |port| allocator.free(port.name);
         filter.registry_ports.deinit(allocator);
         allocator.free(filter.channel_id);
         allocator.free(filter.name_z);
-        allocator.free(filter.raw_monitor_z);
-        allocator.free(filter.processed_sink_z);
+        if (filter.input_target_z) |value| allocator.free(value);
+        filter.output_targets.deinit(allocator);
         if (destroy_self) allocator.destroy(filter);
     }
 
     allocator: std.mem.Allocator,
     filters: std.ArrayList(*ManagedFilter),
+    thread_loop: ?*c.struct_pw_thread_loop = null,
     last_signature: u64 = 0,
     host_available: bool = true,
     pipewire_initialized: bool = false,
@@ -121,6 +148,7 @@ pub const ChannelFxFilterManager = struct {
     pub fn deinit(self: *ChannelFxFilterManager) void {
         for (self.filters.items) |filter| filter.deinit(self.allocator);
         self.filters.deinit(self.allocator);
+        self.destroyThreadLoop();
         if (self.pipewire_initialized) c.pw_deinit();
     }
 
@@ -135,13 +163,23 @@ pub const ChannelFxFilterManager = struct {
         self.host_available = true;
     }
 
+    pub fn routeReady(self: *const ChannelFxFilterManager, channel_id: []const u8) bool {
+        const thread_loop = self.thread_loop orelse {
+            const filter = findFilter(self.filters.items, channel_id) orelse return false;
+            return filter.ports_linked and filterLinksHealthy(filter);
+        };
+        c.pw_thread_loop_lock(thread_loop);
+        defer c.pw_thread_loop_unlock(thread_loop);
+        const filter = findFilter(self.filters.items, channel_id) orelse return false;
+        return filter.ports_linked and filterLinksHealthy(filter);
+    }
+
     pub fn sync(
         self: *ChannelFxFilterManager,
+        engine: *audio_engine_mod.AudioEngine,
         runtime: *fx_runtime_mod.FxRuntime,
         channels: []const channels_mod.Channel,
-        sources: []const sources_mod.Source,
-        channel_sources: []const channel_sources_mod.ChannelSource,
-        fx_channels: []const channels_mod.Channel,
+        route_specs: []const RouteSpec,
     ) !void {
         if (builtin.is_test or !self.host_available) return;
         if (!self.pipewire_initialized) {
@@ -149,29 +187,35 @@ pub const ChannelFxFilterManager = struct {
             self.pipewire_initialized = true;
         }
 
-        const signature = computeSignature(channels, sources, channel_sources, fx_channels);
+        const signature = computeSignature(channels, route_specs);
         if (signature == self.last_signature) {
             try self.ensurePortLinks();
             return;
         }
 
-        var desired = std.ArrayList(RouteSpec).empty;
-        defer desired.deinit(self.allocator);
-        try buildDesired(self.allocator, &desired, channels, sources, channel_sources, fx_channels);
-
         var index = self.filters.items.len;
         while (index > 0) {
             index -= 1;
             const filter = self.filters.items[index];
-            if (!containsSpec(desired.items, filter.channel_id)) {
+            const desired_spec = findSpec(route_specs, filter.channel_id);
+            if (desired_spec == null or !sameRouteSpec(filter, desired_spec.?)) {
+                std.log.info(
+                    "routing fx filter recreate: channel={s} old_input={s}:{s} old_node_id={any}",
+                    .{
+                        filter.channel_id,
+                        @tagName(filter.input_port_kind),
+                        if (filter.input_target_z) |value| value else "(none)",
+                        filter.input_target_node_id,
+                    },
+                );
                 const removed = self.filters.orderedRemove(index);
                 removed.deinit(self.allocator);
             }
         }
 
-        for (desired.items) |spec| {
+        for (route_specs) |spec| {
             if (findFilter(self.filters.items, spec.channel_id) != null) continue;
-            const filter = self.createFilter(runtime, spec) catch |err| {
+            const filter = self.createFilter(engine, runtime, spec) catch |err| {
                 self.host_available = false;
                 return err;
             };
@@ -179,10 +223,16 @@ pub const ChannelFxFilterManager = struct {
         }
 
         try self.ensurePortLinks();
+        logRouteSpecs(route_specs);
         self.last_signature = signature;
     }
 
-    fn createFilter(self: *ChannelFxFilterManager, runtime: *fx_runtime_mod.FxRuntime, spec: RouteSpec) !*ManagedFilter {
+    fn createFilter(
+        self: *ChannelFxFilterManager,
+        engine: *audio_engine_mod.AudioEngine,
+        runtime: *fx_runtime_mod.FxRuntime,
+        spec: RouteSpec,
+    ) !*ManagedFilter {
         const managed = try self.allocator.create(ManagedFilter);
         errdefer self.allocator.destroy(managed);
 
@@ -190,31 +240,41 @@ pub const ChannelFxFilterManager = struct {
         defer self.allocator.free(filter_name);
         const filter_name_z = try self.allocator.dupeZ(u8, filter_name);
         errdefer self.allocator.free(filter_name_z);
-        const raw_input_sink = try allocInputSinkName(self.allocator, spec.channel_id);
-        defer self.allocator.free(raw_input_sink);
-        const raw_input_sink_z = try self.allocator.dupeZ(u8, raw_input_sink);
-        errdefer self.allocator.free(raw_input_sink_z);
-        const processed_sink = try allocProcessedSinkName(self.allocator, spec.channel_id);
-        defer self.allocator.free(processed_sink);
-        const processed_sink_z = try self.allocator.dupeZ(u8, processed_sink);
-        errdefer self.allocator.free(processed_sink_z);
 
-        const thread_loop = c.pw_thread_loop_new(thread_name, null) orelse return error.PipeWireThreadLoopFailed;
-        errdefer c.pw_thread_loop_destroy(thread_loop);
-        if (c.pw_thread_loop_start(thread_loop) < 0) return error.PipeWireThreadLoopFailed;
+        const input_target_z = if (spec.input_target_name) |input_target_name|
+            try self.allocator.dupeZ(u8, input_target_name)
+        else if (spec.requires_external_capture) blk: {
+            const raw_input_sink = try allocInputSinkName(self.allocator, spec.channel_id);
+            defer self.allocator.free(raw_input_sink);
+            break :blk try self.allocator.dupeZ(u8, raw_input_sink);
+        } else null;
+        errdefer if (input_target_z) |value| self.allocator.free(value);
+
+        var output_targets = std.ArrayList(ManagedFilter.OutputTarget).empty;
         errdefer {
-            c.pw_thread_loop_stop(thread_loop);
-            c.pw_thread_loop_destroy(thread_loop);
+            for (output_targets.items) |*output_target| output_target.deinit(self.allocator);
+            output_targets.deinit(self.allocator);
         }
+        for (spec.output_target_names) |output_target_name| {
+            try output_targets.append(self.allocator, .{
+                .name_z = try self.allocator.dupeZ(u8, output_target_name),
+            });
+        }
+
+        const thread_loop = try self.ensureThreadLoop();
 
         managed.* = .{
             .manager = self,
+            .engine = engine,
             .runtime = runtime,
+            .requires_external_capture = spec.requires_external_capture,
+            .input_port_kind = spec.input_port_kind,
             .thread_loop = thread_loop,
             .channel_id = try self.allocator.dupe(u8, spec.channel_id),
             .name_z = filter_name_z,
-            .raw_monitor_z = raw_input_sink_z,
-            .processed_sink_z = processed_sink_z,
+            .input_target_z = input_target_z,
+            .input_target_node_id = spec.input_target_node_id,
+            .output_targets = output_targets,
             .registry_nodes = .empty,
             .registry_ports = .empty,
         };
@@ -247,10 +307,13 @@ pub const ChannelFxFilterManager = struct {
         managed.filter = filter;
         c.pw_filter_add_listener(filter, &managed.listener, &events, managed);
 
-        managed.in_left = addPort(filter, c.PW_DIRECTION_INPUT, managed.raw_monitor_z.ptr, "in-L");
-        managed.in_right = addPort(filter, c.PW_DIRECTION_INPUT, managed.raw_monitor_z.ptr, "in-R");
-        managed.out_left = addPort(filter, c.PW_DIRECTION_OUTPUT, managed.processed_sink_z.ptr, "out-L");
-        managed.out_right = addPort(filter, c.PW_DIRECTION_OUTPUT, managed.processed_sink_z.ptr, "out-R");
+        managed.in_left = addPort(filter, c.PW_DIRECTION_INPUT, if (managed.input_target_z) |value| value.ptr else null, "in-L");
+        managed.in_right = addPort(filter, c.PW_DIRECTION_INPUT, if (managed.input_target_z) |value| value.ptr else null, "in-R");
+        managed.out_left = addPort(filter, c.PW_DIRECTION_OUTPUT, null, "out-L");
+        managed.out_right = addPort(filter, c.PW_DIRECTION_OUTPUT, null, "out-R");
+        if (managed.in_left == null or managed.in_right == null or managed.out_left == null or managed.out_right == null) {
+            return error.PipeWireFilterPortCreateFailed;
+        }
 
         if (c.pw_filter_connect(filter, c.PW_FILTER_FLAG_RT_PROCESS, null, 0) < 0) return error.PipeWireFilterConnectFailed;
         const core = c.pw_filter_get_core(filter) orelse return error.PipeWireCoreUnavailable;
@@ -258,13 +321,50 @@ pub const ChannelFxFilterManager = struct {
         managed.registry = registry;
         _ = c.pw_registry_add_listener(registry, &managed.registry_listener, &registry_events, managed);
         _ = c.pw_filter_set_active(filter, true);
+        std.log.info(
+            "routing fx filter created: channel={s} input={s}:{s} node_id={any} outputs={d}",
+            .{
+                managed.channel_id,
+                @tagName(spec.input_port_kind),
+                spec.input_target_name orelse "(none)",
+                spec.input_target_node_id,
+                spec.output_target_names.len,
+            },
+        );
         return managed;
     }
 
     fn ensurePortLinks(self: *ChannelFxFilterManager) !void {
         for (self.filters.items) |filter| {
             if (filter.ports_linked) continue;
-            filter.ports_linked = try self.tryConnectFilterPorts(filter);
+            const linked = try self.tryConnectFilterPorts(filter);
+            if (linked and !filter.ports_linked) {
+                std.log.info("routing fx links ready: channel={s}", .{filter.channel_id});
+            }
+            filter.ports_linked = linked;
+        }
+    }
+
+    fn ensureThreadLoop(self: *ChannelFxFilterManager) !*c.struct_pw_thread_loop {
+        if (self.thread_loop) |thread_loop| return thread_loop;
+        const thread_loop = c.pw_thread_loop_new(thread_name, null) orelse return error.PipeWireThreadLoopFailed;
+        errdefer c.pw_thread_loop_destroy(thread_loop);
+        if (c.pw_thread_loop_start(thread_loop) < 0) return error.PipeWireThreadLoopFailed;
+        self.thread_loop = thread_loop;
+        return thread_loop;
+    }
+
+    fn destroyThreadLoop(self: *ChannelFxFilterManager) void {
+        if (self.thread_loop) |thread_loop| {
+            c.pw_thread_loop_stop(thread_loop);
+            c.pw_thread_loop_destroy(thread_loop);
+            self.thread_loop = null;
+        }
+    }
+
+    fn refreshLinkProxy(link: *ChannelFxFilterManager.LinkProxy) void {
+        if (link.proxy != null and !link.bound) {
+            destroyLinkProxy(link);
         }
     }
 
@@ -273,79 +373,100 @@ pub const ChannelFxFilterManager = struct {
         c.pw_thread_loop_lock(filter.thread_loop);
         defer c.pw_thread_loop_unlock(filter.thread_loop);
 
-        const raw_node_id = findNodeId(filter.registry_nodes.items, filter.raw_monitor_z) orelse return false;
         const filter_node_id = findNodeId(filter.registry_nodes.items, filter.name_z) orelse return false;
-        const processed_node_id = findNodeId(filter.registry_nodes.items, filter.processed_sink_z) orelse return false;
 
-        const input_left = findPortId(filter.registry_ports.items, raw_node_id, "monitor_FL") orelse return false;
-        const input_right = findPortId(filter.registry_ports.items, raw_node_id, "monitor_FR") orelse return false;
         const filter_in_left = findPortId(filter.registry_ports.items, filter_node_id, "in-L") orelse return false;
         const filter_in_right = findPortId(filter.registry_ports.items, filter_node_id, "in-R") orelse return false;
         const filter_out_left = findPortId(filter.registry_ports.items, filter_node_id, "out-L") orelse return false;
         const filter_out_right = findPortId(filter.registry_ports.items, filter_node_id, "out-R") orelse return false;
-        const processed_left = findPortId(filter.registry_ports.items, processed_node_id, "playback_FL") orelse return false;
-        const processed_right = findPortId(filter.registry_ports.items, processed_node_id, "playback_FR") orelse return false;
 
-        if (filter.link_in_left.proxy == null and !filter.link_in_left.failed) {
-            filter.link_in_left.role = "input-left";
-            filter.link_in_left.channel_id = filter.channel_id;
-            createLinkProxy(filter, &filter.link_in_left, raw_node_id, input_left, filter_node_id, filter_in_left) catch {
-                filter.link_in_left.failed = true;
+        if (filter.input_target_z) |input_target_z| {
+            const input_node_id = if (filter.input_target_node_id) |node_id|
+                node_id
+            else
+                findNodeId(filter.registry_nodes.items, input_target_z) orelse return false;
+            const input_left_name = switch (filter.input_port_kind) {
+                .monitor => "monitor_FL",
+                .capture => "capture_FL",
+                .output => "output_FL",
             };
+            const input_right_name = switch (filter.input_port_kind) {
+                .monitor => "monitor_FR",
+                .capture => "capture_FR",
+                .output => "output_FR",
+            };
+            const input_left = findPortId(filter.registry_ports.items, input_node_id, input_left_name) orelse return false;
+            const input_right = findPortId(filter.registry_ports.items, input_node_id, input_right_name) orelse return false;
+
+            refreshLinkProxy(&filter.link_in_left);
+            refreshLinkProxy(&filter.link_in_right);
+            if (filter.link_in_left.proxy == null and !filter.link_in_left.failed) {
+                filter.link_in_left.role = "input-left";
+                filter.link_in_left.channel_id = filter.channel_id;
+                createLinkProxy(filter, &filter.link_in_left, input_node_id, input_left, filter_node_id, filter_in_left) catch {
+                    filter.link_in_left.failed = true;
+                };
+            }
+            if (filter.link_in_right.proxy == null and !filter.link_in_right.failed) {
+                filter.link_in_right.role = "input-right";
+                filter.link_in_right.channel_id = filter.channel_id;
+                createLinkProxy(filter, &filter.link_in_right, input_node_id, input_right, filter_node_id, filter_in_right) catch {
+                    filter.link_in_right.failed = true;
+                };
+            }
+        } else {
+            filter.link_in_left.bound = true;
+            filter.link_in_right.bound = true;
+            filter.link_in_left.failed = false;
+            filter.link_in_right.failed = false;
         }
-        if (filter.link_in_right.proxy == null and !filter.link_in_right.failed) {
-            filter.link_in_right.role = "input-right";
-            filter.link_in_right.channel_id = filter.channel_id;
-            createLinkProxy(filter, &filter.link_in_right, raw_node_id, input_right, filter_node_id, filter_in_right) catch {
-                filter.link_in_right.failed = true;
-            };
+
+        for (filter.output_targets.items) |*output_target| {
+            const output_node_id = findNodeId(filter.registry_nodes.items, output_target.name_z) orelse return false;
+            const output_left = findPortId(filter.registry_ports.items, output_node_id, "playback_FL") orelse return false;
+            const output_right = findPortId(filter.registry_ports.items, output_node_id, "playback_FR") orelse return false;
+
+            refreshLinkProxy(&output_target.left_link);
+            refreshLinkProxy(&output_target.right_link);
+            if (output_target.left_link.proxy == null and !output_target.left_link.failed) {
+                output_target.left_link.role = "output-left";
+                output_target.left_link.channel_id = filter.channel_id;
+                createLinkProxy(filter, &output_target.left_link, filter_node_id, filter_out_left, output_node_id, output_left) catch {
+                    output_target.left_link.failed = true;
+                };
+            }
+            if (output_target.right_link.proxy == null and !output_target.right_link.failed) {
+                output_target.right_link.role = "output-right";
+                output_target.right_link.channel_id = filter.channel_id;
+                createLinkProxy(filter, &output_target.right_link, filter_node_id, filter_out_right, output_node_id, output_right) catch {
+                    output_target.right_link.failed = true;
+                };
+            }
         }
-        if (filter.link_out_left.proxy == null and !filter.link_out_left.failed) {
-            filter.link_out_left.role = "output-left";
-            filter.link_out_left.channel_id = filter.channel_id;
-            createLinkProxy(filter, &filter.link_out_left, filter_node_id, filter_out_left, processed_node_id, processed_left) catch {
-                filter.link_out_left.failed = true;
-            };
-        }
-        if (filter.link_out_right.proxy == null and !filter.link_out_right.failed) {
-            filter.link_out_right.role = "output-right";
-            filter.link_out_right.channel_id = filter.channel_id;
-            createLinkProxy(filter, &filter.link_out_right, filter_node_id, filter_out_right, processed_node_id, processed_right) catch {
-                filter.link_out_right.failed = true;
-            };
+
+        var outputs_ready = true;
+        for (filter.output_targets.items) |output_target| {
+            outputs_ready = outputs_ready and output_target.left_link.bound and output_target.right_link.bound;
         }
 
         return filter.link_in_left.bound and
             filter.link_in_right.bound and
-            filter.link_out_left.bound and
-            filter.link_out_right.bound;
+            outputs_ready;
     }
 };
 
-const RouteSpec = struct {
+pub const RouteSpec = struct {
     channel_id: []const u8,
+    requires_external_capture: bool,
+    input_target_name: ?[]const u8 = null,
+    input_target_node_id: ?u32 = null,
+    input_port_kind: InputPortKind = .monitor,
+    output_target_names: []const []const u8 = &.{},
 };
-
-fn buildDesired(
-    allocator: std.mem.Allocator,
-    desired: *std.ArrayList(RouteSpec),
-    channels: []const channels_mod.Channel,
-    sources: []const sources_mod.Source,
-    channel_sources: []const channel_sources_mod.ChannelSource,
-    fx_channels: []const channels_mod.Channel,
-) !void {
-    for (fx_channels) |channel| {
-        _ = findChannel(channels, channel.id) orelse continue;
-        if (!channelHasReadySource(channel.id, sources, channel_sources)) continue;
-        try desired.append(allocator, .{ .channel_id = channel.id });
-    }
-}
 
 fn computeSignature(
     channels: []const channels_mod.Channel,
-    sources: []const sources_mod.Source,
-    channel_sources: []const channel_sources_mod.ChannelSource,
-    fx_channels: []const channels_mod.Channel,
+    route_specs: []const RouteSpec,
 ) u64 {
     var hasher = std.hash.Wyhash.init(0);
     for (channels) |channel| {
@@ -355,37 +476,72 @@ fn computeSignature(
             @intFromBool(channel.muted),
         }));
     }
-    for (sources) |source| hasher.update(source.id);
-    for (channel_sources) |channel_source| {
-        hasher.update(channel_source.channel_id);
-        hasher.update(channel_source.source_id);
-        hasher.update(&[_]u8{@intFromBool(channel_source.enabled)});
+    for (route_specs) |spec| {
+        hasher.update(spec.channel_id);
+        hasher.update(&[_]u8{@intFromBool(spec.requires_external_capture)});
+        hasher.update(&[_]u8{@intFromEnum(spec.input_port_kind)});
+        hasher.update(std.mem.asBytes(&spec.input_target_node_id));
+        if (spec.input_target_name) |input_target_name| hasher.update(input_target_name);
+        hasher.update(&[_]u8{0xff});
+        for (spec.output_target_names) |output_target_name| {
+            hasher.update(output_target_name);
+            hasher.update(&[_]u8{0});
+        }
+        hasher.update(&[_]u8{1});
     }
-    for (fx_channels) |channel| hasher.update(channel.id);
     return hasher.final();
 }
 
-fn channelHasReadySource(channel_id: []const u8, sources: []const sources_mod.Source, channel_sources: []const channel_sources_mod.ChannelSource) bool {
-    for (channel_sources) |channel_source| {
-        if (!channel_source.enabled) continue;
-        if (!std.mem.eql(u8, channel_source.channel_id, channel_id)) continue;
-        if (findSource(sources, channel_source.source_id) != null) return true;
-    }
-    return false;
-}
-
-fn findSource(sources: []const sources_mod.Source, source_id: []const u8) ?sources_mod.Source {
-    for (sources) |source| {
-        if (std.mem.eql(u8, source.id, source_id)) return source;
+fn findSpec(specs: []const RouteSpec, channel_id: []const u8) ?RouteSpec {
+    for (specs) |spec| {
+        if (std.mem.eql(u8, spec.channel_id, channel_id)) return spec;
     }
     return null;
 }
 
-fn containsSpec(specs: []const RouteSpec, channel_id: []const u8) bool {
-    for (specs) |spec| {
-        if (std.mem.eql(u8, spec.channel_id, channel_id)) return true;
+fn sameRouteSpec(filter: *const ChannelFxFilterManager.ManagedFilter, spec: RouteSpec) bool {
+    if (filter.requires_external_capture != spec.requires_external_capture) return false;
+    if (filter.input_port_kind != spec.input_port_kind) return false;
+    if (filter.input_target_node_id != spec.input_target_node_id) return false;
+    if (spec.input_target_name) |input_target_name| {
+        const filter_input_target = filter.input_target_z orelse return false;
+        if (!std.mem.eql(u8, filter_input_target, input_target_name)) return false;
+    } else if (filter.input_target_z != null) {
+        return false;
     }
-    return false;
+    if (filter.output_targets.items.len != spec.output_target_names.len) return false;
+    for (filter.output_targets.items, spec.output_target_names) |output_target, output_target_name| {
+        if (!std.mem.eql(u8, output_target.name_z, output_target_name)) return false;
+    }
+    return true;
+}
+
+fn logRouteSpecs(route_specs: []const RouteSpec) void {
+    std.log.info("routing fx sync: channels={d}", .{route_specs.len});
+    for (route_specs) |spec| {
+        var buffer: [512]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&buffer);
+        const writer = stream.writer();
+
+        for (spec.output_target_names, 0..) |target_name, index| {
+            if (index > 0) writer.writeAll(",") catch break;
+            writer.writeAll(target_name) catch break;
+        }
+
+        const targets = if (stream.pos == 0) "(none)" else stream.getWritten();
+        const input_target = spec.input_target_name orelse "(none)";
+        std.log.info(
+            "routing fx channel={s} capture={s} input={s}:{s} targets={d} [{s}]",
+            .{
+                spec.channel_id,
+                if (spec.requires_external_capture) "external" else "internal",
+                @tagName(spec.input_port_kind),
+                input_target,
+                spec.output_target_names.len,
+                targets,
+            },
+        );
+    }
 }
 
 fn findFilter(filters: []const *ChannelFxFilterManager.ManagedFilter, channel_id: []const u8) ?*ChannelFxFilterManager.ManagedFilter {
@@ -426,15 +582,6 @@ fn allocInputSinkName(allocator: std.mem.Allocator, channel_id: []const u8) ![]u
     return sink_name;
 }
 
-fn allocProcessedSinkName(allocator: std.mem.Allocator, channel_id: []const u8) ![]u8 {
-    var sink_name = try allocator.alloc(u8, fx_prefix.len + channel_id.len);
-    @memcpy(sink_name[0..fx_prefix.len], fx_prefix);
-    for (channel_id, fx_prefix.len..) |char, index| {
-        sink_name[index] = if (std.ascii.isAlphanumeric(char)) std.ascii.toLower(char) else '_';
-    }
-    return sink_name;
-}
-
 fn makeFilterProperties(name_z: [:0]const u8) !*c.struct_pw_properties {
     const props = c.pw_properties_new(null);
     if (props == null) return error.OutOfMemory;
@@ -442,7 +589,11 @@ fn makeFilterProperties(name_z: [:0]const u8) !*c.struct_pw_properties {
     _ = c.pw_properties_set(props, c.PW_KEY_NODE_DESCRIPTION, name_z.ptr);
     _ = c.pw_properties_set(props, c.PW_KEY_MEDIA_NAME, name_z.ptr);
     _ = c.pw_properties_set(props, "node.hidden", "true");
-    _ = c.pw_properties_set(props, "node.want-driver", "true");
+    _ = c.pw_properties_set(props, "node.autoconnect", "false");
+    _ = c.pw_properties_set(props, c.PW_KEY_NODE_PASSIVE, "true");
+    _ = c.pw_properties_set(props, "node.want-driver", "false");
+    _ = c.pw_properties_set(props, "node.dont-reconnect", "true");
+    _ = c.pw_properties_set(props, "node.latency", filter_node_latency);
     _ = c.pw_properties_set(props, c.PW_KEY_MEDIA_CLASS, "Audio/Filter");
     return props;
 }
@@ -512,16 +663,22 @@ fn onLinkProxyBound(data: ?*anyopaque, _: u32) callconv(.c) void {
     const link: *ChannelFxFilterManager.LinkProxy = @ptrCast(@alignCast(data));
     link.bound = true;
     link.failed = false;
+    std.log.info("routing fx link bound: channel={s} role={s}", .{ link.channel_id, link.role });
 }
 
 fn onLinkProxyRemoved(data: ?*anyopaque) callconv(.c) void {
-    _ = data;
+    if (data == null) return;
+    const link: *ChannelFxFilterManager.LinkProxy = @ptrCast(@alignCast(data));
+    link.bound = false;
+    std.log.info("routing fx link removed: channel={s} role={s}", .{ link.channel_id, link.role });
 }
 
 fn onLinkProxyError(data: ?*anyopaque, _: c_int, _: c_int, _: [*c]const u8) callconv(.c) void {
     if (data == null) return;
     const link: *ChannelFxFilterManager.LinkProxy = @ptrCast(@alignCast(data));
     link.failed = true;
+    link.bound = false;
+    std.log.warn("routing fx link error: channel={s} role={s}", .{ link.channel_id, link.role });
 }
 
 fn onRegistryGlobal(
@@ -555,9 +712,18 @@ fn onRegistryGlobalRemove(data: ?*anyopaque, id: u32) callconv(.c) void {
     const filter: *ChannelFxFilterManager.ManagedFilter = @ptrCast(@alignCast(data));
     removeRegistryNode(filter, id);
     removeRegistryPort(filter, id);
-    if (filter.ports_linked and (!filter.link_in_left.bound or !filter.link_in_right.bound or !filter.link_out_left.bound or !filter.link_out_right.bound)) {
+    if (filter.ports_linked and !filterLinksHealthy(filter)) {
         filter.ports_linked = false;
+        std.log.info("routing fx links lost: channel={s} removed_global_id={d}", .{ filter.channel_id, id });
     }
+}
+
+fn filterLinksHealthy(filter: *const ChannelFxFilterManager.ManagedFilter) bool {
+    if (!filter.link_in_left.bound or !filter.link_in_right.bound) return false;
+    for (filter.output_targets.items) |output_target| {
+        if (!output_target.left_link.bound or !output_target.right_link.bound) return false;
+    }
+    return true;
 }
 
 fn appendOrUpdateRegistryNode(filter: *ChannelFxFilterManager.ManagedFilter, id: u32, name: []const u8) !void {
@@ -616,7 +782,7 @@ fn removeRegistryPort(filter: *ChannelFxFilterManager.ManagedFilter, id: u32) vo
     }
 }
 
-fn addPort(filter: *c.struct_pw_filter, direction: c.enum_spa_direction, target_object: [*:0]const u8, label: []const u8) ?*anyopaque {
+fn addPort(filter: *c.struct_pw_filter, direction: c.enum_spa_direction, target_object: ?[*:0]const u8, label: []const u8) ?*anyopaque {
     const props = c.pw_properties_new(null) orelse return null;
     const label_z = std.heap.page_allocator.dupeZ(u8, label) catch {
         c.pw_properties_free(props);
@@ -624,7 +790,7 @@ fn addPort(filter: *c.struct_pw_filter, direction: c.enum_spa_direction, target_
     };
     defer std.heap.page_allocator.free(label_z);
     _ = c.pw_properties_set(props, c.PW_KEY_PORT_NAME, label_z.ptr);
-    _ = c.pw_properties_set(props, c.PW_KEY_TARGET_OBJECT, target_object);
+    if (target_object) |value| _ = c.pw_properties_set(props, c.PW_KEY_TARGET_OBJECT, value);
     _ = c.pw_properties_set(props, c.PW_KEY_NODE_PASSIVE, "true");
     _ = c.pw_properties_set(props, c.PW_KEY_FORMAT_DSP, dsp_format);
     return c.pw_filter_add_port(filter, direction, c.PW_FILTER_PORT_FLAG_MAP_BUFFERS, 0, props, null, 0);
@@ -641,13 +807,13 @@ fn onProcess(data: ?*anyopaque, position: ?*c.struct_spa_io_position) callconv(.
     if (data == null) return;
     const filter: *ChannelFxFilterManager.ManagedFilter = @ptrCast(@alignCast(data));
     const runtime = filter.runtime;
-    if (position) |pos| {
-        const rate_num = pos.clock.rate.num;
-        const rate_denom = pos.clock.rate.denom;
-        if (rate_num != 0 and rate_denom != 0) {
-            runtime.setSampleRate(@intCast(rate_denom / rate_num));
-        }
-    }
+    const process_started_ns = std.time.nanoTimestamp();
+    const position_missing = position == null;
+    const invalid_duration = blk: {
+        const pos = position orelse break :blk false;
+        const duration = @as(usize, @intCast(pos.clock.duration));
+        break :blk duration == 0 or duration > max_block_frames;
+    };
     const frames: u32 = blk: {
         const pos = position orelse break :blk max_block_frames;
         const duration = @as(usize, @intCast(pos.clock.duration));
@@ -664,9 +830,144 @@ fn onProcess(data: ?*anyopaque, position: ?*c.struct_spa_io_position) callconv(.
     const out_l = @as([*]f32, @ptrCast(@alignCast(out_left)))[0..frames];
     const out_r = @as([*]f32, @ptrCast(@alignCast(out_right)))[0..frames];
 
-    _ = runtime.processChannel(filter.channel_id, left, right);
+    const sample_rate_hz: u32 = blk: {
+        const pos = position orelse break :blk 0;
+        const rate_num = pos.clock.rate.num;
+        const rate_denom = pos.clock.rate.denom;
+        if (rate_num == 0 or rate_denom == 0) break :blk 0;
+        break :blk @intCast(rate_denom / rate_num);
+    };
+    const cycle_token: u64 = blk: {
+        const pos = position orelse break :blk 0;
+        break :blk @intCast(pos.clock.position);
+    };
+
+    if (position_missing) {
+        logProcessDiagnostic(filter, "missing PipeWire position; using fallback quantum", .{});
+    } else if (invalid_duration) {
+        logProcessDiagnostic(filter, "invalid quantum from PipeWire: duration={d}; using fallback={d}", .{
+            position.?.clock.duration,
+            max_block_frames,
+        });
+    }
+    if (sample_rate_hz == 0) {
+        logProcessDiagnostic(filter, "invalid sample rate in process callback; rate.num={d} rate.denom={d}", .{
+            if (position) |pos| pos.clock.rate.num else 0,
+            if (position) |pos| pos.clock.rate.denom else 0,
+        });
+    }
+    if (filter.last_process_frames != 0 and frames != filter.last_process_frames) {
+        logProcessDiagnostic(filter, "quantum changed: prev={d} now={d} cycle={d}", .{
+            filter.last_process_frames,
+            frames,
+            cycle_token,
+        });
+    }
+    if (filter.last_process_sample_rate_hz != 0 and sample_rate_hz != 0 and sample_rate_hz != filter.last_process_sample_rate_hz) {
+        logProcessDiagnostic(filter, "sample rate changed: prev={d} now={d} cycle={d}", .{
+            filter.last_process_sample_rate_hz,
+            sample_rate_hz,
+            cycle_token,
+        });
+    }
+    const cycle_drift_frames: ?u64 = blk: {
+        if (filter.last_process_cycle_token == 0 or cycle_token == 0 or filter.last_process_frames == 0) break :blk null;
+        const expected_next_cycle = filter.last_process_cycle_token + filter.last_process_frames;
+        if (cycle_token >= expected_next_cycle) break :blk cycle_token - expected_next_cycle;
+        break :blk expected_next_cycle - cycle_token;
+    };
+
+    if (filter.last_process_started_ns != 0 and filter.last_process_frames != 0 and sample_rate_hz != 0) {
+        const expected_interval_ns = framesToNanoseconds(filter.last_process_frames, sample_rate_hz);
+        const actual_interval_ns = process_started_ns - filter.last_process_started_ns;
+        const interval_delta_ns = absoluteDelta(actual_interval_ns, expected_interval_ns);
+        if (interval_delta_ns > callback_jitter_warn_threshold_ns and
+            (cycle_drift_frames == null or cycle_drift_frames.? != 0))
+        {
+            logProcessDiagnostic(filter, "callback interval jitter: prev_frames={d} expected_ns={d} actual_ns={d} delta_ns={d}", .{
+                filter.last_process_frames,
+                expected_interval_ns,
+                actual_interval_ns,
+                interval_delta_ns,
+            });
+        }
+    }
+    if (cycle_drift_frames) |drift| {
+        if (drift != 0) {
+            const expected_next_cycle = filter.last_process_cycle_token + filter.last_process_frames;
+            logProcessDiagnostic(filter, "cycle drift: prev_cycle={d} expected={d} actual={d} drift={d} frames={d}", .{
+                filter.last_process_cycle_token,
+                expected_next_cycle,
+                cycle_token,
+                drift,
+                frames,
+            });
+        }
+    }
+
+    var input_peak_abs: f32 = 0.0;
+    for (0..frames) |index| {
+        input_peak_abs = @max(input_peak_abs, @abs(left[index]));
+        input_peak_abs = @max(input_peak_abs, @abs(right[index]));
+    }
+    const input_signal_present = input_peak_abs > 0.00001;
+    if (input_signal_present != filter.last_input_signal_present) {
+        std.log.info(
+            "routing fx signal: channel={s} input={s}:{s} state={s} peak={d:.6} frames={d} cycle={d}",
+            .{
+                filter.channel_id,
+                @tagName(filter.input_port_kind),
+                if (filter.input_target_z) |value| value else "(none)",
+                if (input_signal_present) "present" else "silent",
+                input_peak_abs,
+                frames,
+                cycle_token,
+            },
+        );
+        filter.last_input_signal_present = input_signal_present;
+    }
+
+    _ = filter.engine.populateChannelInput(filter.channel_id, left, right, sample_rate_hz);
+    _ = filter.engine.processChannel(runtime, filter.channel_id, left, right, sample_rate_hz, cycle_token);
     for (0..frames) |index| {
         out_l[index] = left[index];
         out_r[index] = right[index];
     }
+
+    const process_duration_ns = std.time.nanoTimestamp() - process_started_ns;
+    if (sample_rate_hz != 0) {
+        const budget_ns = framesToNanoseconds(frames, sample_rate_hz);
+        if (process_duration_ns > budget_ns) {
+            logProcessDiagnostic(filter, "process over budget: frames={d} budget_ns={d} actual_ns={d}", .{
+                frames,
+                budget_ns,
+                process_duration_ns,
+            });
+        }
+    }
+
+    filter.last_process_frames = frames;
+    filter.last_process_sample_rate_hz = sample_rate_hz;
+    filter.last_process_cycle_token = cycle_token;
+    filter.last_process_started_ns = process_started_ns;
+}
+
+fn logProcessDiagnostic(
+    filter: *ChannelFxFilterManager.ManagedFilter,
+    comptime fmt: []const u8,
+    args: anytype,
+) void {
+    const now_ns = std.time.nanoTimestamp();
+    if (filter.last_process_log_ns != 0 and now_ns - filter.last_process_log_ns < process_diag_log_interval_ns) return;
+    filter.last_process_log_ns = now_ns;
+    std.log.warn(ansi_red ++ "fx process diag channel={s}: " ++ fmt ++ ansi_reset, .{filter.channel_id} ++ args);
+}
+
+fn framesToNanoseconds(frames: u32, sample_rate_hz: u32) i128 {
+    if (frames == 0 or sample_rate_hz == 0) return 0;
+    return @divTrunc(@as(i128, frames) * std.time.ns_per_s, @as(i128, sample_rate_hz));
+}
+
+fn absoluteDelta(actual: i128, expected: i128) i128 {
+    return if (actual >= expected) actual - expected else expected - actual;
 }

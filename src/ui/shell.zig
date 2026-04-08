@@ -4,6 +4,7 @@ const StateStore = @import("../app/state_store.zig").StateStore;
 const App = @import("../app/app.zig").App;
 const channels_mod = @import("../core/audio/channels.zig");
 const buses_mod = @import("../core/audio/buses.zig");
+const sources_mod = @import("../core/audio/sources.zig");
 const sends_mod = @import("../core/audio/sends.zig");
 const channel_sources_mod = @import("../core/audio/channel_sources.zig");
 const bus_destinations_mod = @import("../core/audio/bus_destinations.zig");
@@ -15,6 +16,7 @@ const Lv2UiManager = @import("../plugins/lv2_ui.zig").Lv2UiManager;
 const SdlPlatform = @import("../platform/sdl.zig").SdlPlatform;
 const WindowConfig = @import("../platform/window.zig").WindowConfig;
 const ConfigStore = @import("../persistence/config.zig").ConfigStore;
+const runtime_shutdown = @import("../runtime/shutdown.zig");
 
 const max_recent_events = 6;
 const event_label_capacity = 96;
@@ -101,25 +103,26 @@ pub const UiShell = struct {
             .event_count = 0,
             .request_add_input = 0,
             .request_add_output = 0,
-            .request_select_source_id = zeroedBuffer(64),
-            .request_rename_input_id = zeroedBuffer(64),
-            .request_rename_input_label = zeroedBuffer(64),
-            .request_rename_output_id = zeroedBuffer(64),
-            .request_rename_output_label = zeroedBuffer(64),
-            .request_pick_input_icon_id = zeroedBuffer(64),
-            .request_clear_input_icon_id = zeroedBuffer(64),
-            .request_delete_input_id = zeroedBuffer(64),
-            .request_delete_output_id = zeroedBuffer(64),
-            .request_add_plugin_channel_id = zeroedBuffer(64),
-            .request_add_plugin_descriptor_id = zeroedBuffer(64),
-            .request_remove_plugin_id = zeroedBuffer(64),
-            .request_move_plugin_id = zeroedBuffer(64),
+            .request_select_source_id = zeroedBuffer(256),
+            .request_rename_input_id = zeroedBuffer(256),
+            .request_rename_input_label = zeroedBuffer(256),
+            .request_rename_output_id = zeroedBuffer(256),
+            .request_rename_output_label = zeroedBuffer(256),
+            .request_pick_input_icon_id = zeroedBuffer(256),
+            .request_clear_input_icon_id = zeroedBuffer(256),
+            .request_delete_input_id = zeroedBuffer(256),
+            .request_delete_output_id = zeroedBuffer(256),
+            .request_add_plugin_channel_id = zeroedBuffer(256),
+            .request_add_plugin_descriptor_id = zeroedBuffer(256),
+            .request_remove_plugin_id = zeroedBuffer(256),
+            .request_move_plugin_id = zeroedBuffer(256),
             .request_move_plugin_delta = 0,
-            .request_open_plugin_ui_id = zeroedBuffer(64),
+            .request_open_plugin_ui_id = zeroedBuffer(256),
             .request_select_noise_model_path = zeroedBuffer(512),
         };
 
         while (true) {
+            if (runtime_shutdown.isRequested()) break;
             const ui_state = imgui.wiredeck_imgui_pump_events(bridge);
             if (ui_state < 0) {
                 std.debug.print("UI event pump failed: {s}\n", .{imgui.wiredeck_imgui_last_error() orelse "unknown error"});
@@ -132,6 +135,7 @@ pub const UiShell = struct {
                 _ = lv2_ui_manager.pump(app, state_store);
                 try syncTrayAutostartPreference(allocator, bridge);
                 app.reconcileOutputRoutingIfNeeded();
+                if (runtime_shutdown.isRequested()) break;
                 platform.nextFrame();
                 if (config.max_frames) |max_frames| {
                     if (platform.frame_count >= max_frames) break;
@@ -166,6 +170,7 @@ pub const UiShell = struct {
                 return error.UiFrameFailed;
             }
             if (keep_running == 0) break;
+            if (runtime_shutdown.isRequested()) break;
 
             const ui_changes = try syncUiChanges(state_store, &snapshot);
             var state_changed = ui_changes.changed;
@@ -382,7 +387,7 @@ pub const UiShell = struct {
                 .volume = bus.volume,
                 .muted = @intFromBool(bus.muted),
                 .expose_as_microphone = @intFromBool(bus.expose_as_microphone),
-                .expose_on_web = @intFromBool(bus.expose_on_web),
+                .share_on_network = @intFromBool(bus.share_on_network),
             };
             bus_index += 1;
         }
@@ -496,17 +501,17 @@ pub const UiShell = struct {
             const next_volume = snapshot.buses[visible_bus_index].volume;
             const next_muted = snapshot.buses[visible_bus_index].muted != 0;
             const next_expose_as_microphone = snapshot.buses[visible_bus_index].expose_as_microphone != 0;
-            const next_expose_on_web = snapshot.buses[visible_bus_index].expose_on_web != 0;
+            const next_share_on_network = snapshot.buses[visible_bus_index].share_on_network != 0;
             const bus_changed = bus.volume != next_volume or
                 bus.muted != next_muted or
                 bus.expose_as_microphone != next_expose_as_microphone or
-                bus.expose_on_web != next_expose_on_web;
+                bus.share_on_network != next_share_on_network;
             result.changed = result.changed or bus_changed;
             result.routing_changed = result.routing_changed or bus_changed;
             bus.volume = next_volume;
             bus.muted = next_muted;
             bus.expose_as_microphone = next_expose_as_microphone;
-            bus.expose_on_web = next_expose_on_web;
+            bus.share_on_network = next_share_on_network;
             visible_bus_index += 1;
         }
         var visible_send_index: usize = 0;
@@ -575,6 +580,7 @@ pub const UiShell = struct {
         if (snapshot.request_add_output != 0) {
             snapshot.request_add_output = 0;
             try addBus(state_store);
+            std.log.info("ui request: add output bus", .{});
             result.changed = true;
             result.routing_changed = true;
         }
@@ -629,10 +635,19 @@ pub const UiShell = struct {
             result.routing_changed = true;
         }
         if (snapshot.request_delete_output_id[0] != 0) {
-            try deleteBus(state_store, cStringSlice(&snapshot.request_delete_output_id));
+            const bus_id = cStringSlice(&snapshot.request_delete_output_id);
+            if (visibleMixerBusCount(state_store) <= 2) {
+                std.log.warn("ui request ignored: refusing to delete output bus {s} because only {d} visible buses remain", .{
+                    bus_id,
+                    visibleMixerBusCount(state_store),
+                });
+            } else {
+                std.log.info("ui request: delete output bus {s}", .{bus_id});
+                try deleteBus(state_store, bus_id);
+                result.changed = true;
+                result.routing_changed = true;
+            }
             clearBuffer(&snapshot.request_delete_output_id);
-            result.changed = true;
-            result.routing_changed = true;
         }
         if (snapshot.request_add_plugin_channel_id[0] != 0 and snapshot.request_add_plugin_descriptor_id[0] != 0) {
             try addPluginToChannel(state_store, cStringSlice(&snapshot.request_add_plugin_channel_id), cStringSlice(&snapshot.request_add_plugin_descriptor_id));
@@ -729,7 +744,22 @@ fn computeBusLevels(state_store: *const StateStore, bus_id: []const u8, bus_volu
 
 fn addChannelFromSource(state_store: *StateStore, source_id: []const u8) !void {
     const selected_source = findSource(state_store, source_id) orelse return;
-    if (findChannelByBoundSource(state_store, source_id) != null) return;
+    if (hasEquivalentChannelForSource(state_store, selected_source)) {
+        std.log.info("ui add source blocked: source={s} label={s} subtitle={s} kind={s}", .{
+            selected_source.id,
+            selected_source.label,
+            selected_source.subtitle,
+            @tagName(selected_source.kind),
+        });
+        return;
+    }
+
+    std.log.info("ui add source: source={s} label={s} subtitle={s} kind={s}", .{
+        selected_source.id,
+        selected_source.label,
+        selected_source.subtitle,
+        @tagName(selected_source.kind),
+    });
 
     const index = nextGeneratedIndexForChannels(state_store);
     const id = try std.fmt.allocPrint(state_store.allocator, "source-strip-{d}", .{index});
@@ -783,6 +813,16 @@ fn addBus(state_store: *StateStore) !void {
     for (state_store.destinations.items) |destination| {
         try state_store.addBusDestination(.{ .bus_id = bus_id, .destination_id = destination.id, .enabled = false });
     }
+}
+
+fn visibleMixerBusCount(state_store: *const StateStore) usize {
+    var count: usize = 0;
+    for (state_store.buses.items) |bus| {
+        if (bus.hidden) continue;
+        if (bus.role == .input_stage) continue;
+        count += 1;
+    }
+    return count;
 }
 
 fn deleteChannel(state_store: *StateStore, id: []const u8) !void {
@@ -968,6 +1008,7 @@ fn syncChannelBindingSelections(state_store: *StateStore) !bool {
     var changed = false;
 
     for (state_store.channels.items) |*channel| {
+        const previous_source = if (channel.bound_source_id) |bound_source_id| findSource(state_store, bound_source_id) else null;
         var selected_source_id: ?[]const u8 = null;
         var selected_source: ?@TypeOf(state_store.sources.items[0]) = null;
 
@@ -991,6 +1032,15 @@ fn syncChannelBindingSelections(state_store: *StateStore) !bool {
         }
 
         if (selected_source) |source| {
+            if (shouldSyncChannelLabelWithSource(channel.*, previous_source, source)) {
+                try replaceOwnedString(state_store.allocator, &channel.label, source.label);
+                if (channel.input_bus_id) |input_bus_id| {
+                    if (findBus(state_store, input_bus_id)) |bus| {
+                        try replaceOwnedString(state_store.allocator, &bus.label, source.label);
+                    }
+                }
+                changed = true;
+            }
             if (!std.mem.eql(u8, channel.subtitle, source.subtitle)) {
                 try replaceOwnedString(state_store.allocator, &channel.subtitle, source.subtitle);
                 changed = true;
@@ -1015,6 +1065,19 @@ fn syncChannelBindingSelections(state_store: *StateStore) !bool {
     return changed;
 }
 
+fn shouldSyncChannelLabelWithSource(
+    channel: channels_mod.Channel,
+    previous_source: ?sources_mod.Source,
+    next_source: sources_mod.Source,
+) bool {
+    if (channel.label.len == 0) return true;
+    if (std.mem.eql(u8, channel.label, next_source.label)) return false;
+    if (previous_source) |source| {
+        return std.mem.eql(u8, channel.label, source.label);
+    }
+    return false;
+}
+
 fn findChannel(state_store: *StateStore, id: []const u8) ?*channels_mod.Channel {
     for (state_store.channels.items) |*channel| {
         if (std.mem.eql(u8, channel.id, id)) return channel;
@@ -1036,6 +1099,96 @@ fn findChannelByBoundSource(state_store: *StateStore, source_id: []const u8) ?*c
         }
     }
     return null;
+}
+
+fn hasEquivalentChannelForSource(state_store: *const StateStore, source: sources_mod.Source) bool {
+    if (findChannelByBoundSourceConst(state_store, source.id) != null) return true;
+    for (state_store.channels.items) |channel| {
+        if (!channelRepresentsEquivalentSource(channel, source)) continue;
+        return true;
+    }
+    return false;
+}
+
+fn findChannelByBoundSourceConst(state_store: *const StateStore, source_id: []const u8) ?channels_mod.Channel {
+    for (state_store.channels.items) |channel| {
+        if (channel.bound_source_id) |bound_source_id| {
+            if (std.mem.eql(u8, bound_source_id, source_id)) return channel;
+        }
+    }
+    return null;
+}
+
+fn channelRepresentsEquivalentSource(channel: channels_mod.Channel, source: sources_mod.Source) bool {
+    if (channel.source_kind != @intFromEnum(source.kind)) return false;
+
+    if (source.kind == .app) {
+        const source_has_generic_identity = appSourceUsesGenericWrapperIdentity(source);
+        const channel_has_generic_identity = appChannelUsesGenericWrapperIdentity(channel);
+        if (!source_has_generic_identity and !channel_has_generic_identity and
+            channel.subtitle.len > 0 and source.process_binary.len > 0 and std.ascii.eqlIgnoreCase(channel.subtitle, source.process_binary))
+        {
+            return true;
+        }
+        if (channel.label.len > 0 and source.label.len > 0 and std.ascii.eqlIgnoreCase(channel.label, source.label)) {
+            return true;
+        }
+        if (!source_has_generic_identity and !channel_has_generic_identity and
+            channel.icon_name.len > 0 and source.icon_name.len > 0 and
+            !std.mem.eql(u8, channel.icon_name, "application-x-executable") and
+            std.ascii.eqlIgnoreCase(channel.icon_name, source.icon_name))
+        {
+            return true;
+        }
+        return false;
+    }
+
+    if (source.kind == .physical) {
+        return false;
+    }
+
+    if (channel.label.len > 0 and source.label.len > 0 and std.ascii.eqlIgnoreCase(channel.label, source.label)) {
+        if (channel.subtitle.len == 0 or source.subtitle.len == 0) return true;
+        return std.ascii.eqlIgnoreCase(channel.subtitle, source.subtitle);
+    }
+    return false;
+}
+
+fn appSourceUsesGenericWrapperIdentity(source: sources_mod.Source) bool {
+    return sourceLabelLooksGeneric(source.label) or
+        processBinaryLooksWrapper(source.process_binary) or
+        iconLooksWrapper(source.icon_name);
+}
+
+fn appChannelUsesGenericWrapperIdentity(channel: channels_mod.Channel) bool {
+    return sourceLabelLooksGeneric(channel.label) or
+        processBinaryLooksWrapper(channel.subtitle) or
+        iconLooksWrapper(channel.icon_name);
+}
+
+fn sourceLabelLooksGeneric(label: []const u8) bool {
+    return std.ascii.startsWithIgnoreCase(label, "audio stream #") or
+        std.ascii.eqlIgnoreCase(label, "audio stream") or
+        std.ascii.eqlIgnoreCase(label, "playback") or
+        std.ascii.eqlIgnoreCase(label, "output stream");
+}
+
+fn processBinaryLooksWrapper(value: []const u8) bool {
+    return containsIgnoreCase(value, "wine") or
+        containsIgnoreCase(value, "proton") or
+        containsIgnoreCase(value, "steam") or
+        containsIgnoreCase(value, "pressure-vessel") or
+        containsIgnoreCase(value, "gamescope");
+}
+
+fn iconLooksWrapper(icon_name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(icon_name, "steam") or
+        std.ascii.eqlIgnoreCase(icon_name, "wine") or
+        std.ascii.eqlIgnoreCase(icon_name, "application-x-executable");
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
 }
 
 fn findBus(state_store: *StateStore, id: []const u8) ?*buses_mod.Bus {

@@ -160,7 +160,7 @@ pub const VirtualInputManager = struct {
 
         const sink_properties = try std.fmt.allocPrint(
             self.allocator,
-            "\"device.description='{s}' node.description='{s}' wiredeck.channel.id={s} node.virtual=true node.hidden=true device.class=filter media.class=Audio/Sink\"",
+            "\"device.description='{s}' node.description='{s}' wiredeck.channel.id={s} node.virtual=true node.hidden=true device.class=filter media.class=Audio/Sink node.pause-on-idle=false node.always-process=true\"",
             .{ description, description, channel.id },
         );
         defer self.allocator.free(sink_properties);

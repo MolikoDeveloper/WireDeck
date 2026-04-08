@@ -251,6 +251,7 @@ fn parseProps(allocator: Allocator, dict: ?*const c.struct_spa_dict) !PwProps {
     props.client_id = parseU32Maybe(dictGet(dict, c.PW_KEY_CLIENT_ID));
     props.app_process_id = parseU32Maybe(dictGet(dict, c.PW_KEY_APP_PROCESS_ID));
     props.sec_pid = parseU32Maybe(dictGet(dict, c.PW_KEY_SEC_PID));
+    props.object_serial = parseU64Maybe(dictGet(dict, "object.serial"));
 
     return props;
 }
@@ -274,6 +275,11 @@ fn dupDictValue(
 fn parseU32Maybe(value: ?[]const u8) ?u32 {
     const s = value orelse return null;
     return std.fmt.parseUnsigned(u32, s, 10) catch null;
+}
+
+fn parseU64Maybe(value: ?[]const u8) ?u64 {
+    const s = value orelse return null;
+    return std.fmt.parseUnsigned(u64, s, 10) catch null;
 }
 
 fn resolvePid(props: PwProps) ?u32 {

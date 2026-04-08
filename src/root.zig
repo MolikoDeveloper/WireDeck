@@ -2,6 +2,9 @@ pub const App = @import("app/app.zig").App;
 pub const StateStore = @import("app/state_store.zig").StateStore;
 
 pub const AudioCore = @import("core/audio/routing.zig").AudioCore;
+pub const AudioEngine = @import("core/audio/engine.zig").AudioEngine;
+pub const NetworkAudioSettings = @import("core/audio/network.zig").NetworkAudioSettings;
+pub const NetworkAudioService = @import("core/audio/network_ingress.zig").NetworkAudioService;
 pub const Source = @import("core/audio/sources.zig").Source;
 pub const Destination = @import("core/audio/destinations.zig").Destination;
 pub const PipewireContext = @import("core/pipewire.zig").PipewireContext;
@@ -12,6 +15,7 @@ pub const OutputExposure = @import("core/output_exposure.zig");
 pub const SdlPlatform = @import("platform/sdl.zig").SdlPlatform;
 pub const WindowConfig = @import("platform/window.zig").WindowConfig;
 pub const UiShell = @import("ui/shell.zig").UiShell;
+pub const RuntimeShutdown = @import("runtime/shutdown.zig");
 pub const ImGuiBridge = @import("native/imgui_bridge.zig");
 pub const ConfigStore = @import("persistence/config.zig").ConfigStore;
 pub const PluginHost = @import("plugins/root.zig").PluginHost;

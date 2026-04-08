@@ -31,6 +31,15 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const client_exe = b.addExecutable(.{
+        .name = "wiredeck-client",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/client_main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
     if (enable_lilv and enable_suil) {
         const helper = b.addExecutable(.{
             .name = "wiredeck-lv2-ui-host",
@@ -136,11 +145,13 @@ pub fn build(b: *std.Build) void {
     }
 
     b.installArtifact(exe);
+    const install_client = b.addInstallArtifact(client_exe, .{});
     mod.link_libc = true;
     mod.link_libcpp = true;
     mod.linkSystemLibrary("pipewire-0.3", .{ .needed = true });
     mod.linkSystemLibrary("spa-0.2", .{ .needed = true });
     mod.linkSystemLibrary("pulse", .{ .needed = true });
+    mod.linkSystemLibrary("pulse-simple", .{ .needed = true });
     mod.linkSystemLibrary("vulkan", .{ .needed = true });
     if (enable_lilv) {
         mod.linkSystemLibrary("lilv-0", .{ .needed = true });
@@ -161,6 +172,7 @@ pub fn build(b: *std.Build) void {
 
     mod.addIncludePath(b.path("src/native"));
     mod.addIncludePath(b.path("src/core/pipewire"));
+    mod.addIncludePath(b.path("OBS/src/wiredeck_obs_output_source/include"));
     mod.addIncludePath(b.path("vendor/cimgui/imgui"));
     mod.addIncludePath(b.path("vendor/cimgui/imgui/backends"));
 
@@ -189,6 +201,17 @@ pub fn build(b: *std.Build) void {
 
     if (b.args) |args| {
         run_cmd.addArgs(args);
+    }
+
+    const client_step = b.step("client", "Build the WireDeck client");
+    client_step.dependOn(&install_client.step);
+
+    const run_client_step = b.step("run-client", "Run the WireDeck client");
+    const run_client_cmd = b.addRunArtifact(client_exe);
+    run_client_step.dependOn(&run_client_cmd.step);
+    run_client_cmd.step.dependOn(&install_client.step);
+    if (b.args) |args| {
+        run_client_cmd.addArgs(args);
     }
 
     const mod_tests = b.addTest(.{
