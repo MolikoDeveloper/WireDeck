@@ -5,9 +5,12 @@
 # Local project caches and generated packaging artifacts
 /.cache/
 /.dist/
+/dist/
+/OBS/build/
 /packaging/
 
 # Temporary working files
+/.tmp/
 /temp/
 /vendor/
 
