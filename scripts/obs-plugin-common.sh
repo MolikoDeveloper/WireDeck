@@ -40,7 +40,8 @@ obs_plugin_default_install_path() {
             printf '%s\n' "$HOME/.config/obs-studio/plugins/$plugin_name"
             ;;
         macos)
-            printf '%s\n' "$HOME/Library/Application Support/obs-studio/plugins/$plugin_name.plugin"
+            plugins_root=$(obs_plugin_detect_macos_plugins_root)
+            printf '%s\n' "$plugins_root/$plugin_name.plugin"
             ;;
         windows)
             if [ -n "${ProgramData:-}" ]; then
@@ -53,6 +54,21 @@ obs_plugin_default_install_path() {
             return 1
             ;;
     esac
+}
+
+obs_plugin_detect_macos_plugins_root() {
+    for known_plugin in \
+        "$HOME/Library/Application Support/obs-studio/plugins/obs-mac-backgroundremoval.plugin" \
+        "/Library/Application Support/obs-studio/plugins/obs-mac-backgroundremoval.plugin" \
+        "/Applications/OBS.app/Contents/PlugIns/obs-mac-backgroundremoval.plugin"
+    do
+        if [ -d "$known_plugin" ]; then
+            dirname "$known_plugin"
+            return 0
+        fi
+    done
+
+    printf '%s\n' "$HOME/Library/Application Support/obs-studio/plugins"
 }
 
 obs_plugin_default_build_dir() {

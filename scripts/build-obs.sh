@@ -164,6 +164,65 @@ run_configure() (
     "$@"
 )
 
+validate_libobs_binary() {
+    libobs_cmake_dir=$(sed -n 's/^libobs_DIR:PATH=//p' "$BUILD_DIR/CMakeCache.txt" | head -n 1)
+    [ -n "$libobs_cmake_dir" ] || return 0
+    obs_build_dir=$(CDPATH= cd -- "$libobs_cmake_dir/.." 2>/dev/null && pwd || printf '%s\n' "$libobs_cmake_dir/..")
+
+    targets_file="$libobs_cmake_dir/libobsTargets.cmake"
+    [ -f "$targets_file" ] || return 0
+
+    build_type_upper=$(printf '%s' "$BUILD_TYPE" | tr '[:lower:]' '[:upper:]' | tr -cd 'A-Z0-9_')
+    expected_path=$(sed -n "s/^[[:space:]]*IMPORTED_LOCATION_${build_type_upper}[[:space:]]*\"\\(.*\\)\".*/\\1/p" "$targets_file" | head -n 1)
+    [ -n "$expected_path" ] || return 0
+    [ -e "$expected_path" ] && return 0
+
+    existing_configs=""
+    existing_paths=""
+    while IFS='|' read -r cfg path; do
+        [ -n "$cfg" ] || continue
+        [ -n "$path" ] || continue
+        if [ -e "$path" ]; then
+            if [ -n "$existing_configs" ]; then
+                existing_configs="$existing_configs, $cfg"
+                existing_paths="$existing_paths\n  - $cfg: $path"
+            else
+                existing_configs="$cfg"
+                existing_paths="  - $cfg: $path"
+            fi
+        fi
+    done <<EOF
+$(sed -n 's/^[[:space:]]*IMPORTED_LOCATION_\([A-Z0-9_]*\)[[:space:]]*"\(.*\)".*/\1|\2/p' "$targets_file")
+EOF
+
+    cat >&2 <<EOF
+[wiredeck-obs] libobs is configured but missing for BUILD_TYPE='$BUILD_TYPE':
+  $expected_path
+
+Most likely cause:
+  OBS/libobs has not been built yet for this configuration.
+
+Try:
+  cmake --build "$obs_build_dir" --config $BUILD_TYPE --target libobs
+
+Then re-run:
+  ./scripts/build-obs.sh --target-os $TARGET_OS
+EOF
+
+    if [ -n "$existing_configs" ]; then
+        cat >&2 <<EOF
+
+Detected existing libobs binaries for other configurations:
+$existing_paths
+
+If you want to use one of those, re-run with:
+  BUILD_TYPE=<one of: $existing_configs> ./scripts/build-obs.sh --target-os $TARGET_OS
+EOF
+    fi
+
+    exit 1
+}
+
 set +e
 run_configure
 configure_status=$?
@@ -186,6 +245,8 @@ Example:
 EOF
     exit "$configure_status"
 fi
+
+validate_libobs_binary
 
 cmake --build "$BUILD_DIR" "$@"
 

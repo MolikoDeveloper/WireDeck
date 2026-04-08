@@ -44,6 +44,13 @@ OBS_MACOS_DEPLOYMENT_TARGET=13.0 \
 
 Por defecto no intenta hacer cross-compile desde Linux a macOS sin un toolchain explícito.
 
+Si usas un `libobs_DIR` que apunta a un build tree de `obs-studio`, asegúrate de haber compilado `libobs` antes:
+
+```bash
+cmake --build /ruta/a/obs-studio/build_macos --config RelWithDebInfo --target libobs
+libobs_DIR=/ruta/a/obs-studio/build_macos/libobs ./scripts/build-obs.sh --target-os macos
+```
+
 ## Install Layouts
 
 La instalación local para OBS en Linux usa esta estructura:
