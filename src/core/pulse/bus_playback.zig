@@ -6,8 +6,12 @@ const bus_buffer_mod = @import("../audio/bus_consumer_buffer.zig");
 const playback_quantum_frames: usize = 128;
 const playback_quantum_samples: usize = playback_quantum_frames * 2;
 const playback_quantum_bytes: usize = playback_quantum_samples * @sizeOf(i16);
+const enable_bus_playback_summary_logs = false;
+const underrun_warn_log_interval_ns: i128 = 1000 * std.time.ns_per_ms;
 
 pub const BusPlayback = struct {
+    const target_buffer_frames = bus_buffer_mod.render_quantum_frames * 4;
+
     allocator: std.mem.Allocator,
     engine: *audio_engine_mod.AudioEngine,
     bus_id: []u8,
@@ -18,9 +22,14 @@ pub const BusPlayback = struct {
     api: ?*c.pa_mainloop_api = null,
     context: ?*c.pa_context = null,
     stream: ?*c.pa_stream = null,
+    feeder_thread: ?std.Thread = null,
+    stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    buffer_mutex: std.Thread.Mutex = .{},
     write_count: u64 = 0,
     nonzero_write_count: u64 = 0,
     peak_abs_sample: u16 = 0,
+    underrun_count: u64 = 0,
+    last_underrun_log_ns: i128 = 0,
     pcm_buffer: bus_buffer_mod.BusConsumerBuffer,
 
     pub fn init(
@@ -46,20 +55,24 @@ pub const BusPlayback = struct {
         errdefer self.freeOwnedState();
 
         try self.connect();
+        self.stop_requested.store(false, .release);
+        self.feeder_thread = try std.Thread.spawn(.{}, feederMain, .{self});
         return self;
     }
 
     pub fn deinit(self: *BusPlayback) void {
         self.shutdown();
-        std.log.info("pulse bus playback summary for {s}: writes={d} nonzero_writes={d}", .{
-            self.consumer_id,
-            self.write_count,
-            self.nonzero_write_count,
-        });
-        std.log.info("pulse bus playback peak for {s}: peak_abs_sample={d}", .{
-            self.consumer_id,
-            self.peak_abs_sample,
-        });
+        if (enable_bus_playback_summary_logs) {
+            std.log.info("pulse bus playback summary for {s}: writes={d} nonzero_writes={d}", .{
+                self.consumer_id,
+                self.write_count,
+                self.nonzero_write_count,
+            });
+            std.log.info("pulse bus playback peak for {s}: peak_abs_sample={d}", .{
+                self.consumer_id,
+                self.peak_abs_sample,
+            });
+        }
         self.engine.releaseBusTapConsumer(self.bus_id, self.consumer_id);
         self.freeOwnedState();
         self.allocator.destroy(self);
@@ -97,6 +110,11 @@ pub const BusPlayback = struct {
     }
 
     fn shutdown(self: *BusPlayback) void {
+        self.stop_requested.store(true, .release);
+        if (self.feeder_thread) |thread| {
+            thread.join();
+            self.feeder_thread = null;
+        }
         if (self.mainloop) |mainloop| {
             c.pa_threaded_mainloop_lock(mainloop);
             if (self.stream) |stream| {
@@ -193,6 +211,35 @@ pub const BusPlayback = struct {
         self.allocator.free(self.consumer_id);
         self.allocator.free(self.bus_id);
     }
+
+    fn feederMain(self: *BusPlayback) void {
+        var scratch_buffer: [bus_buffer_mod.render_quantum_frames * bus_buffer_mod.stereo_channels]i16 = undefined;
+        var next_tick_ns = std.time.nanoTimestamp();
+        while (!self.stop_requested.load(.acquire)) {
+            self.buffer_mutex.lock();
+            _ = self.pcm_buffer.fillFromEngine(
+                self.engine,
+                self.bus_id,
+                self.consumer_id,
+                target_buffer_frames,
+                scratch_buffer[0..],
+            ) catch {};
+            const buffered_frames = self.pcm_buffer.availableFrames();
+            self.buffer_mutex.unlock();
+
+            const step_ns: u64 = if (buffered_frames < target_buffer_frames / 2)
+                @max(@as(u64, 1), bus_buffer_mod.render_quantum_ns / 2)
+            else
+                bus_buffer_mod.render_quantum_ns;
+            next_tick_ns +%= step_ns;
+            const now_ns = std.time.nanoTimestamp();
+            if (next_tick_ns > now_ns) {
+                std.Thread.sleep(@intCast(next_tick_ns - now_ns));
+            } else {
+                next_tick_ns = now_ns;
+            }
+        }
+    }
 };
 
 fn contextStateCb(_: ?*c.pa_context, userdata: ?*anyopaque) callconv(.c) void {
@@ -220,21 +267,46 @@ fn streamWriteCb(stream: ?*c.pa_stream, nbytes: usize, userdata: ?*anyopaque) ca
     var wrote_nonzero = false;
     var scratch_buffer: [bus_buffer_mod.render_quantum_frames * bus_buffer_mod.stereo_channels]i16 = undefined;
 
-    _ = self.pcm_buffer.fillFromEngine(
-        self.engine,
-        self.bus_id,
-        self.consumer_id,
-        remaining_frames,
-        scratch_buffer[0..],
-    ) catch {};
-
     while (remaining_frames > 0) {
         const frames_this_write = @min(remaining_frames, playback_quantum_frames);
         const sample_count = std.math.mul(usize, frames_this_write, 2) catch return;
 
         var sample_buffer: [playback_quantum_samples]i16 = undefined;
         @memset(&sample_buffer, 0);
+        self.buffer_mutex.lock();
+        const available_before_fill = self.pcm_buffer.availableFrames();
+        if (self.pcm_buffer.availableFrames() < frames_this_write) {
+            _ = self.pcm_buffer.fillFromEngine(
+                self.engine,
+                self.bus_id,
+                self.consumer_id,
+                frames_this_write,
+                scratch_buffer[0..],
+            ) catch {};
+        }
+        const available_before_drain = self.pcm_buffer.availableFrames();
         const drained_frames = self.pcm_buffer.drainFrames(sample_buffer[0..sample_count], frames_this_write);
+        self.buffer_mutex.unlock();
+
+        if (drained_frames < frames_this_write) {
+            self.underrun_count += 1;
+            const now_ns = std.time.nanoTimestamp();
+            if (self.last_underrun_log_ns == 0 or now_ns - self.last_underrun_log_ns >= underrun_warn_log_interval_ns) {
+                self.last_underrun_log_ns = now_ns;
+                std.log.warn(
+                    "pulse bus playback underrun: bus={s} sink={s} requested_frames={d} drained_frames={d} available_before_fill={d} available_before_drain={d} underruns={d}",
+                    .{
+                        self.bus_id,
+                        self.target_sink_name,
+                        frames_this_write,
+                        drained_frames,
+                        available_before_fill,
+                        available_before_drain,
+                        self.underrun_count,
+                    },
+                );
+            }
+        }
 
         var nonzero = false;
         for (sample_buffer[0 .. drained_frames * bus_buffer_mod.stereo_channels]) |sample| {

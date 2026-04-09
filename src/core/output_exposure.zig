@@ -1,4 +1,5 @@
 const std = @import("std");
+const enable_output_exposure_info_logs = false;
 const StateStore = @import("../app/state_store.zig").StateStore;
 const audio_engine_mod = @import("audio/engine.zig");
 const bus_buffer_mod = @import("audio/bus_consumer_buffer.zig");
@@ -994,14 +995,16 @@ fn logExposurePlan(state_store: *const StateStore, pulse_snapshot: pulse.PulseSn
     for (state_store.buses.items) |bus| {
         const summary = summarizeBusTargets(state_store, pulse_snapshot, bus);
         if (summary.needsVirtualBus(bus) or bus.share_on_network or bus.expose_as_microphone) {
-            std.log.info(
-                "routing bus {s}: internal route targets={d} network={any} mic={any}",
-                .{ bus.id, summary.count, bus.share_on_network, bus.expose_as_microphone },
-            );
+            if (enable_output_exposure_info_logs) {
+                std.log.info(
+                    "routing bus {s}: internal route targets={d} network={any} mic={any}",
+                    .{ bus.id, summary.count, bus.share_on_network, bus.expose_as_microphone },
+                );
+            }
             continue;
         }
 
-        std.log.info("routing bus {s}: no resolved sink targets", .{bus.id});
+        if (enable_output_exposure_info_logs) std.log.info("routing bus {s}: no resolved sink targets", .{bus.id});
     }
 }
 
@@ -1223,11 +1226,13 @@ fn loadBusDestinationLoopback(
         desired.target_sink_name,
         description,
     );
-    std.log.info("output exposure: created bus playback {s} for bus {s} -> {s}", .{
-        consumer_id,
-        desired.bus_id,
-        desired.target_sink_name,
-    });
+    if (enable_output_exposure_info_logs) {
+        std.log.info("output exposure: created bus playback {s} for bus {s} -> {s}", .{
+            consumer_id,
+            desired.bus_id,
+            desired.target_sink_name,
+        });
+    }
 
     return .{
         .bus_id = try manager.allocator.dupe(u8, desired.bus_id),

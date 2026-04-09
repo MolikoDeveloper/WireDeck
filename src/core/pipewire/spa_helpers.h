@@ -10,6 +10,7 @@ extern "C" {
 #endif
 
 const struct spa_pod* wiredeck_spa_build_f32_capture_format(struct spa_pod_builder* builder);
+const struct spa_pod* wiredeck_spa_build_f32_stereo_capture_format(struct spa_pod_builder* builder);
 const struct spa_pod* wiredeck_spa_build_s16_stereo_format(struct spa_pod_builder* builder);
 uint32_t wiredeck_spa_parse_audio_channels(const struct spa_pod* param);
 

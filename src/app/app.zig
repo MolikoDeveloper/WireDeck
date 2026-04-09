@@ -8,6 +8,7 @@ const channels_mod = @import("../core/audio/channels.zig");
 const sources_mod = @import("../core/audio/sources.zig");
 const destinations_mod = @import("../core/audio/destinations.zig");
 const pw = @import("../core/pipewire.zig");
+const live_profiler_mod = @import("../core/pipewire/live_profiler.zig");
 const pulse = @import("../core/pulse.zig");
 const binder = @import("../core/binder.zig");
 const icon = @import("../core/icon_resolver.zig");
@@ -20,17 +21,24 @@ const FxInputPortKind = channel_fx_filters_mod.InputPortKind;
 const virtual_inputs = @import("../core/pipewire/virtual_inputs.zig");
 const VirtualInputManager = virtual_inputs.VirtualInputManager;
 const plugin_host = @import("../plugins/host.zig");
+const plugin_chain = @import("../plugins/chain.zig");
 const Lv2Support = @import("../plugins/lv2.zig").Lv2Support;
 const FxRuntime = @import("../plugins/fx_runtime.zig").FxRuntime;
 
-const shared_fx_stage_id = "shared";
-const shared_fx_stage_label = "FX Stage";
 const parking_sink_name = "wiredeck_parking_sink";
 const parking_sink_label = "WireDeck Parking";
+const enable_routing_info_logs = false;
+const enable_shutdown_info_logs = false;
+const enable_shutdown_stage_logs = false;
+const live_audio_apply_warn_threshold_ns: i128 = 6 * std.time.ns_per_ms;
+const live_audio_worker_warn_threshold_ns: i128 = 12 * std.time.ns_per_ms;
+const live_audio_warn_log_interval_ns: i128 = 1000 * std.time.ns_per_ms;
 
 pub const App = struct {
     const inventory_refresh_interval_ns = 1500 * std.time.ns_per_ms;
     const routing_poll_interval_ns = 20 * std.time.ns_per_ms;
+    const live_audio_poll_interval_ns = 50 * std.time.ns_per_ms;
+    const app_resume_grace_ns = 2500 * std.time.ns_per_ms;
     const pulse_startup_retry_attempts = 6;
     const pulse_startup_retry_delay_ns = 150 * std.time.ns_per_ms;
     const worker_allocator = std.heap.c_allocator;
@@ -111,6 +119,15 @@ pub const App = struct {
         sink_name: []u8,
     };
 
+    const RecentAppFxBinding = struct {
+        channel_id: []u8,
+        source_id: []u8,
+        target_name: []u8,
+        target_node_id: ?u32,
+        port_kind: FxInputPortKind,
+        last_live_ns: i128,
+    };
+
     const ChannelTargetSink = struct {
         sink_index: u32,
         sink_name: []const u8,
@@ -121,6 +138,12 @@ pub const App = struct {
     pipewire_live: pw.PipeWireLiveProfiler,
     pulse_peak: pulse.PeakMonitor,
     last_live_generation: u64,
+    last_live_audio_apply_warn_ns: i128,
+    last_live_audio_worker_warn_ns: i128,
+    live_audio_thread: ?std.Thread,
+    live_audio_mutex: std.Thread.Mutex,
+    pending_live_discovery: ?*live_profiler_mod.Discovery,
+    live_audio_stop: std.atomic.Value(bool),
     last_inventory_refresh_ns: i128,
     refresh_thread: ?std.Thread,
     refresh_mutex: std.Thread.Mutex,
@@ -140,6 +163,7 @@ pub const App = struct {
     routed_combine_modules: std.ArrayList(RoutedCombineModule),
     routed_loopback_modules: std.ArrayList(RoutedLoopbackModule),
     routed_fx_output_loopbacks: std.ArrayList(RoutedFxOutputLoopbackModule),
+    recent_app_fx_bindings: std.ArrayList(RecentAppFxBinding),
     audio_engine: AudioEngine,
     network_audio: NetworkAudioService,
     obs_output_service: ObsOutputService,
@@ -149,6 +173,7 @@ pub const App = struct {
     fx_filters: ChannelFxFilterManager,
     lv2_support: Lv2Support,
     fx_runtime: FxRuntime,
+    last_fx_runtime_signature: u64,
     parking_sink_module_index: ?u32,
     parking_sink_name_owned: ?[]u8,
     original_default_sink_name: ?[]u8,
@@ -160,6 +185,12 @@ pub const App = struct {
             .pipewire_live = pw.PipeWireLiveProfiler.init(allocator),
             .pulse_peak = pulse.PeakMonitor.init(allocator),
             .last_live_generation = 0,
+            .last_live_audio_apply_warn_ns = 0,
+            .last_live_audio_worker_warn_ns = 0,
+            .live_audio_thread = null,
+            .live_audio_mutex = .{},
+            .pending_live_discovery = null,
+            .live_audio_stop = std.atomic.Value(bool).init(false),
             .last_inventory_refresh_ns = 0,
             .refresh_thread = null,
             .refresh_mutex = .{},
@@ -179,6 +210,7 @@ pub const App = struct {
             .routed_combine_modules = .empty,
             .routed_loopback_modules = .empty,
             .routed_fx_output_loopbacks = .empty,
+            .recent_app_fx_bindings = .empty,
             .audio_engine = AudioEngine.init(allocator),
             .network_audio = NetworkAudioService.init(allocator),
             .obs_output_service = ObsOutputService.init(allocator),
@@ -188,6 +220,7 @@ pub const App = struct {
             .fx_filters = ChannelFxFilterManager.init(allocator),
             .lv2_support = Lv2Support.init(allocator),
             .fx_runtime = FxRuntime.init(allocator),
+            .last_fx_runtime_signature = 0,
             .parking_sink_module_index = null,
             .parking_sink_name_owned = null,
             .original_default_sink_name = null,
@@ -195,25 +228,29 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
-        std.log.info("shutdown: stop routing worker", .{});
+        if (enable_shutdown_info_logs) std.log.info("shutdown: stop routing worker", .{});
         self.stopRoutingWorker();
-        std.log.info("shutdown: clear pending routing", .{});
+        if (enable_shutdown_info_logs) std.log.info("shutdown: clear pending routing", .{});
         self.clearPendingRouting();
-        std.log.info("shutdown: stop refresh worker", .{});
+        if (enable_shutdown_info_logs) std.log.info("shutdown: stop live audio worker", .{});
+        self.stopLiveAudioWorker();
+        if (enable_shutdown_info_logs) std.log.info("shutdown: clear pending live audio", .{});
+        self.clearPendingLiveDiscovery();
+        if (enable_shutdown_info_logs) std.log.info("shutdown: stop refresh worker", .{});
         self.stopRefreshWorker();
-        std.log.info("shutdown: clear pending refresh", .{});
+        if (enable_shutdown_info_logs) std.log.info("shutdown: clear pending refresh", .{});
         self.clearPendingRefresh();
-        std.log.info("shutdown: deinit fx filters", .{});
+        if (enable_shutdown_info_logs) std.log.info("shutdown: deinit fx filters", .{});
         self.fx_filters.deinit();
-        std.log.info("shutdown: deinit output exposure", .{});
+        if (enable_shutdown_info_logs) std.log.info("shutdown: deinit output exposure", .{});
         self.output_exposure.deinit();
-        std.log.info("shutdown: deinit obs output service", .{});
+        if (enable_shutdown_info_logs) std.log.info("shutdown: deinit obs output service", .{});
         self.obs_output_service.deinit();
-        std.log.info("shutdown: deinit fx processed inputs", .{});
+        if (enable_shutdown_info_logs) std.log.info("shutdown: deinit fx processed inputs", .{});
         self.fx_processed_inputs.deinit();
-        std.log.info("shutdown: deinit fx virtual inputs", .{});
+        if (enable_shutdown_info_logs) std.log.info("shutdown: deinit fx virtual inputs", .{});
         self.fx_virtual_inputs.deinit();
-        std.log.info("shutdown: restore output routing", .{});
+        if (enable_shutdown_info_logs) std.log.info("shutdown: restore output routing", .{});
         self.restoreOutputRouting() catch {};
         for (self.routed_sink_inputs.items) |item| {
             self.allocator.free(item.channel_id);
@@ -240,19 +277,25 @@ pub const App = struct {
             self.allocator.free(module.sink_name);
         }
         self.routed_fx_output_loopbacks.deinit(self.allocator);
-        std.log.info("shutdown: deinit audio engine", .{});
+        for (self.recent_app_fx_bindings.items) |binding| {
+            self.allocator.free(binding.channel_id);
+            self.allocator.free(binding.source_id);
+            self.allocator.free(binding.target_name);
+        }
+        self.recent_app_fx_bindings.deinit(self.allocator);
+        if (enable_shutdown_stage_logs) std.log.info("shutdown stage: deinit audio engine", .{});
         self.audio_engine.deinit();
-        std.log.info("shutdown: deinit network audio", .{});
+        if (enable_shutdown_stage_logs) std.log.info("shutdown stage: deinit network audio", .{});
         self.network_audio.deinit();
-        std.log.info("shutdown: deinit fx runtime", .{});
+        if (enable_shutdown_stage_logs) std.log.info("shutdown stage: deinit fx runtime", .{});
         self.fx_runtime.deinit();
-        std.log.info("shutdown: deinit pulse peak", .{});
+        if (enable_shutdown_stage_logs) std.log.info("shutdown stage: deinit pulse peak", .{});
         self.pulse_peak.deinit();
-        std.log.info("shutdown: deinit pipewire live profiler", .{});
+        if (enable_shutdown_stage_logs) std.log.info("shutdown stage: deinit pipewire live profiler", .{});
         self.pipewire_live.deinit();
         if (self.parking_sink_name_owned) |value| self.allocator.free(value);
         if (self.original_default_sink_name) |value| self.allocator.free(value);
-        std.log.info("shutdown: app deinit complete", .{});
+        if (enable_shutdown_stage_logs) std.log.info("shutdown stage: app deinit complete", .{});
     }
 
     pub fn prepareBootstrapState(self: *App) !void {
@@ -279,6 +322,9 @@ pub const App = struct {
     }
 
     pub fn startBackgroundServices(self: *App) void {
+        self.startLiveAudioWorker() catch |err| {
+            std.log.warn("live audio worker unavailable: {s}", .{@errorName(err)});
+        };
         self.startRefreshWorker() catch |err| {
             std.log.warn("audio inventory worker unavailable: {s}", .{@errorName(err)});
         };
@@ -374,68 +420,86 @@ pub const App = struct {
         const pulsectx = try initPulseContextWithRetry(self.allocator);
         defer pulsectx.deinit();
 
-        try self.activateParkingDefaultSink(pulsectx);
-        const default_sink_name = try pulsectx.defaultSinkName(self.allocator) orelse return;
-        defer self.allocator.free(default_sink_name);
-        std.log.info("startup normalization default sink: {s}", .{default_sink_name});
-        std.log.info("startup normalization leaves existing app streams on their current sinks; parking sink only applies to new defaults", .{});
+        try self.ensureParkingSinkAvailable(pulsectx);
+        const previous_default_sink_name = try pulsectx.defaultSinkName(self.allocator) orelse return;
+        defer self.allocator.free(previous_default_sink_name);
+        if (!std.mem.eql(u8, previous_default_sink_name, parking_sink_name)) {
+            try pulsectx.setDefaultSinkName(parking_sink_name);
+            std.log.info("startup normalization parking default sink: {s}", .{parking_sink_name});
+        }
+        const active_default_sink_name = try pulsectx.defaultSinkName(self.allocator) orelse return;
+        defer self.allocator.free(active_default_sink_name);
+        std.log.info("startup normalization default sink: {s}", .{active_default_sink_name});
+        std.log.info("startup normalization keeps parking as the default sink before routing so app playback is captured without duplicate output", .{});
     }
 
     pub fn pumpLiveAudio(self: *App) !void {
-        self.fx_runtime.sync(
+        const started_ns = std.time.nanoTimestamp();
+        var had_pending_discovery = false;
+        const fx_runtime_signature = computeFxRuntimeSignature(
             self.state_store.plugin_descriptors.items,
             self.state_store.channel_plugins.items,
             self.state_store.channel_plugin_params.items,
-        ) catch |err| {
-            std.log.warn("fx runtime sync failed: {s}", .{@errorName(err)});
-        };
+        );
+        if (fx_runtime_signature != self.last_fx_runtime_signature) {
+            self.fx_runtime.sync(
+                self.state_store.plugin_descriptors.items,
+                self.state_store.channel_plugins.items,
+                self.state_store.channel_plugin_params.items,
+            ) catch |err| {
+                std.log.warn("fx runtime sync failed: {s}", .{@errorName(err)});
+            };
+            self.last_fx_runtime_signature = fx_runtime_signature;
+        }
 
-        if (self.pipewire_live.canPump()) {
-            var pump_count: usize = 0;
-            while (pump_count < 3) : (pump_count += 1) {
-                self.pipewire_live.pump(if (pump_count == 2) 8 else 0) catch break;
+        self.live_audio_mutex.lock();
+        const pending_discovery = self.pending_live_discovery;
+        self.pending_live_discovery = null;
+        self.live_audio_mutex.unlock();
+
+        if (pending_discovery) |discovery_ptr| {
+            defer {
+                var discovery = discovery_ptr.*;
+                discovery.deinit(worker_allocator);
+                worker_allocator.destroy(discovery_ptr);
             }
-            self.last_live_generation = self.pipewire_live.discovery_generation;
-        }
-        self.pulse_peak.pump(8) catch {};
+            had_pending_discovery = true;
 
-        var discovery = try self.pipewire_live.snapshotDiscovery(self.allocator);
-        defer discovery.deinit(self.allocator);
+            for (self.state_store.sources.items) |*source| {
+                source.level_left = 0.0;
+                source.level_right = 0.0;
+                source.level = 0.0;
+            }
+            for (self.state_store.channels.items) |*channel| {
+                channel.level_left = 0.0;
+                channel.level_right = 0.0;
+                channel.level = 0.0;
+            }
+            for (self.state_store.destinations.items) |*destination| {
+                destination.level_left = 0.0;
+                destination.level_right = 0.0;
+                destination.level = 0.0;
+            }
 
-        for (self.state_store.sources.items) |*source| {
-            source.level_left = 0.0;
-            source.level_right = 0.0;
-            source.level = 0.0;
-        }
-        for (self.state_store.channels.items) |*channel| {
-            channel.level_left = 0.0;
-            channel.level_right = 0.0;
-            channel.level = 0.0;
-        }
-        for (self.state_store.destinations.items) |*destination| {
-            destination.level_left = 0.0;
-            destination.level_right = 0.0;
-            destination.level = 0.0;
-        }
-
-        for (discovery.channels.items) |discovered_source| {
-            if (try findMappedStateSourceIndex(self.allocator, self.state_store.sources.items, discovered_source)) |index| {
-                self.state_store.sources.items[index].level_left = discovered_source.level_left;
-                self.state_store.sources.items[index].level_right = discovered_source.level_right;
-                self.state_store.sources.items[index].level = discovered_source.level;
-                self.state_store.sources.items[index].muted = discovered_source.muted;
+            for (discovery_ptr.channels.items) |discovered_source| {
+                if (try findMappedStateSourceIndex(self.allocator, self.state_store.sources.items, discovered_source)) |index| {
+                    self.state_store.sources.items[index].level_left = discovered_source.level_left;
+                    self.state_store.sources.items[index].level_right = discovered_source.level_right;
+                    self.state_store.sources.items[index].level = discovered_source.level;
+                    self.state_store.sources.items[index].muted = discovered_source.muted;
+                }
+            }
+            for (discovery_ptr.destinations.items) |discovered_destination| {
+                if (findMappedStateDestinationIndex(self.state_store.destinations.items, discovered_destination)) |index| {
+                    self.state_store.destinations.items[index].level_left = discovered_destination.level_left;
+                    self.state_store.destinations.items[index].level_right = discovered_destination.level_right;
+                    self.state_store.destinations.items[index].level = discovered_destination.level;
+                }
             }
         }
+
         self.network_audio.applyToSources(self.state_store.sources.items);
         self.pulse_peak.applyToSources(self.state_store.sources.items);
-        for (discovery.destinations.items) |discovered_destination| {
-            if (findMappedStateDestinationIndex(self.state_store.destinations.items, discovered_destination)) |index| {
-                self.state_store.destinations.items[index].level_left = discovered_destination.level_left;
-                self.state_store.destinations.items[index].level_right = discovered_destination.level_right;
-                self.state_store.destinations.items[index].level = discovered_destination.level;
-            }
-        }
-
         for (self.state_store.channels.items) |*channel| {
             const bound_source_id = channel.bound_source_id orelse continue;
             const source = findStateSource(self.state_store.sources.items, bound_source_id) orelse continue;
@@ -454,6 +518,21 @@ pub const App = struct {
                     channel.level = levels.level;
                 },
             }
+        }
+
+        const duration_ns = std.time.nanoTimestamp() - started_ns;
+        if (duration_ns >= live_audio_apply_warn_threshold_ns and
+            (self.last_live_audio_apply_warn_ns == 0 or started_ns - self.last_live_audio_apply_warn_ns >= live_audio_warn_log_interval_ns))
+        {
+            self.last_live_audio_apply_warn_ns = started_ns;
+            std.log.warn(
+                "live audio apply slow: duration_ns={d} had_pending_discovery={any} live_generation={d}",
+                .{
+                    duration_ns,
+                    had_pending_discovery,
+                    self.last_live_generation,
+                },
+            );
         }
     }
 
@@ -537,6 +616,12 @@ pub const App = struct {
         self.refresh_thread = try std.Thread.spawn(.{}, refreshWorkerMain, .{self});
     }
 
+    fn startLiveAudioWorker(self: *App) !void {
+        if (self.live_audio_thread != null) return;
+        self.live_audio_stop.store(false, .release);
+        self.live_audio_thread = try std.Thread.spawn(.{}, liveAudioWorkerMain, .{self});
+    }
+
     fn startRoutingWorker(self: *App) !void {
         if (self.routing_thread != null) return;
         self.routing_stop.store(false, .release);
@@ -548,6 +633,14 @@ pub const App = struct {
         if (self.refresh_thread) |thread| {
             thread.join();
             self.refresh_thread = null;
+        }
+    }
+
+    fn stopLiveAudioWorker(self: *App) void {
+        self.live_audio_stop.store(true, .release);
+        if (self.live_audio_thread) |thread| {
+            thread.join();
+            self.live_audio_thread = null;
         }
     }
 
@@ -567,6 +660,17 @@ pub const App = struct {
             value.deinit(worker_allocator);
             worker_allocator.destroy(pending);
             self.pending_refresh = null;
+        }
+    }
+
+    fn clearPendingLiveDiscovery(self: *App) void {
+        self.live_audio_mutex.lock();
+        defer self.live_audio_mutex.unlock();
+        if (self.pending_live_discovery) |pending| {
+            var discovery = pending.*;
+            discovery.deinit(worker_allocator);
+            worker_allocator.destroy(pending);
+            self.pending_live_discovery = null;
         }
     }
 
@@ -597,6 +701,79 @@ pub const App = struct {
             worker_allocator.destroy(pending);
         }
         self.pending_routing = snapshot_ptr;
+    }
+
+    fn pruneRecentAppFxBindings(self: *App, now_ns: i128) void {
+        var index: usize = 0;
+        while (index < self.recent_app_fx_bindings.items.len) {
+            const binding = self.recent_app_fx_bindings.items[index];
+            if (now_ns - binding.last_live_ns <= app_resume_grace_ns) {
+                index += 1;
+                continue;
+            }
+            self.allocator.free(binding.channel_id);
+            self.allocator.free(binding.source_id);
+            self.allocator.free(binding.target_name);
+            _ = self.recent_app_fx_bindings.orderedRemove(index);
+        }
+    }
+
+    fn findRecentAppFxBindingIndex(self: *const App, channel_id: []const u8) ?usize {
+        for (self.recent_app_fx_bindings.items, 0..) |binding, index| {
+            if (std.mem.eql(u8, binding.channel_id, channel_id)) return index;
+        }
+        return null;
+    }
+
+    fn rememberRecentAppFxBinding(self: *App, channel_id: []const u8, source_id: []const u8, binding: FxInputBinding) !void {
+        const target_name = binding.target_name orelse return;
+        const now_ns = std.time.nanoTimestamp();
+        self.pruneRecentAppFxBindings(now_ns);
+
+        if (self.findRecentAppFxBindingIndex(channel_id)) |index| {
+            var existing = &self.recent_app_fx_bindings.items[index];
+            if (!std.mem.eql(u8, existing.source_id, source_id)) {
+                self.allocator.free(existing.source_id);
+                existing.source_id = try self.allocator.dupe(u8, source_id);
+            }
+            self.allocator.free(existing.target_name);
+            existing.target_name = try self.allocator.dupe(u8, target_name);
+            existing.target_node_id = binding.target_node_id;
+            existing.port_kind = binding.port_kind;
+            existing.last_live_ns = now_ns;
+            return;
+        }
+
+        try self.recent_app_fx_bindings.append(self.allocator, .{
+            .channel_id = try self.allocator.dupe(u8, channel_id),
+            .source_id = try self.allocator.dupe(u8, source_id),
+            .target_name = try self.allocator.dupe(u8, target_name),
+            .target_node_id = binding.target_node_id,
+            .port_kind = binding.port_kind,
+            .last_live_ns = now_ns,
+        });
+    }
+
+    fn recentAppFxBinding(self: *App, channel_id: []const u8, source_id: []const u8) ?RecentAppFxBinding {
+        const index = self.findRecentAppFxBindingIndex(channel_id) orelse return null;
+        const now_ns = std.time.nanoTimestamp();
+        const binding = self.recent_app_fx_bindings.items[index];
+        if (now_ns - binding.last_live_ns > app_resume_grace_ns or !std.mem.eql(u8, binding.source_id, source_id)) {
+            self.allocator.free(binding.channel_id);
+            self.allocator.free(binding.source_id);
+            self.allocator.free(binding.target_name);
+            _ = self.recent_app_fx_bindings.orderedRemove(index);
+            return null;
+        }
+        return self.recent_app_fx_bindings.items[index];
+    }
+
+    fn hasRecentAppFxBindingForChannel(self: *App, state_store: *const StateStore, channel_id: []const u8) bool {
+        const channel = findStateChannel(state_store, channel_id) orelse return false;
+        const source_id = channel.bound_source_id orelse return false;
+        const source = findStateSource(state_store.sources.items, source_id) orelse return false;
+        if (source.kind != .app) return false;
+        return self.recentAppFxBinding(channel_id, source.id) != null;
     }
 
     fn applyPendingRefresh(self: *App) !void {
@@ -668,6 +845,7 @@ pub const App = struct {
     }
 
     fn reconcileOutputRouting(self: *App, state_store: *const StateStore) !void {
+        self.pruneRecentAppFxBindings(std.time.nanoTimestamp());
         self.network_audio.configure(state_store.network_audio);
         try self.audio_engine.syncGraph(
             state_store.channels.items,
@@ -709,18 +887,7 @@ pub const App = struct {
         try collectVirtualCaptureFxChannels(self.allocator, state_store, owners, fx_channels.items, fx_route_specs.items, &fx_capture_channels);
 
         try self.fx_virtual_inputs.sync(fx_capture_channels.items);
-        if (fx_route_specs.items.len == 0) {
-            try self.fx_processed_inputs.sync(&.{});
-        } else {
-            const shared_fx_channel = [_]channels_mod.Channel{
-                .{
-                    .id = shared_fx_stage_id,
-                    .label = shared_fx_stage_label,
-                    .subtitle = "internal",
-                },
-            };
-            try self.fx_processed_inputs.sync(&shared_fx_channel);
-        }
+        try self.fx_processed_inputs.sync(&.{});
         try self.fx_filters.sync(
             &self.audio_engine,
             &self.fx_runtime,
@@ -834,7 +1001,8 @@ pub const App = struct {
                 pulsectx,
                 sink_input,
                 uses_fx,
-            ) or (try self.resolveTargetSinkForChannel(state_store, routed.channel_id, routing_pulse_snapshot, pulsectx)) != null;
+            ) or self.hasRecentAppFxBindingForChannel(state_store, routed.channel_id) or
+                (try self.resolveTargetSinkForChannel(state_store, routed.channel_id, routing_pulse_snapshot, pulsectx)) != null;
             if (channel_still_has_target) {
                 index += 1;
                 continue;
@@ -952,7 +1120,7 @@ pub const App = struct {
         std.log.info("shutdown restore: complete", .{});
     }
 
-    fn activateParkingDefaultSink(self: *App, pulsectx: *pulse.PulseContext) !void {
+    fn ensureParkingSinkAvailable(self: *App, pulsectx: *pulse.PulseContext) !void {
         const pulse_snapshot = try pulsectx.snapshot(self.allocator);
         defer pulse.freeSnapshot(self.allocator, pulse_snapshot);
 
@@ -989,13 +1157,6 @@ pub const App = struct {
 
             self.parking_sink_module_index = try pulsectx.loadModule("module-null-sink", args);
             self.parking_sink_name_owned = try self.allocator.dupe(u8, parking_sink_name);
-        }
-
-        const active_default_sink_name = try pulsectx.defaultSinkName(self.allocator) orelse return;
-        defer self.allocator.free(active_default_sink_name);
-        if (!std.mem.eql(u8, active_default_sink_name, parking_sink_name)) {
-            try pulsectx.setDefaultSinkName(parking_sink_name);
-            std.log.info("startup normalization parking default sink: {s}", .{parking_sink_name});
         }
     }
 
@@ -1084,7 +1245,7 @@ pub const App = struct {
             const fx_route_ready = !uses_fx or self.fx_filters.routeReady(channel.id);
             const direct_app_capture = routeSpecUsesDirectAppCapture(fx_route_specs, channel.id);
             for (owners) |owner| {
-                if (!try ownerMatchesGroupedSourceId(self.allocator, owner, bound_source_id)) continue;
+                if (!try ownerMatchesAppSource(self.allocator, owner, source)) continue;
                 for (owner.pulse_sink_input_indexes) |sink_input_index| {
                     const sink_input = findPulseSinkInput(pulse_snapshot.sink_inputs, sink_input_index) orelse continue;
                     const preserved_volume = if (findRecordedRoutedSinkInput(self.routed_sink_inputs.items, sink_input_index)) |recorded|
@@ -1095,7 +1256,7 @@ pub const App = struct {
                         if (!fx_route_ready) {
                             if (shouldHoldNetworkCaptureRoute(self, state_store, channel.id, pulse_snapshot, pulsectx, sink_input, uses_fx)) {
                                 removeBlockedSinkInput(&self.blocked_sink_inputs, sink_input_index);
-                                if (source.kind == .app) {
+                                if (source.kind == .app and enable_routing_info_logs) {
                                     std.log.info(
                                         "routing app decision: channel={s} sink_input={d} mode=route_not_ready_hold current_sink={d} muted={any} volume={d:.3}",
                                         .{
@@ -1109,7 +1270,7 @@ pub const App = struct {
                                 }
                                 continue;
                             }
-                            if (source.kind == .app) {
+                            if (source.kind == .app and enable_routing_info_logs) {
                                 std.log.info(
                                     "routing app decision: channel={s} sink_input={d} mode=route_not_ready direct_capture={any} current_sink={d} muted={any} volume={d:.3}",
                                     .{
@@ -1153,46 +1314,84 @@ pub const App = struct {
 
                         if (direct_app_capture) {
                             removeBlockedSinkInput(&self.blocked_sink_inputs, sink_input_index);
-                            const parking_target_sink_index = findPulseSinkIndexByName(pulse_snapshot, parking_sink_name);
-                            std.log.info(
-                                "routing app decision: channel={s} sink_input={d} mode=direct_capture_ready parking_sink={d} current_sink={d} muted={any} volume={d:.3}",
-                                .{
-                                    channel.id,
-                                    sink_input_index,
-                                    parking_target_sink_index orelse 0,
-                                    sink_input.sink_index orelse 0,
-                                    sink_input.muted,
-                                    sink_input.volume,
-                                },
-                            );
+                            var parking_target_sink_index = findPulseSinkIndexByName(pulse_snapshot, parking_sink_name);
+                            if (parking_target_sink_index == null) {
+                                self.ensureParkingSinkAvailable(pulsectx) catch |err| {
+                                    std.log.warn("routing app direct capture parking ensure failed: channel={s} sink_input={d} err={s}", .{
+                                        channel.id,
+                                        sink_input_index,
+                                        @errorName(err),
+                                    });
+                                };
+                                const latest_snapshot = try pulsectx.snapshot(self.allocator);
+                                defer pulse.freeSnapshot(self.allocator, latest_snapshot);
+                                parking_target_sink_index = findPulseSinkIndexByName(latest_snapshot, parking_sink_name);
+                            }
+                            if (enable_routing_info_logs) {
+                                std.log.info(
+                                    "routing app decision: channel={s} sink_input={d} mode=direct_capture_ready parking_sink={d} current_sink={d} muted={any} volume={d:.3}",
+                                    .{
+                                        channel.id,
+                                        sink_input_index,
+                                        parking_target_sink_index orelse 0,
+                                        sink_input.sink_index orelse 0,
+                                        sink_input.muted,
+                                        sink_input.volume,
+                                    },
+                                );
+                            }
+                            const current_sink_index = sink_input.sink_index orelse 0;
+                            const keep_on_parking = blk: {
+                                const parking_sink_index = parking_target_sink_index orelse break :blk false;
+                                if (current_sink_index == parking_sink_index) break :blk true;
+                                if (findRecordedRoutedSinkInput(self.routed_sink_inputs.items, sink_input_index)) |recorded| {
+                                    break :blk recorded.original_sink_index == parking_sink_index;
+                                }
+                                break :blk false;
+                            };
                             if (findRecordedRoutedSinkInput(self.routed_sink_inputs.items, sink_input_index)) |recorded| {
-                                const current_sink_index = sink_input.sink_index orelse recorded.original_sink_index;
-                                const desired_sink_index = parking_target_sink_index orelse recorded.original_sink_index;
-                                if (current_sink_index != desired_sink_index or
+                                const active_sink_index = sink_input.sink_index orelse recorded.original_sink_index;
+                                const desired_sink_index: ?u32 = if (keep_on_parking)
+                                    (parking_target_sink_index orelse recorded.original_sink_index)
+                                else
+                                    null;
+                                const desired_volume = if (keep_on_parking)
+                                    recorded.original_volume
+                                else
+                                    0.0;
+                                const needs_sink_move = if (desired_sink_index) |sink_index|
+                                    active_sink_index != sink_index
+                                else
+                                    false;
+                                if (needs_sink_move or
                                     sink_input.muted != recorded.original_muted or
-                                    !approxEqVolume(sink_input.volume, recorded.original_volume))
+                                    !approxEqVolume(sink_input.volume, desired_volume))
                                 {
                                     try out.append(self.allocator, .{
                                         .channel_id = channel.id,
                                         .sink_input_index = sink_input_index,
                                         .target_sink_index = desired_sink_index,
                                         .muted = recorded.original_muted,
-                                        .volume = recorded.original_volume,
+                                        .volume = desired_volume,
                                         .block_on_failure = false,
                                     });
                                 }
-                            } else if ((parking_target_sink_index != null and (sink_input.sink_index orelse 0) != parking_target_sink_index.?) or
-                                sink_input.muted or
-                                !approxEqVolume(sink_input.volume, 1.0))
-                            {
-                                try out.append(self.allocator, .{
-                                    .channel_id = channel.id,
-                                    .sink_input_index = sink_input_index,
-                                    .target_sink_index = parking_target_sink_index,
-                                    .muted = false,
-                                    .volume = preserved_volume,
-                                    .block_on_failure = false,
-                                });
+                            } else {
+                                const desired_sink_index: ?u32 = if (keep_on_parking) parking_target_sink_index else null;
+                                const desired_volume = if (keep_on_parking) preserved_volume else 0.0;
+                                if ((desired_sink_index != null and current_sink_index != desired_sink_index.?) or
+                                    sink_input.muted or
+                                    !approxEqVolume(sink_input.volume, desired_volume))
+                                {
+                                    try out.append(self.allocator, .{
+                                        .channel_id = channel.id,
+                                        .sink_input_index = sink_input_index,
+                                        .target_sink_index = desired_sink_index,
+                                        .muted = false,
+                                        .volume = desired_volume,
+                                        .block_on_failure = false,
+                                    });
+                                }
                             }
                             continue;
                         }
@@ -1577,21 +1776,13 @@ pub const App = struct {
                 continue;
             }
 
-            const output_target_names = try self.allocator.alloc([]const u8, 1);
-            errdefer self.allocator.free(output_target_names);
-            output_target_names[0] = try virtual_inputs.allocSinkName(self.allocator, "wiredeck_fx_", shared_fx_stage_id);
-            errdefer {
-                self.allocator.free(output_target_names[0]);
-                self.allocator.free(output_target_names);
-            }
-
             try out.append(self.allocator, .{
                 .channel_id = channel.id,
                 .requires_external_capture = channelRequiresExternalCapture(state_store, channel),
                 .input_target_name = input_binding.target_name,
                 .input_target_node_id = input_binding.target_node_id,
                 .input_port_kind = input_binding.port_kind,
-                .output_target_names = output_target_names,
+                .output_target_names = &.{},
             });
         }
     }
@@ -1626,7 +1817,7 @@ pub const App = struct {
         defer meter_specs.deinit(allocator);
         for (sources.items) |source| {
             if (source.kind == .app) {
-                try appendAppPulseSpecs(allocator, &meter_specs, snapshot, owners, source.id);
+                try appendAppPulseSpecs(allocator, &meter_specs, snapshot, owners, source);
             } else {
                 try appendPhysicalPulseSpecs(allocator, &meter_specs, snapshot, source);
             }
@@ -1911,7 +2102,7 @@ pub const App = struct {
 
         for (self.state_store.sources.items) |source| {
             if (source.kind == .app) {
-                try appendAppPulseSpecs(self.allocator, &specs, snapshot, owners, source.id);
+                try appendAppPulseSpecs(self.allocator, &specs, snapshot, owners, source);
             } else {
                 try appendPhysicalPulseSpecs(self.allocator, &specs, snapshot, source);
             }
@@ -1945,6 +2136,61 @@ fn refreshWorkerMain(app: *App) void {
             App.worker_allocator.destroy(pending);
         }
         app.pending_refresh = refresh_ptr;
+    }
+}
+
+fn liveAudioWorkerMain(app: *App) void {
+    while (!app.live_audio_stop.load(.acquire)) {
+        const started_ns = std.time.nanoTimestamp();
+        if (app.pipewire_live.canPump()) {
+            var pump_count: usize = 0;
+            while (pump_count < 3) : (pump_count += 1) {
+                app.pipewire_live.pump(if (pump_count == 2) 8 else 0) catch break;
+            }
+            app.last_live_generation = app.pipewire_live.discovery_generation;
+        }
+        app.pulse_peak.pump(8) catch {};
+
+        const discovery_ptr = App.worker_allocator.create(live_profiler_mod.Discovery) catch {
+            std.Thread.sleep(App.live_audio_poll_interval_ns);
+            continue;
+        };
+        discovery_ptr.* = app.pipewire_live.snapshotDiscovery(App.worker_allocator) catch |err| {
+            App.worker_allocator.destroy(discovery_ptr);
+            if (err != error.OutOfMemory) {
+                std.log.warn("live audio worker discovery failed: {s}", .{@errorName(err)});
+            }
+            std.Thread.sleep(App.live_audio_poll_interval_ns);
+            continue;
+        };
+
+        app.live_audio_mutex.lock();
+        if (app.pending_live_discovery) |pending| {
+            var previous = pending.*;
+            previous.deinit(App.worker_allocator);
+            App.worker_allocator.destroy(pending);
+        }
+        app.pending_live_discovery = discovery_ptr;
+        app.live_audio_mutex.unlock();
+
+        const duration_ns = std.time.nanoTimestamp() - started_ns;
+        if (duration_ns >= live_audio_worker_warn_threshold_ns and
+            (app.last_live_audio_worker_warn_ns == 0 or started_ns - app.last_live_audio_worker_warn_ns >= live_audio_warn_log_interval_ns))
+        {
+            app.last_live_audio_worker_warn_ns = started_ns;
+            std.log.warn(
+                "live audio worker slow: duration_ns={d} live_generation={d}",
+                .{
+                    duration_ns,
+                    app.last_live_generation,
+                },
+            );
+        }
+
+        const elapsed_ns = std.time.nanoTimestamp() - started_ns;
+        if (elapsed_ns < App.live_audio_poll_interval_ns) {
+            std.Thread.sleep(@intCast(App.live_audio_poll_interval_ns - elapsed_ns));
+        }
     }
 }
 
@@ -2005,6 +2251,61 @@ fn findStateSource(sources: []const sources_mod.Source, source_id: []const u8) ?
         if (std.mem.eql(u8, source.id, source_id)) return source;
     }
     return null;
+}
+
+fn computeFxRuntimeSignature(
+    descriptors: []const plugin_host.PluginDescriptor,
+    channel_plugins: []const plugin_chain.ChannelPlugin,
+    channel_plugin_params: []const plugin_chain.ChannelPluginParam,
+) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+
+    for (descriptors) |descriptor| {
+        hasher.update(descriptor.id);
+        hasher.update(descriptor.label);
+        hasher.update(descriptor.category);
+        hasher.update(descriptor.bundle_name);
+        hasher.update(descriptor.primary_ui_uri);
+        hasher.update(std.mem.asBytes(&[_]u8{
+            @intFromEnum(descriptor.backend),
+            @intFromBool(descriptor.has_custom_ui),
+        }));
+        for (descriptor.control_ports) |port| {
+            hasher.update(std.mem.asBytes(&port.index));
+            hasher.update(port.symbol);
+            hasher.update(port.label);
+            hasher.update(std.mem.asBytes(&port.min_value));
+            hasher.update(std.mem.asBytes(&port.max_value));
+            hasher.update(std.mem.asBytes(&port.default_value));
+            hasher.update(std.mem.asBytes(&[_]u8{
+                @intFromBool(port.is_output),
+                @intFromBool(port.toggled),
+                @intFromBool(port.integer),
+                @intFromBool(port.enumeration),
+                @intFromEnum(port.sync_kind),
+            }));
+        }
+    }
+
+    for (channel_plugins) |channel_plugin| {
+        hasher.update(channel_plugin.id);
+        hasher.update(channel_plugin.channel_id);
+        hasher.update(channel_plugin.descriptor_id);
+        hasher.update(channel_plugin.label);
+        hasher.update(std.mem.asBytes(&channel_plugin.slot));
+        hasher.update(std.mem.asBytes(&[_]u8{
+            @intFromEnum(channel_plugin.backend),
+            @intFromBool(channel_plugin.enabled),
+        }));
+    }
+
+    for (channel_plugin_params) |channel_plugin_param| {
+        hasher.update(channel_plugin_param.plugin_id);
+        hasher.update(channel_plugin_param.symbol);
+        hasher.update(std.mem.asBytes(&channel_plugin_param.value));
+    }
+
+    return hasher.final();
 }
 
 fn logAppInventoryRefresh(state_store: *const StateStore, next_sources: []const sources_mod.Source) void {
@@ -2470,20 +2771,10 @@ fn appendAppPulseSpecs(
     specs: *std.ArrayList(pulse.MeterSpec),
     snapshot: pulse.PulseSnapshot,
     owners: []const binder.BoundOwner,
-    grouped_source_id: []const u8,
+    source: sources_mod.Source,
 ) !void {
     for (owners) |owner| {
-        if (shouldSkipGroupedAppOwner(owner)) continue;
-
-        const resolved = try icon.resolve(allocator, .{
-            .process_binary = owner.process_binary,
-            .app_name = owner.flatpak_app_id orelse owner.app_name,
-        });
-        defer icon.freeResolveResult(allocator, resolved);
-
-        const owner_group_id = try buildGroupedAppSourceId(allocator, owner, resolved);
-        defer allocator.free(owner_group_id);
-        if (!std.mem.eql(u8, owner_group_id, grouped_source_id)) continue;
+        if (!try ownerMatchesAppSource(allocator, owner, source)) continue;
 
         for (owner.pulse_sink_input_indexes) |sink_input_index| {
             const sink_input = findPulseSinkInput(snapshot.sink_inputs, sink_input_index) orelse continue;
@@ -2491,7 +2782,7 @@ fn appendAppPulseSpecs(
             const sink = findPulseSink(snapshot.sinks, sink_index) orelse continue;
             const monitor_name = sink.monitor_source_name orelse continue;
             try specs.append(allocator, .{
-                .source_id = try allocator.dupe(u8, grouped_source_id),
+                .source_id = try allocator.dupe(u8, source.id),
                 .channel_id = null,
                 .pulse_source_name = try allocator.dupe(u8, monitor_name),
                 .sink_input_index = sink_input_index,
@@ -2714,8 +3005,6 @@ fn resolveFxInputBinding(
     owners: []const binder.BoundOwner,
     channel: channels_mod.Channel,
 ) !FxInputBinding {
-    _ = registry;
-    _ = owners;
     if (!channelRequiresExternalCapture(state_store, channel)) return .{};
 
     const bound_source_id = channel.bound_source_id orelse {
@@ -2732,10 +3021,77 @@ fn resolveFxInputBinding(
     };
 
     if (source.kind == .app) {
-        std.log.info("routing fx input: channel={s} source={s} mode=fallback_monitor reason=sticky_app_virtual_capture", .{
-            channel.id,
-            bound_source_id,
-        });
+        if (try resolveDirectAppPipewireNodeTarget(self.allocator, registry, owners, pulse_snapshot, source)) |target| {
+            const binding: FxInputBinding = .{
+                .target_name = target.node_name,
+                .target_node_id = target.node_id,
+                .port_kind = .output,
+            };
+            try self.rememberRecentAppFxBinding(channel.id, source.id, binding);
+            if (enable_routing_info_logs) {
+                std.log.info("routing fx input: channel={s} source={s} mode=direct_output target={s} node_id={d}", .{
+                    channel.id,
+                    bound_source_id,
+                    target.node_name,
+                    target.node_id,
+                });
+            }
+            return binding;
+        }
+        if (self.recentAppFxBinding(channel.id, source.id)) |recent_binding| {
+            if (recent_binding.port_kind == .output) {
+                if (enable_routing_info_logs) {
+                    std.log.info("routing fx input: channel={s} source={s} mode=hold_recent target={s} port={s}", .{
+                        channel.id,
+                        bound_source_id,
+                        recent_binding.target_name,
+                        @tagName(recent_binding.port_kind),
+                    });
+                }
+                return .{
+                    .target_name = try self.allocator.dupe(u8, recent_binding.target_name),
+                    .target_node_id = recent_binding.target_node_id,
+                    .port_kind = recent_binding.port_kind,
+                };
+            }
+        }
+        if (appSourceHasLiveFallbackCaptureOwner(self.allocator, owners, source)) {
+            const target_name = try virtual_inputs.allocSinkName(self.allocator, "wiredeck_input_", channel.id);
+            const binding: FxInputBinding = .{
+                .target_name = target_name,
+                .port_kind = .monitor,
+            };
+            try self.rememberRecentAppFxBinding(channel.id, source.id, binding);
+            if (enable_routing_info_logs) {
+                std.log.info("routing fx input: channel={s} source={s} mode=fallback_monitor reason=sticky_app_virtual_capture", .{
+                    channel.id,
+                    bound_source_id,
+                });
+            }
+            return binding;
+        }
+        if (self.recentAppFxBinding(channel.id, source.id)) |recent_binding| {
+            if (enable_routing_info_logs) {
+                std.log.info("routing fx input: channel={s} source={s} mode=hold_recent target={s} port={s}", .{
+                    channel.id,
+                    bound_source_id,
+                    recent_binding.target_name,
+                    @tagName(recent_binding.port_kind),
+                });
+            }
+            return .{
+                .target_name = try self.allocator.dupe(u8, recent_binding.target_name),
+                .target_node_id = recent_binding.target_node_id,
+                .port_kind = recent_binding.port_kind,
+            };
+        }
+        if (enable_routing_info_logs) {
+            std.log.info("routing fx input: channel={s} source={s} mode=skip reason=no_live_app_owner", .{
+                channel.id,
+                bound_source_id,
+            });
+        }
+        return .{};
     } else if (matchPulseSourceNameForStateSource(pulse_snapshot, source)) |source_name| {
         return .{
             .target_name = try self.allocator.dupe(u8, source_name),
@@ -2754,29 +3110,45 @@ fn resolveDirectAppPipewireNodeTarget(
     registry: *const pw.RegistryState,
     owners: []const binder.BoundOwner,
     pulse_snapshot: pulse.PulseSnapshot,
-    grouped_source_id: []const u8,
+    source: sources_mod.Source,
 ) !?DirectAppPipewireNodeTarget {
     var active_target: ?DirectAppPipewireNodeTarget = null;
     errdefer if (active_target) |target| allocator.free(target.node_name);
+    var corked_target: ?DirectAppPipewireNodeTarget = null;
+    errdefer if (corked_target) |target| allocator.free(target.node_name);
     var matched_owner_count: usize = 0;
     var matched_output_node_count: usize = 0;
     var corked_node_count: usize = 0;
     var ambiguous = false;
 
     for (owners) |owner| {
-        if (!try ownerMatchesGroupedSourceId(allocator, owner, grouped_source_id)) continue;
+        if (!try ownerMatchesAppSource(allocator, owner, source)) continue;
         matched_owner_count += 1;
         for (owner.pw_node_ids) |pw_node_id| {
             const obj = findRegistryNodeById(registry, pw_node_id) orelse continue;
             const media_class = obj.props.media_class orelse continue;
             if (!std.mem.eql(u8, media_class, "Stream/Output/Audio")) continue;
             matched_output_node_count += 1;
+            const node_name = obj.props.node_name orelse continue;
 
             if (obj.props.object_serial) |serial| {
                 const sink_input_index = std.math.cast(u32, serial) orelse continue;
                 const sink_input = findPulseSinkInput(pulse_snapshot.sink_inputs, sink_input_index) orelse continue;
                 if (sink_input.corked) {
                     corked_node_count += 1;
+                    if (corked_target) |existing| {
+                        if (existing.node_id != pw_node_id) {
+                            allocator.free(existing.node_name);
+                            corked_target = null;
+                            ambiguous = true;
+                            return null;
+                        }
+                    } else {
+                        corked_target = .{
+                            .node_id = pw_node_id,
+                            .node_name = try allocator.dupe(u8, node_name),
+                        };
+                    }
                     continue;
                 }
                 if (active_target) |existing| {
@@ -2789,7 +3161,6 @@ fn resolveDirectAppPipewireNodeTarget(
                     continue;
                 }
 
-                const node_name = obj.props.node_name orelse continue;
                 active_target = .{
                     .node_id = pw_node_id,
                     .node_name = try allocator.dupe(u8, node_name),
@@ -2809,11 +3180,22 @@ fn resolveDirectAppPipewireNodeTarget(
         }
     }
 
+    if (active_target == null and corked_target != null and !ambiguous) {
+        std.log.info("routing app direct target: source={s} mode=hold_corked owners={d} output_nodes={d} corked_nodes={d}", .{
+            source.id,
+            matched_owner_count,
+            matched_output_node_count,
+            corked_node_count,
+        });
+        active_target = corked_target;
+        corked_target = null;
+    }
+
     if (active_target == null and matched_owner_count > 0) {
         std.log.info(
             "routing app direct target unavailable: source={s} owners={d} output_nodes={d} corked_nodes={d} ambiguous={any}",
             .{
-                grouped_source_id,
+                source.id,
                 matched_owner_count,
                 matched_output_node_count,
                 corked_node_count,
@@ -2901,7 +3283,7 @@ fn channelHasActiveFallbackAppCapture(
     if (source.kind != .app) return true;
 
     for (owners) |owner| {
-        if (!(ownerMatchesGroupedSourceId(allocator, owner, bound_source_id) catch false)) continue;
+        if (!(ownerMatchesAppSource(allocator, owner, source) catch false)) continue;
         if (owner.pulse_sink_input_indexes.len > 0) return true;
     }
     return false;
@@ -3120,6 +3502,73 @@ fn ownerMatchesGroupedSourceId(
     const owner_group_id = try buildGroupedAppSourceId(allocator, owner, resolved);
     defer allocator.free(owner_group_id);
     return std.mem.eql(u8, owner_group_id, grouped_source_id);
+}
+
+fn ownerMatchesAppSource(
+    allocator: std.mem.Allocator,
+    owner: binder.BoundOwner,
+    source: sources_mod.Source,
+) !bool {
+    if (source.kind != .app) return false;
+    if (shouldSkipGroupedAppOwner(owner)) return false;
+    if (try ownerMatchesGroupedSourceId(allocator, owner, source.id)) return true;
+
+    const source_group_id = try buildGroupedSourceIdForDiscovered(allocator, source);
+    defer allocator.free(source_group_id);
+    if (try ownerMatchesGroupedSourceId(allocator, owner, source_group_id)) return true;
+
+    if (looksLikeDiscordSource(source) and looksLikeDiscordCaptureOwner(owner)) return true;
+    return ownerMatchesAppSourceMetadata(owner, source);
+}
+
+fn ownerMatchesAppSourceMetadata(owner: binder.BoundOwner, source: sources_mod.Source) bool {
+    const label_match = appSourceFieldMatchesOwner(source.label, owner);
+    const subtitle_match = appSourceFieldMatchesOwner(source.subtitle, owner);
+    const process_match = appSourceFieldMatchesOwner(source.process_binary, owner);
+
+    if (process_match) return true;
+    if (label_match and (source.subtitle.len == 0 or subtitle_match or process_match)) return true;
+    if (subtitle_match and (source.label.len == 0 or label_match or process_match)) return true;
+    return false;
+}
+
+fn appSourceFieldMatchesOwner(source_value: []const u8, owner: binder.BoundOwner) bool {
+    return sameAppIdentityText(source_value, normalizedOwnerLabel(owner)) or
+        sameAppIdentityText(source_value, normalizedOwnerSubtitle(owner)) or
+        sameAppIdentityText(source_value, owner.process_binary orelse "") or
+        sameAppIdentityText(source_value, owner.app_name orelse "") or
+        sameAppIdentityText(source_value, owner.media_name orelse "") or
+        sameAppIdentityText(source_value, owner.flatpak_app_id orelse "");
+}
+
+fn sameAppIdentityText(left: []const u8, right: []const u8) bool {
+    if (!appIdentityTextLooksUsable(left) or !appIdentityTextLooksUsable(right)) return false;
+    if (sameText(left, right)) return true;
+    if (left.len < 4 or right.len < 4) return false;
+    return containsIgnoreCase(left, right) or containsIgnoreCase(right, left);
+}
+
+fn appIdentityTextLooksUsable(value: []const u8) bool {
+    if (value.len == 0) return false;
+    if (containsIgnoreCase(value, "wiredeck")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "unknown app")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "audio")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "playback")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "audio stream")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "output stream")) return false;
+    return true;
+}
+
+fn appSourceHasLiveFallbackCaptureOwner(
+    allocator: std.mem.Allocator,
+    owners: []const binder.BoundOwner,
+    source: sources_mod.Source,
+) bool {
+    for (owners) |owner| {
+        if (!(ownerMatchesAppSource(allocator, owner, source) catch false)) continue;
+        if (owner.pulse_sink_input_indexes.len > 0) return true;
+    }
+    return false;
 }
 
 fn containsDesiredMove(items: []const DesiredSinkMove, sink_input_index: u32) bool {

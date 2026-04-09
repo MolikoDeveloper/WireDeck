@@ -1,5 +1,6 @@
 const std = @import("std");
 const audio_engine_mod = @import("../audio/engine.zig");
+const bus_buffer_mod = @import("../audio/bus_consumer_buffer.zig");
 
 const c = @cImport({
     @cInclude("pipewire/pipewire.h");
@@ -9,6 +10,8 @@ const c = @cImport({
 });
 
 pub const BusPlaybackStream = struct {
+    const target_buffer_frames = bus_buffer_mod.render_quantum_frames * 4;
+
     allocator: std.mem.Allocator,
     engine: *audio_engine_mod.AudioEngine,
     bus_id: []u8,
@@ -22,6 +25,8 @@ pub const BusPlaybackStream = struct {
     trigger_thread: ?std.Thread = null,
     pipewire_initialized: bool = false,
     stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    buffer_mutex: std.Thread.Mutex = .{},
+    pcm_buffer: bus_buffer_mod.BusConsumerBuffer,
     last_signal_log_ns: i128 = 0,
     last_silence_log_ns: i128 = 0,
     process_callback_count: u64 = 0,
@@ -45,8 +50,10 @@ pub const BusPlaybackStream = struct {
             .consumer_id = try allocator.dupe(u8, consumer_id),
             .target_sink_name = try allocator.dupe(u8, target_sink_name),
             .description = try allocator.dupe(u8, description),
+            .pcm_buffer = bus_buffer_mod.BusConsumerBuffer.init(allocator),
         };
         errdefer {
+            self.pcm_buffer.deinit();
             allocator.free(self.description);
             allocator.free(self.target_sink_name);
             allocator.free(self.consumer_id);
@@ -156,6 +163,7 @@ pub const BusPlaybackStream = struct {
             self.pipewire_initialized = false;
         }
         self.engine.releaseBusTapConsumer(self.bus_id, self.consumer_id);
+        self.pcm_buffer.deinit();
         self.allocator.free(self.description);
         self.allocator.free(self.target_sink_name);
         self.allocator.free(self.consumer_id);
@@ -175,11 +183,34 @@ pub const BusPlaybackStream = struct {
     }
 
     fn triggerMain(self: *BusPlaybackStream) void {
+        var scratch_buffer: [bus_buffer_mod.render_quantum_frames * bus_buffer_mod.stereo_channels]i16 = undefined;
+        var next_tick_ns = std.time.nanoTimestamp();
         while (!self.stop_requested.load(.monotonic)) {
+            self.buffer_mutex.lock();
+            _ = self.pcm_buffer.fillFromEngine(
+                self.engine,
+                self.bus_id,
+                self.consumer_id,
+                target_buffer_frames,
+                scratch_buffer[0..],
+            ) catch {};
+            const buffered_frames = self.pcm_buffer.availableFrames();
+            self.buffer_mutex.unlock();
             if (self.stream) |stream| {
                 _ = c.pw_stream_trigger_process(stream);
             }
-            std.Thread.sleep(5 * std.time.ns_per_ms);
+
+            const step_ns: u64 = if (buffered_frames < target_buffer_frames / 2)
+                @max(@as(u64, 1), bus_buffer_mod.render_quantum_ns / 2)
+            else
+                bus_buffer_mod.render_quantum_ns;
+            next_tick_ns +%= step_ns;
+            const now_ns = std.time.nanoTimestamp();
+            if (next_tick_ns > now_ns) {
+                std.Thread.sleep(@intCast(next_tick_ns - now_ns));
+            } else {
+                next_tick_ns = now_ns;
+            }
         }
     }
 
@@ -199,8 +230,9 @@ pub const BusPlaybackStream = struct {
         if (frame_capacity == 0) return;
 
         const samples = @as([*]i16, @ptrCast(@alignCast(spa_data.data)))[0 .. frame_capacity * 2];
-        const read = self.engine.readBusPcmS16ForConsumer(self.bus_id, self.consumer_id, samples);
-        const written_frames = if (read.frames > 0) @min(read.frames, frame_capacity) else 0;
+        self.buffer_mutex.lock();
+        const written_frames = self.pcm_buffer.drainFrames(samples, frame_capacity);
+        self.buffer_mutex.unlock();
         const written_samples = written_frames * 2;
         var peak: f32 = 0.0;
         for (samples[0..written_samples]) |sample| {

@@ -3,6 +3,7 @@ const buses_mod = @import("buses.zig");
 const channels_mod = @import("channels.zig");
 const sends_mod = @import("sends.zig");
 const FxRuntime = @import("../../plugins/fx_runtime.zig").FxRuntime;
+const ChannelProcessStatus = FxRuntime.ChannelProcessStatus;
 
 pub const MeterLevels = struct {
     left: f32 = 0.0,
@@ -96,6 +97,8 @@ const max_remote_buffer_frames: usize = 4096;
 const jitter_target_blocks: usize = 2;
 const jitter_rebuffer_divisor: usize = 2;
 const max_drift_correction_ratio: f64 = 0.01;
+const render_late_warn_threshold_ns: i128 = 2 * std.time.ns_per_ms;
+const render_late_warn_log_interval_ns: i128 = 1000 * std.time.ns_per_ms;
 
 const RemoteInputState = struct {
     source_id: []u8,
@@ -122,9 +125,11 @@ const RemoteInputState = struct {
 
 pub const AudioEngine = struct {
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
+    state_mutex: std.Thread.Mutex = .{},
+    audio_mutex: std.Thread.Mutex = .{},
     render_thread: ?std.Thread = null,
     render_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    last_render_late_warn_ns: i128 = 0,
     render_generation: u64 = 0,
     graph_signature: u64 = 0,
     channels: std.ArrayList(ChannelState),
@@ -158,8 +163,8 @@ pub const AudioEngine = struct {
 
     pub fn deinit(self: *AudioEngine) void {
         self.stop();
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.lockStateAndAudio();
+        defer self.unlockStateAndAudio();
 
         clearChannelStates(self.allocator, &self.channels);
         clearBusStates(self.allocator, &self.buses);
@@ -177,8 +182,8 @@ pub const AudioEngine = struct {
         buses: []const buses_mod.Bus,
         sends: []const sends_mod.Send,
     ) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.lockStateAndAudio();
+        defer self.unlockStateAndAudio();
 
         const next_signature = computeGraphSignature(channels, buses, sends);
         if ((self.channels.items.len != 0 or self.buses.items.len != 0 or self.sends.items.len != 0) and
@@ -276,8 +281,8 @@ pub const AudioEngine = struct {
     ) bool {
         if (left.len == 0 or left.len != right.len) return false;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.state_mutex.lock();
+        defer self.state_mutex.unlock();
 
         const channel = findChannelStatePtr(self.channels.items, channel_id) orelse return false;
         const bound_source_id = channel.bound_source_id orelse return false;
@@ -297,34 +302,51 @@ pub const AudioEngine = struct {
         sample_rate_hz: u32,
         cycle_token: u64,
     ) bool {
-        if (left.len == 0 or left.len != right.len) return false;
+        return switch (self.processChannelStatus(runtime, channel_id, left, right, sample_rate_hz, cycle_token)) {
+            .processed, .bypass_no_chain => true,
+            .bypass_busy, .bypass_failed => false,
+        };
+    }
+
+    pub fn processChannelStatus(
+        self: *AudioEngine,
+        runtime: *FxRuntime,
+        channel_id: []const u8,
+        left: []f32,
+        right: []f32,
+        sample_rate_hz: u32,
+        cycle_token: u64,
+    ) ChannelProcessStatus {
+        if (left.len == 0 or left.len != right.len) return .bypass_failed;
         _ = cycle_token;
 
         const input_levels = measureLevels(left, right);
-        if (sample_rate_hz != 0) runtime.setSampleRate(sample_rate_hz);
-        const processed = runtime.processChannel(channel_id, left, right);
+        const processed = runtime.processChannelStatus(channel_id, left, right);
         const post_fx_levels = measureLevels(left, right);
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.state_mutex.lock();
+        if (findChannelStatePtr(self.channels.items, channel_id)) |channel| {
+            self.render_generation += 1;
+            channel.metrics.input = input_levels;
+            channel.metrics.post_fx = post_fx_levels;
+            channel.metrics.post_fader = applyChannelFader(post_fx_levels, channel.volume, channel.muted);
+            channel.metrics.latency_frames = runtime.channelLatencyFrames(channel_id);
+            channel.metrics.sample_rate_hz = sample_rate_hz;
+            channel.metrics.frame_count = @intCast(left.len);
+            channel.metrics.generation = self.render_generation;
+        }
+        self.state_mutex.unlock();
 
+        self.audio_mutex.lock();
+        defer self.audio_mutex.unlock();
         const channel = findChannelStatePtr(self.channels.items, channel_id) orelse return processed;
-
-        self.render_generation += 1;
-        channel.metrics.input = input_levels;
-        channel.metrics.post_fx = post_fx_levels;
-        channel.metrics.post_fader = applyChannelFader(post_fx_levels, channel.volume, channel.muted);
-        channel.metrics.latency_frames = runtime.channelLatencyFrames(channel_id);
-        channel.metrics.sample_rate_hz = sample_rate_hz;
-        channel.metrics.frame_count = @intCast(left.len);
-        channel.metrics.generation = self.render_generation;
         appendChannelRenderAudioLocked(self.allocator, channel, left, right, sample_rate_hz) catch {};
         return processed;
     }
 
     pub fn channelLevels(self: *AudioEngine, channel_id: []const u8, stage: channels_mod.MeterStage) ?MeterLevels {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        if (!self.state_mutex.tryLock()) return null;
+        defer self.state_mutex.unlock();
 
         const channel = findChannelState(self.channels.items, channel_id) orelse return null;
         if (channel.metrics.generation == 0) return null;
@@ -336,8 +358,8 @@ pub const AudioEngine = struct {
     }
 
     pub fn busLevels(self: *AudioEngine, bus_id: []const u8) ?BusMetrics {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        if (!self.state_mutex.tryLock()) return null;
+        defer self.state_mutex.unlock();
 
         const bus = findBusState(self.buses.items, bus_id) orelse return null;
         if (bus.metrics.generation == 0) return null;
@@ -356,39 +378,53 @@ pub const AudioEngine = struct {
     ) BusPcmReadResult {
         if (out.len < 2) return .{};
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        while (true) {
+            self.audio_mutex.lock();
+            const bus = findBusStatePtr(self.buses.items, bus_id) orelse {
+                self.audio_mutex.unlock();
+                return .{};
+            };
+            const consumer = ensureBusTapConsumerLocked(self.allocator, bus, consumer_id) catch {
+                self.audio_mutex.unlock();
+                return .{};
+            };
+            const needs_render = self.render_thread == null and consumer.read_sample_index >= bus.tap_stream_buffer.items.len;
+            if (!needs_render) {
+                if (consumer.read_sample_index >= bus.tap_stream_buffer.items.len) {
+                    compactBusTapStreamLocked(self.allocator, bus);
+                    const sample_rate_hz = bus.tap_sample_rate_hz;
+                    self.audio_mutex.unlock();
+                    return .{ .sample_rate_hz = sample_rate_hz };
+                }
 
-        const bus = findBusStatePtr(self.buses.items, bus_id) orelse return .{};
-        const consumer = ensureBusTapConsumerLocked(self.allocator, bus, consumer_id) catch return .{};
-        if (self.render_thread == null and consumer.read_sample_index >= bus.tap_stream_buffer.items.len) {
-            renderBusQuantumLocked(self, out.len / 2);
-        }
-        if (consumer.read_sample_index >= bus.tap_stream_buffer.items.len) {
-            compactBusTapStreamLocked(self.allocator, bus);
-            return .{ .sample_rate_hz = bus.tap_sample_rate_hz };
-        }
+                const available_samples = @min(out.len, bus.tap_stream_buffer.items.len - consumer.read_sample_index);
+                if (available_samples < 2) {
+                    const sample_rate_hz = bus.tap_sample_rate_hz;
+                    self.audio_mutex.unlock();
+                    return .{ .sample_rate_hz = sample_rate_hz };
+                }
 
-        const available_samples = @min(out.len, bus.tap_stream_buffer.items.len - consumer.read_sample_index);
-        if (available_samples < 2) {
-            return .{ .sample_rate_hz = bus.tap_sample_rate_hz };
+                for (0..available_samples) |index| {
+                    const sample = std.math.clamp(bus.tap_stream_buffer.items[consumer.read_sample_index + index], -1.0, 1.0);
+                    out[index] = @intFromFloat(@round(sample * 32767.0));
+                }
+                consumer.read_sample_index += available_samples;
+                compactBusTapStreamLocked(self.allocator, bus);
+                const sample_rate_hz = bus.tap_sample_rate_hz;
+                self.audio_mutex.unlock();
+                return .{
+                    .frames = available_samples / 2,
+                    .sample_rate_hz = sample_rate_hz,
+                };
+            }
+            self.audio_mutex.unlock();
+            self.renderQuantum(out.len / 2);
         }
-
-        for (0..available_samples) |index| {
-            const sample = std.math.clamp(bus.tap_stream_buffer.items[consumer.read_sample_index + index], -1.0, 1.0);
-            out[index] = @intFromFloat(@round(sample * 32767.0));
-        }
-        consumer.read_sample_index += available_samples;
-        compactBusTapStreamLocked(self.allocator, bus);
-        return .{
-            .frames = available_samples / 2,
-            .sample_rate_hz = bus.tap_sample_rate_hz,
-        };
     }
 
     pub fn releaseBusTapConsumer(self: *AudioEngine, bus_id: []const u8, consumer_id: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.audio_mutex.lock();
+        defer self.audio_mutex.unlock();
 
         const bus = findBusStatePtr(self.buses.items, bus_id) orelse return;
         releaseBusTapConsumerLocked(self.allocator, bus, consumer_id);
@@ -405,8 +441,8 @@ pub const AudioEngine = struct {
         const remote_channels = @max(@as(u8, 1), channels);
         if (samples.len == 0) return;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.state_mutex.lock();
+        defer self.state_mutex.unlock();
 
         const remote = try ensureRemoteInputStateLocked(self, source_id);
         compactRemoteInputLocked(remote);
@@ -433,8 +469,8 @@ pub const AudioEngine = struct {
         const remote_channels = @max(@as(u8, 1), channels);
         if (samples.len == 0) return;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.state_mutex.lock();
+        defer self.state_mutex.unlock();
 
         const remote = try ensureRemoteInputStateLocked(self, source_id);
         compactRemoteInputLocked(remote);
@@ -453,8 +489,8 @@ pub const AudioEngine = struct {
     }
 
     pub fn deactivateRemoteSource(self: *AudioEngine, source_id: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.state_mutex.lock();
+        defer self.state_mutex.unlock();
 
         const remote = findRemoteInputStatePtr(self.remote_inputs.items, source_id) orelse return;
         remote.buffered_samples.clearRetainingCapacity();
@@ -515,9 +551,19 @@ pub const AudioEngine = struct {
     }
 
     fn renderQuantum(self: *AudioEngine, frame_count: usize) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.lockStateAndAudio();
+        defer self.unlockStateAndAudio();
         renderBusQuantumLocked(self, frame_count);
+    }
+
+    fn lockStateAndAudio(self: *AudioEngine) void {
+        self.state_mutex.lock();
+        self.audio_mutex.lock();
+    }
+
+    fn unlockStateAndAudio(self: *AudioEngine) void {
+        self.audio_mutex.unlock();
+        self.state_mutex.unlock();
     }
 };
 
@@ -788,6 +834,16 @@ fn renderWorkerMain(engine: *AudioEngine) void {
         if (next_tick_ns > now_ns) {
             std.Thread.sleep(@intCast(next_tick_ns - now_ns));
         } else {
+            const late_ns = now_ns - next_tick_ns;
+            if (late_ns >= render_late_warn_threshold_ns and
+                (engine.last_render_late_warn_ns == 0 or now_ns - engine.last_render_late_warn_ns >= render_late_warn_log_interval_ns))
+            {
+                engine.last_render_late_warn_ns = now_ns;
+                std.log.warn("audio render worker late: late_ns={d} quantum_frames={d}", .{
+                    late_ns,
+                    render_quantum_frames,
+                });
+            }
             next_tick_ns = now_ns;
         }
     }

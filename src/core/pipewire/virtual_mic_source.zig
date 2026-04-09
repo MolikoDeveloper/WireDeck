@@ -1,4 +1,5 @@
 const std = @import("std");
+const enable_virtual_mic_info_logs = false;
 const audio_engine_mod = @import("../audio/engine.zig");
 const bus_buffer_mod = @import("../audio/bus_consumer_buffer.zig");
 
@@ -126,11 +127,13 @@ pub const VirtualMicSource = struct {
 
     pub fn deinit(self: *VirtualMicSource) void {
         self.stop_requested.store(true, .monotonic);
-        std.log.info("virtual mic source summary for {s}: callbacks={d} nonzero_callbacks={d}", .{
-            self.source_name,
-            self.process_callback_count,
-            self.nonzero_callback_count,
-        });
+        if (enable_virtual_mic_info_logs) {
+            std.log.info("virtual mic source summary for {s}: callbacks={d} nonzero_callbacks={d}", .{
+                self.source_name,
+                self.process_callback_count,
+                self.nonzero_callback_count,
+            });
+        }
         if (self.main_loop) |main_loop| {
             _ = c.pw_main_loop_quit(main_loop);
         }
@@ -249,10 +252,12 @@ fn onStreamStateChanged(
     const self: *VirtualMicSource = @ptrCast(@alignCast(data orelse return));
     self.active.store(state == c.PW_STREAM_STATE_STREAMING or state == c.PW_STREAM_STATE_PAUSED, .monotonic);
     if (state == c.PW_STREAM_STATE_STREAMING or state == c.PW_STREAM_STATE_PAUSED) {
-        std.log.info("virtual mic source state for {s}: {s}", .{
-            self.source_name,
-            if (state == c.PW_STREAM_STATE_STREAMING) "streaming" else "paused",
-        });
+        if (enable_virtual_mic_info_logs) {
+            std.log.info("virtual mic source state for {s}: {s}", .{
+                self.source_name,
+                if (state == c.PW_STREAM_STATE_STREAMING) "streaming" else "paused",
+            });
+        }
     }
     if (state == c.PW_STREAM_STATE_ERROR) {
         std.log.warn("virtual mic source error for {s}: {s}", .{

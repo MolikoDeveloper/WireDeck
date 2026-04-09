@@ -20,6 +20,15 @@ const runtime_shutdown = @import("../runtime/shutdown.zig");
 
 const max_recent_events = 6;
 const event_label_capacity = 96;
+const snapshot_refresh_interval_ns = 50 * std.time.ns_per_ms;
+const ui_housekeeping_interval_ns = 150 * std.time.ns_per_ms;
+const hidden_housekeeping_interval_ns = 500 * std.time.ns_per_ms;
+const lv2_ui_pump_interval_ns = 50 * std.time.ns_per_ms;
+const config_save_debounce_ns = 800 * std.time.ns_per_ms;
+const visible_frame_interval_ns = 50 * std.time.ns_per_ms;
+const hidden_frame_interval_ns = 250 * std.time.ns_per_ms;
+const ui_frame_warn_threshold_ns = 20 * std.time.ns_per_ms;
+const ui_warn_log_interval_ns = 1000 * std.time.ns_per_ms;
 
 pub const UiShell = struct {
     const MutationResult = struct {
@@ -71,6 +80,12 @@ pub const UiShell = struct {
         var recent_event_labels: [max_recent_events][event_label_capacity:0]u8 = undefined;
         var ui_strings = UiStringStorage.init(allocator);
         defer ui_strings.deinit();
+        var last_snapshot_refresh_ns: i128 = 0;
+        var last_housekeeping_ns: i128 = 0;
+        var last_lv2_ui_pump_ns: i128 = 0;
+        var last_ui_warn_ns: i128 = 0;
+        var pending_config_save = false;
+        var last_config_change_ns: i128 = 0;
 
         var snapshot = imgui.UiSnapshot{
             .active_profile = undefined,
@@ -122,49 +137,77 @@ pub const UiShell = struct {
         };
 
         while (true) {
+            const loop_started_ns = std.time.nanoTimestamp();
+            var pump_events_duration_ns: i128 = 0;
+            var snapshot_duration_ns: i128 = 0;
+            var render_duration_ns: i128 = 0;
+            var ui_changes_duration_ns: i128 = 0;
             if (runtime_shutdown.isRequested()) break;
+            const pump_events_started_ns = std.time.nanoTimestamp();
             const ui_state = imgui.wiredeck_imgui_pump_events(bridge);
+            pump_events_duration_ns = std.time.nanoTimestamp() - pump_events_started_ns;
             if (ui_state < 0) {
                 std.debug.print("UI event pump failed: {s}\n", .{imgui.wiredeck_imgui_last_error() orelse "unknown error"});
                 return error.UiFrameFailed;
             }
             if (ui_state == 0) break;
             if (ui_state == 1) {
-                app.pumpLiveAudio() catch {};
-                app.maybeRefreshAudioInventory();
-                _ = lv2_ui_manager.pump(app, state_store);
-                try syncTrayAutostartPreference(allocator, bridge);
-                app.reconcileOutputRoutingIfNeeded();
+                const now_ns = std.time.nanoTimestamp();
+                if (housekeepingDueWithInterval(last_housekeeping_ns, now_ns, hidden_housekeeping_interval_ns)) {
+                    app.maybeRefreshAudioInventory();
+                    try syncTrayAutostartPreference(allocator, bridge);
+                    app.reconcileOutputRoutingIfNeeded();
+                    last_housekeeping_ns = now_ns;
+                }
+                flushPendingConfigSave(config_store, state_store, &pending_config_save, last_config_change_ns, now_ns);
                 if (runtime_shutdown.isRequested()) break;
                 platform.nextFrame();
+                sleepForFrameBudget(loop_started_ns, hidden_frame_interval_ns);
                 if (config.max_frames) |max_frames| {
                     if (platform.frame_count >= max_frames) break;
                 }
                 continue;
             }
 
-            app.pumpLiveAudio() catch {};
-            app.maybeRefreshAudioInventory();
-            const lv2_ui_changed = lv2_ui_manager.pump(app, state_store);
-            try ensureSnapshotCapacity(
-                allocator,
-                state_store,
-                &channels,
-                &buses,
-                &sends,
-                &sources,
-                &channel_sources,
-                &destinations,
-                &bus_destinations,
-                &channel_plugins,
-                &channel_plugin_params,
-                &noise_models,
-                &plugin_descriptors,
-                &snapshot,
-            );
-            try rebuildUiSnapshot(state_store, &snapshot, &recent_event_labels, &ui_strings);
+            const now_ns = std.time.nanoTimestamp();
+            if (housekeepingDue(last_housekeeping_ns, now_ns)) {
+                app.maybeRefreshAudioInventory();
+                try syncTrayAutostartPreference(allocator, bridge);
+                app.reconcileOutputRoutingIfNeeded();
+                last_housekeeping_ns = now_ns;
+            }
+            const lv2_ui_changed = pumpLv2UiIfDue(&lv2_ui_manager, app, state_store, &last_lv2_ui_pump_ns, now_ns, false);
+            const snapshot_due = last_snapshot_refresh_ns == 0 or
+                now_ns - last_snapshot_refresh_ns >= snapshot_refresh_interval_ns or
+                lv2_ui_changed;
+            if (snapshot_due) {
+                app.pumpLiveAudio() catch {};
+                _ = pumpLv2UiIfDue(&lv2_ui_manager, app, state_store, &last_lv2_ui_pump_ns, std.time.nanoTimestamp(), true);
+                const snapshot_started_ns = std.time.nanoTimestamp();
+                try ensureSnapshotCapacity(
+                    allocator,
+                    state_store,
+                    &channels,
+                    &buses,
+                    &sends,
+                    &sources,
+                    &channel_sources,
+                    &destinations,
+                    &bus_destinations,
+                    &channel_plugins,
+                    &channel_plugin_params,
+                    &noise_models,
+                    &plugin_descriptors,
+                    &snapshot,
+                );
+                try rebuildUiSnapshot(state_store, &snapshot, &recent_event_labels, &ui_strings);
+                snapshot_duration_ns = std.time.nanoTimestamp() - snapshot_started_ns;
+                last_snapshot_refresh_ns = now_ns;
+            }
 
+            const render_started_ns = std.time.nanoTimestamp();
             const keep_running = imgui.wiredeck_imgui_render_frame(bridge, &snapshot);
+            render_duration_ns = std.time.nanoTimestamp() - render_started_ns;
             if (keep_running < 0) {
                 std.debug.print("UI frame failed: {s}\n", .{imgui.wiredeck_imgui_last_error() orelse "unknown error"});
                 return error.UiFrameFailed;
@@ -172,6 +215,7 @@ pub const UiShell = struct {
             if (keep_running == 0) break;
             if (runtime_shutdown.isRequested()) break;
 
+            const ui_changes_started_ns = std.time.nanoTimestamp();
             const ui_changes = try syncUiChanges(state_store, &snapshot);
             var state_changed = ui_changes.changed;
             var routing_changed = ui_changes.routing_changed;
@@ -187,22 +231,93 @@ pub const UiShell = struct {
             routing_changed = routing_changed or request_changes.routing_changed;
             if (routing_changed) {
                 app.markRoutingDirty();
+                app.reconcileOutputRoutingIfNeeded();
             }
             if (state_changed) {
-                if (config_store) |store| {
-                    store.save(state_store) catch |err| {
-                        std.log.warn("config save failed: {s}", .{@errorName(err)});
-                    };
-                }
+                last_snapshot_refresh_ns = 0;
+                pending_config_save = true;
+                last_config_change_ns = std.time.nanoTimestamp();
             }
-            try syncTrayAutostartPreference(allocator, bridge);
-            app.reconcileOutputRoutingIfNeeded();
+            ui_changes_duration_ns = std.time.nanoTimestamp() - ui_changes_started_ns;
+            flushPendingConfigSave(config_store, state_store, &pending_config_save, last_config_change_ns, std.time.nanoTimestamp());
+
+            const loop_duration_ns = std.time.nanoTimestamp() - loop_started_ns;
+            if (loop_duration_ns >= ui_frame_warn_threshold_ns and
+                (last_ui_warn_ns == 0 or loop_started_ns - last_ui_warn_ns >= ui_warn_log_interval_ns))
+            {
+                last_ui_warn_ns = loop_started_ns;
+                std.log.warn(
+                    "ui frame slow: duration_ns={d} state={d} snapshot_due={any} lv2_ui_changed={any} pump_events_ns={d} snapshot_ns={d} render_ns={d} ui_changes_ns={d}",
+                    .{
+                        loop_duration_ns,
+                        ui_state,
+                        snapshot_due,
+                        lv2_ui_changed,
+                        pump_events_duration_ns,
+                        snapshot_duration_ns,
+                        render_duration_ns,
+                        ui_changes_duration_ns,
+                    },
+                );
+            }
 
             platform.nextFrame();
+            sleepForFrameBudget(loop_started_ns, visible_frame_interval_ns);
             if (config.max_frames) |max_frames| {
                 if (platform.frame_count >= max_frames) break;
             }
         }
+    }
+
+    fn sleepForFrameBudget(loop_started_ns: i128, target_interval_ns: u64) void {
+        const now_ns = std.time.nanoTimestamp();
+        const target_end_ns = loop_started_ns + @as(i128, @intCast(target_interval_ns));
+        if (target_end_ns > now_ns) {
+            std.Thread.sleep(@intCast(target_end_ns - now_ns));
+        }
+    }
+
+    fn housekeepingDue(last_housekeeping_ns: i128, now_ns: i128) bool {
+        return housekeepingDueWithInterval(last_housekeeping_ns, now_ns, ui_housekeeping_interval_ns);
+    }
+
+    fn housekeepingDueWithInterval(last_housekeeping_ns: i128, now_ns: i128, interval_ns: i128) bool {
+        return last_housekeeping_ns == 0 or now_ns - last_housekeeping_ns >= interval_ns;
+    }
+
+    fn pumpLv2UiIfDue(
+        lv2_ui_manager: *Lv2UiManager,
+        app: *App,
+        state_store: *StateStore,
+        last_lv2_ui_pump_ns: *i128,
+        now_ns: i128,
+        force: bool,
+    ) bool {
+        if (!force and
+            last_lv2_ui_pump_ns.* != 0 and
+            now_ns - last_lv2_ui_pump_ns.* < lv2_ui_pump_interval_ns)
+        {
+            return false;
+        }
+        last_lv2_ui_pump_ns.* = now_ns;
+        return lv2_ui_manager.pump(app, state_store);
+    }
+
+    fn flushPendingConfigSave(
+        config_store: ?*const ConfigStore,
+        state_store: *StateStore,
+        pending_config_save: *bool,
+        last_config_change_ns: i128,
+        now_ns: i128,
+    ) void {
+        if (!pending_config_save.*) return;
+        if (now_ns - last_config_change_ns < config_save_debounce_ns) return;
+        if (config_store) |store| {
+            store.save(state_store) catch |err| {
+                std.log.warn("config save failed: {s}", .{@errorName(err)});
+            };
+        }
+        pending_config_save.* = false;
     }
 
     fn syncTrayAutostartPreference(allocator: std.mem.Allocator, bridge: *imgui.Bridge) !void {

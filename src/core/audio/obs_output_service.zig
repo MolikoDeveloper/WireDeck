@@ -297,21 +297,21 @@ fn handleSubscribeRequest(
     const endpoint_text = std.fmt.allocPrint(service.allocator, "{f}", .{endpoint}) catch return;
     defer service.allocator.free(endpoint_text);
 
-    std.log.info("obs output subscribe: request_id={d} client={s} bus={s} from={s}", .{
-        header.request_id,
-        client_name,
-        bus_id,
-        endpoint_text,
-    });
+    //std.log.info("obs output subscribe: request_id={d} client={s} bus={s} from={s}", .{
+    //    header.request_id,
+    //    client_name,
+    //    bus_id,
+    //    endpoint_text,
+    //});
 
     service.mutex.lock();
     defer service.mutex.unlock();
 
     const output = service.findOutputLocked(bus_id) orelse {
-        std.log.warn("obs output subscribe rejected: bus={s} from={s} reason=unavailable", .{
-            bus_id,
-            endpoint_text,
-        });
+        //std.log.warn("obs output subscribe rejected: bus={s} from={s} reason=unavailable", .{
+        //    bus_id,
+        //    endpoint_text,
+        //});
         protocol.writeStringField(response.message[0..], "Output not available in Wiredeck");
         _ = std.posix.sendto(sock, std.mem.asBytes(&response), 0, &source_addr, addr_len) catch {};
         return;

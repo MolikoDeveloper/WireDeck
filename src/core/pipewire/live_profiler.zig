@@ -109,8 +109,8 @@ pub const PipeWireLiveProfiler = struct {
         right_peak_milli: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
         active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-        fn deinit(self: *MeterStream, allocator: std.mem.Allocator) void {
-            c.pw_stream_destroy(self.stream);
+        fn deinit(self: *MeterStream, allocator: std.mem.Allocator, destroy_stream: bool) void {
+            if (destroy_stream) c.pw_stream_destroy(self.stream);
             allocator.free(self.target_object);
             allocator.destroy(self);
         }
@@ -267,7 +267,7 @@ pub const PipeWireLiveProfiler = struct {
         self.entries.deinit(self.allocator);
         self.clearClients();
         self.clients.deinit(self.allocator);
-        self.clearMeters();
+        self.clearMeters(false);
         self.meters.deinit(self.allocator);
         self.destroyProfilerProxy();
         self.destroyProfilerModule();
@@ -308,7 +308,7 @@ pub const PipeWireLiveProfiler = struct {
             self.profiler_global_id = null;
             self.clearEntries();
             self.clearClients();
-            self.clearMeters();
+            self.clearMeters(true);
             self.discovery_generation += 1;
         }
     }
@@ -524,8 +524,8 @@ pub const PipeWireLiveProfiler = struct {
         self.registry_snapshot = .{};
     }
 
-    fn clearMeters(self: *PipeWireLiveProfiler) void {
-        for (self.meters.items) |meter| meter.deinit(self.allocator);
+    fn clearMeters(self: *PipeWireLiveProfiler, destroy_streams: bool) void {
+        for (self.meters.items) |meter| meter.deinit(self.allocator, destroy_streams);
         self.meters.clearRetainingCapacity();
     }
 
@@ -615,7 +615,7 @@ pub const PipeWireLiveProfiler = struct {
             const meter = self.meters.items[meter_index];
             if (std.mem.eql(u8, meter.target_object, meter_target)) return;
             const removed = self.meters.orderedRemove(meter_index);
-            removed.deinit(self.allocator);
+            removed.deinit(self.allocator, true);
         }
 
         const meter = try self.createMeter(global_id, meter_target);
@@ -684,7 +684,7 @@ pub const PipeWireLiveProfiler = struct {
     fn removeMeter(self: *PipeWireLiveProfiler, global_id: u32) void {
         if (self.findMeterIndex(global_id)) |index| {
             const removed = self.meters.orderedRemove(index);
-            removed.deinit(self.allocator);
+            removed.deinit(self.allocator, true);
         }
     }
 
