@@ -533,7 +533,7 @@ pub const AudioEngine = struct {
                 if (channel.muted) continue;
 
                 const source = if (send.pre_fader) channel.metrics.post_fx else channel.metrics.post_fader;
-                const send_gain = std.math.clamp(send.gain * bus.volume * bus.system_volume, 0.0, 4.0);
+                const send_gain = std.math.clamp(send.gain * bus.volume, 0.0, 4.0);
                 const left = std.math.clamp(source.left * send_gain, 0.0, 1.0);
                 const right = std.math.clamp(source.right * send_gain, 0.0, 1.0);
                 if (left <= 0.00001 and right <= 0.00001) continue;
@@ -931,9 +931,9 @@ fn renderBusQuantumLocked(self: *AudioEngine, frame_count: usize) void {
         if (channel.muted) continue;
 
         const gain = if (send.pre_fader)
-            std.math.clamp(send.gain * bus.volume * bus.system_volume, 0.0, 4.0)
+            std.math.clamp(send.gain * bus.volume, 0.0, 4.0)
         else
-            std.math.clamp(send.gain * bus.volume * bus.system_volume * channel.volume, 0.0, 4.0);
+            std.math.clamp(send.gain * bus.volume * channel.volume, 0.0, 4.0);
         if (gain <= 0.00001) continue;
 
         for (0..frame_count) |frame_index| {

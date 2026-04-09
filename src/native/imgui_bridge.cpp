@@ -3707,13 +3707,13 @@ namespace
         ImGui::TextUnformatted("Physical destination");
         ImGui::PopStyleColor();
 
-        const std::string system_capture_label = system_capture_status_label(bus);
+        /*const std::string system_capture_label = system_capture_status_label(bus);
         ImGui::SameLine();
         ImGui::PushStyleColor(
             ImGuiCol_Text,
             bus.system_muted != 0 ? ImVec4(0.96f, 0.52f, 0.52f, 0.92f) : ImVec4(0.58f, 0.80f, 0.98f, 0.82f));
         ImGui::TextUnformatted(system_capture_label.c_str());
-        ImGui::PopStyleColor();
+        ImGui::PopStyleColor();*/
 
         const float combo_y = 56.0f;
         const float combo_x = pad_x;
