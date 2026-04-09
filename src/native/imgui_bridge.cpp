@@ -1728,7 +1728,7 @@ namespace
         const bool active = ImGui::IsItemActive();
         ImDrawList *draw_list = ImGui::GetWindowDrawList();
 
-        const ImVec4 icon_color = active ? ImVec4(std::min(base_color.x + 0.08f, 1.0f), std::min(base_color.y + 0.08f, 1.0f), std::min(base_color.z + 0.08f, 1.0f), base_color.w)
+        const ImVec4 icon_color = active    ? ImVec4(std::min(base_color.x + 0.08f, 1.0f), std::min(base_color.y + 0.08f, 1.0f), std::min(base_color.z + 0.08f, 1.0f), base_color.w)
                                   : hovered ? ImVec4(std::min(base_color.x + 0.04f, 1.0f), std::min(base_color.y + 0.04f, 1.0f), std::min(base_color.z + 0.04f, 1.0f), base_color.w)
                                             : base_color;
         if (texture.descriptor_set != VK_NULL_HANDLE)
@@ -2251,9 +2251,8 @@ namespace
             return {};
         }
         std::string result(text);
-        std::transform(result.begin(), result.end(), result.begin(), [](unsigned char c) {
-            return static_cast<char>(std::tolower(c));
-        });
+        std::transform(result.begin(), result.end(), result.begin(), [](unsigned char c)
+                       { return static_cast<char>(std::tolower(c)); });
         return result;
     }
 
@@ -3109,9 +3108,14 @@ namespace
                     }
                     else
                     {
+                        if (preview.length() > 25)
+                        {
+                            preview = preview.substr(0, 20) + "...";
+                        }
                         const int volume_percent = static_cast<int>(std::round(std::clamp(destination.volume, 0.0f, 4.0f) * 100.0f));
                         preview += " (" + std::to_string(volume_percent) + "%)";
                     }
+
                     return preview;
                 }
             }
@@ -3821,10 +3825,10 @@ namespace
 
                 const bool enabled = bus_destination->enabled != 0;
                 const std::string status_text = enabled
-                    ? ((destination.muted != 0)
-                        ? "Enabled | Muted"
-                        : ("Enabled | " + std::to_string(static_cast<int>(std::round(std::clamp(destination.volume, 0.0f, 4.0f) * 100.0f))) + "%"))
-                    : "Disabled";
+                                                    ? ((destination.muted != 0)
+                                                           ? "Enabled | Muted"
+                                                           : ("Enabled | " + std::to_string(static_cast<int>(std::round(std::clamp(destination.volume, 0.0f, 4.0f) * 100.0f))) + "%"))
+                                                    : "Disabled";
                 if (enabled)
                 {
                     popup_draw_list->AddRectFilled(
