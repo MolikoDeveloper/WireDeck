@@ -1,0 +1,91 @@
+## Internal Bus Routing Tasks
+
+- [x] Move bus playback exposure to internal engine-backed `wiredeck_output_bus_*` sources
+- [x] Feed physical destinations from bus loopbacks instead of per-channel FX outputs
+- [x] Preserve internal bus tap state across graph rebuilds
+- [x] Prefer direct PipeWire app capture when a stable `Stream/Output/Audio` node resolves
+- [x] Add app-stream fallback so failed legacy capture moves do not loop forever or leave streams muted
+- [x] Filter synthetic/managed WireDeck loopback owners out of grouped app inventory and routing
+- [x] Skip FX route creation for app channels that no longer have a live resolvable capture owner
+- [x] Fix shutdown hang after `shutdown: deinit output exposure`
+- [x] Validate current runtime with `./scripts/build.sh`, `./scripts/build.sh test`, and `./scripts/build.sh run`
+- [x] Restore `wiredeck_parking_sink` bootstrap/default-sink behavior so app capture starts from a stable non-duplicated state
+- [ ] Make app/TTS capture fully internal so no app routing depends on Pulse sink moves
+- [~] Make FX channel routing fully internal to the engine so channel FX no longer require visible PipeWire/Pulse virtual inputs or outputs
+- [x] Remove the remaining `wiredeck_input_*` / per-channel FX system nodes from the steady-state runtime graph
+- [x] Split shared FX runtime state so one slow/heavy channel plugin cannot stall unrelated channels
+- [x] Replace the global LV2 runtime processing mutex with per-channel isolation or another non-blocking RT-safe design
+- [x] Define overload policy so an over-budget FX chain degrades only its own channel (bypass, silence, or hold-last-buffer) and never all channels
+- [ ] Keep audio behavior stable regardless of whether the main UI is visible, hidden, or never started
+- [ ] Keep real-time audio behavior stable in debug/development runs, or explicitly separate unsupported debug-only diagnostics from the RT path
+- [x] Remove `sleep(5ms)` scheduling from active physical bus playback so output timing follows the engine quantum instead of a slower helper cadence
+- [ ] Replace remaining shared `AudioEngine.audio_mutex` hot-path contention between FX callbacks, render worker, and bus consumers with lock-free or per-bus/channel buffering
+- [ ] Remove hot-path dynamic buffer growth/compaction from channel render and bus tap streaming
+- [ ] Decouple UI-visible metering/discovery work further so visible windows do not measurably change RT behavior
+- [ ] Validate that zero-volume direct app capture stays stable when PipeWire corks or reconfigures streams
+- [ ] Confirm audible output on every enabled destination from the internal bus mix
+- [x] Decide whether FX/UI host crashes from third-party LV2 UIs should be sandboxed or disabled by policy
+- [ ] Validate runtime route-switch latency and multi-source stability under load
+- [x] Document crash-risk review findings for Pulse/PipeWire lifecycle paths
+- [x] Fix Pulse operation timeout handling so late callbacks cannot touch expired stack request state
+- [x] Validate PipeWire filter port creation before connect/activate so null ports cannot reach the process callback
+- [x] Serialize FX filter link-health reads/writes to avoid routing-thread vs PipeWire callback data races
+
+Current runtime status:
+- Bus playback is now exposed through hidden PipeWire sources named `wiredeck_output_bus_*`, and Pulse loopbacks route those sources to the selected physical sinks.
+- Virtual mic exposure still uses `wiredeck_busmic_*` and is fed from the internal engine.
+- Resolvable app channels such as Firefox and RHVoice now use direct PipeWire capture in the FX graph (`input=output:*`) without being moved to hidden `wiredeck_input_*` sinks.
+- Persisted app channels that no longer have a live matching owner now skip FX route creation entirely instead of creating idle `wiredeck_input_*` monitor sinks; only live-but-unresolved sticky app captures still fall back to monitor-based virtual capture.
+- Synthetic `loopback-*` and WireDeck-managed owners are no longer exposed as app sources, which removed the bogus `appgrp-unknown` source and the `legacy capture move blocked` spam.
+- Unresolvable stale app channels no longer create fallback FX routes, so startup FX routing now matches the actually live sources.
+- Runtime inspection with `pactl`/`pw-cli` shows only `wiredeck_output_bus_*` loopbacks feeding physical sinks; legacy `wiredeck_input_*` parking sinks and per-channel `wiredeck-combine-*` outputs are no longer part of the direct-app path.
+- Channel FX processing now uses per-channel LV2 runtime state and per-channel locks, so steady-state plugin work is no longer serialized behind one global runtime mutex.
+- Channel FX filters now run on per-filter PipeWire thread loops instead of one shared filter loop, which reduces cross-channel callback interference.
+- The old shared `wiredeck_fx_shared` intermediate Pulse sink is no longer part of the active FX path.
+- Channel FX output is now consumed by a hidden internal PipeWire filter-style discard node with DSP-compatible `in-L`/`in-R` ports, so `out-L`/`out-R` stay fully internal without reviving a visible FX sink.
+- Channel FX routing is internal from the user/system point of view now: no user-visible FX sink/module is required for the active path, although PipeWire filter nodes still exist inside the process graph as internal helpers.
+- The remaining `wiredeck_input_*` nodes are now limited to app captures that are both live and still unresolved for direct PipeWire output capture.
+- Direct app capture now keeps a unique corked PipeWire output node bound instead of immediately discarding it, which should reduce resume latency after brief playback pauses; full pause/resume validation is still pending.
+- App FX routing now keeps the most recent live app binding for a short grace window, so brief PipeWire disappear/reconfigure gaps do not immediately tear down the channel FX route or restore parked sink inputs.
+- App pause/resume now retargets existing FX filters to the new PipeWire node and opportunistically relinks dropped input ports on demand, which avoids the earlier full filter recreate path; a small relink delay remains but was acceptable in live testing.
+- FX route readiness now keeps a short grace window after a healthy state, so brief pause/mute/relink transitions do not immediately force `route_not_ready_hold` while direct app capture is reappearing.
+- Startup normalization now intentionally creates `wiredeck_parking_sink` and sets it as the default sink before routing starts, because that avoids duplicate app playback during bootstrap and gives direct app capture a stable landing sink.
+- When direct app capture is ready, the active app streams remain routed through that parking/default-sink model while the FX graph captures them directly from PipeWire output nodes.
+- Headless validation with `pactl` during runtime no longer shows `wiredeck_fx_*` Pulse sinks or modules, so the user-visible FX virtual device has been removed from the active system graph.
+- Live validation now confirms the internal FX path is audible again and visible in the UI: Firefox and Scarlett channels produce nonzero FX callbacks, the UI meters react correctly, and enabled playback/network buses emit nonzero samples.
+- Real-time callback diagnostics and input signal transition logs are now disabled by default so debug/dev runs do not pay that logging cost inside the PipeWire process callback.
+- Normal routing/info logs for FX links, bus exposure, app capture decisions, Pulse bus playback summaries, and virtual-mic state transitions are now disabled by default behind local feature flags, so normal runs are much quieter while warnings/errors still surface.
+- PipeWire bus playback now drains from a per-stream consumer buffer populated by its helper thread instead of reading `AudioEngine` directly inside the playback callback, reducing mutex contention between physical bus outputs and channel FX processing.
+- Pulse bus playback, which is the active physical-output path in the current runtime, now also pre-fills a per-stream consumer buffer from a feeder thread so the Pulse write callback usually drains ready PCM instead of pulling from `AudioEngine` under callback pressure.
+- The Pulse bus playback feeder and the equivalent PipeWire playback trigger helper now wake on the engine render quantum (with a short catch-up cadence when buffers run low) instead of sleeping at a coarse fixed `5 ms` interval, so output buffering follows the mixer cadence more closely.
+- `AudioEngine` now uses separate state and audio-buffer mutexes instead of one global mutex, so channel metric/config work no longer serializes every bus tap read and channel render append behind the same lock.
+- UI-side meter reads now use non-blocking `AudioEngine` metric access, so the visible UI can skip a meter frame instead of blocking audio-state updates.
+- `App.pumpLiveAudio()` now only calls `fx_runtime.sync(...)` when the effective plugin/runtime signature changes, instead of doing that work every UI/audio pump tick.
+- The visible UI now rate-limits full snapshot rebuilds to roughly 30 Hz, which lowers CPU pressure when the window is open without changing the audio/control state model.
+- FX processing now returns explicit per-channel statuses (`processed`, `bypass_no_chain`, `bypass_busy`, `bypass_failed`) instead of a single ambiguous boolean.
+- When a channel FX runtime is busy or a plugin process step fails, the PipeWire FX callback now degrades only that channel by reusing its last good output block when possible, or falling back to local bypass for that block; other channels are no longer asked to wait on that condition.
+- The internal `AudioEngine` render worker is enabled again, so bus tap production no longer depends primarily on on-demand consumer reads when physical playback/OBS/UDP ask for samples.
+- Debug logging now confirms the current over-budget spikes are dominated by `runtime.processChannel(...)`, not by input population, sample-rate updates, or output copy.
+- The FX/internal-routing path is now audibly working again, but residual jitter still remains in the active output path even with only one source enabled.
+- Current analysis suggests the strongest remaining jitter source is the active Pulse playback feeder cadence: the engine renders at `128` frames / `48 kHz` (~`2.67 ms`) while `BusPlayback.feederMain()` still wakes every `5 ms`, so the write callback can still arrive before the helper buffer is replenished.
+- `AudioEngine.audio_mutex` is still shared by channel FX publication, bus render production, and bus consumer reads, so single-source jitter can still happen from producer/consumer contention even after splitting state-vs-metrics work.
+- The current hot path still performs dynamic buffer append/resize/compact work for channel render buffers and bus tap stream buffers, which is not yet RT-friendly.
+- Hiding the UI still reduces the remaining jitter somewhat, which matches the current design: the UI loop continues to pump live discovery/meters and rebuild/render snapshots while visible, so it still consumes enough CPU budget to affect the remaining RT margin.
+- Headless bootstrap now works from `./scripts/build.sh run -- --headless ...`, and routing/audio background services still start before the UI loop is entered.
+- Audible output has now been validated again on the active internal FX path and UI meters, but a full all-destinations matrix is still worth rechecking before considering the routing work “done”.
+- Headless runtime shutdown now completes cleanly after switching `VirtualMicSource` to `pw_main_loop_run()`/`pw_main_loop_quit()`.
+- One `run` session also hit a segmentation fault inside `lsp-plugins-lv2ui.so`, which looks separate from the bus mixer work but should be tracked.
+- Custom LV2 UIs now stay isolated in `wiredeck-lv2-ui-host`; if that helper exits by signal or abnormal status, WireDeck disables that descriptor's custom UI for the rest of the session instead of relaunching it repeatedly.
+
+Desired architecture notes:
+- Channel capture, channel FX, and channel-to-bus sends should stay inside the engine unless a system-facing endpoint is explicitly required.
+- Physical playback, network output, OBS output, and virtual microphone exposure are valid system-facing edges; intermediate FX buses are not.
+- Routing/control workers and the UI may remain on separate threads, but the RT audio path must not depend on UI visibility, UI frame rate, or debug-only diagnostics.
+- A plugin/runtime fault or overload must be containable to one channel chain and must not introduce cross-channel stalls through shared locks or shared initialization paths.
+- Physical playback timing should be driven by the same audio quantum as the engine, or by a buffer model that is explicitly aligned to it, rather than by coarse helper-thread sleeps.
+- The final mixer/output path should avoid allocator traffic and compaction/copy work inside any callback-adjacent hot path.
+
+Crash-risk review notes:
+- `PulseContext` uses stack-local async request structs for `move/set/load/unload` operations. If an operation times out and we return immediately, a late Pulse callback can still write into expired stack memory. This is the most urgent stability fix.
+- `ChannelFxFilterManager.createFilter()` currently assumes all four PipeWire filter ports were created successfully. If any port creation returns null, the process callback can later call into PipeWire with invalid handles.
+- `routeReady()` reads filter link state from the routing thread while PipeWire callbacks mutate the same fields concurrently. Even when it only looks like routing instability, this is still undefined behavior and should be serialized.

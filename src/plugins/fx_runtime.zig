@@ -4,6 +4,13 @@ const host = @import("host.zig");
 const Lv2Runtime = @import("lv2_runtime.zig").Lv2Runtime;
 
 pub const FxRuntime = struct {
+    pub const ChannelProcessStatus = enum(u8) {
+        processed,
+        bypass_no_chain,
+        bypass_busy,
+        bypass_failed,
+    };
+
     allocator: std.mem.Allocator,
     lv2: Lv2Runtime,
 
@@ -28,8 +35,15 @@ pub const FxRuntime = struct {
         try self.lv2.sync(descriptors, channel_plugins, channel_plugin_params);
     }
 
+    pub fn processChannelStatus(self: *FxRuntime, channel_id: []const u8, left: []f32, right: []f32) ChannelProcessStatus {
+        return self.lv2.processChannelStatus(channel_id, left, right);
+    }
+
     pub fn processChannel(self: *FxRuntime, channel_id: []const u8, left: []f32, right: []f32) bool {
-        return self.lv2.processChannel(channel_id, left, right);
+        return switch (self.processChannelStatus(channel_id, left, right)) {
+            .processed, .bypass_no_chain => true,
+            .bypass_busy, .bypass_failed => false,
+        };
     }
 
     pub fn setSampleRate(self: *FxRuntime, sample_rate_hz: u32) void {

@@ -3,6 +3,8 @@ const c = @import("c.zig").c;
 const sources_mod = @import("../audio/sources.zig");
 
 const AtomicU32 = std.atomic.Value(u32);
+const peak_monitor_max_frames: u32 = 8192;
+const peak_monitor_fragment_frames: u32 = 512;
 
 pub const MeterSpec = struct {
     source_id: []const u8,
@@ -250,15 +252,14 @@ pub const PeakMonitor = struct {
         }
 
         var attr = c.pa_buffer_attr{
-            .maxlength = @sizeOf(f32) * @as(u32, sample_spec.channels) * 2048,
+            .maxlength = @sizeOf(f32) * @as(u32, sample_spec.channels) * peak_monitor_max_frames,
             .tlength = 0,
             .prebuf = 0,
             .minreq = 0,
-            .fragsize = @sizeOf(f32) * @as(u32, sample_spec.channels) * 128,
+            .fragsize = @sizeOf(f32) * @as(u32, sample_spec.channels) * peak_monitor_fragment_frames,
         };
         const flags: c.pa_stream_flags_t =
             @as(c.pa_stream_flags_t, @intCast(c.PA_STREAM_DONT_MOVE)) |
-            @as(c.pa_stream_flags_t, @intCast(c.PA_STREAM_ADJUST_LATENCY)) |
             @as(c.pa_stream_flags_t, @intCast(c.PA_STREAM_AUTO_TIMING_UPDATE));
 
         if (c.pa_stream_connect_record(stream, source_name_z.ptr, &attr, flags) < 0) {

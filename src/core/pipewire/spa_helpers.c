@@ -7,6 +7,26 @@ const struct spa_pod* wiredeck_spa_build_f32_capture_format(struct spa_pod_build
     return spa_format_audio_raw_build(builder, SPA_PARAM_EnumFormat, &info);
 }
 
+const struct spa_pod* wiredeck_spa_build_f32_stereo_capture_format(struct spa_pod_builder* builder) {
+    struct spa_audio_info_raw info = SPA_AUDIO_INFO_RAW_INIT(
+        .format = SPA_AUDIO_FORMAT_F32,
+        .rate = 48000,
+        .channels = 2,
+        .position = { SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR }
+    );
+    return spa_format_audio_raw_build(builder, SPA_PARAM_EnumFormat, &info);
+}
+
+const struct spa_pod* wiredeck_spa_build_s16_stereo_format(struct spa_pod_builder* builder) {
+    struct spa_audio_info_raw info = SPA_AUDIO_INFO_RAW_INIT(
+        .format = SPA_AUDIO_FORMAT_S16_LE,
+        .rate = 48000,
+        .channels = 2,
+        .position = { SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR }
+    );
+    return spa_format_audio_raw_build(builder, SPA_PARAM_EnumFormat, &info);
+}
+
 uint32_t wiredeck_spa_parse_audio_channels(const struct spa_pod* param) {
     uint32_t media_type = 0;
     uint32_t media_subtype = 0;

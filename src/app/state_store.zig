@@ -6,6 +6,7 @@ const channel_sources_mod = @import("../core/audio/channel_sources.zig");
 const destinations_mod = @import("../core/audio/destinations.zig");
 const bus_destinations_mod = @import("../core/audio/bus_destinations.zig");
 const sends_mod = @import("../core/audio/sends.zig");
+const network_mod = @import("../core/audio/network.zig");
 const plugins_mod = @import("../plugins/chain.zig");
 const plugin_host_mod = @import("../plugins/host.zig");
 
@@ -23,6 +24,7 @@ pub const StateStore = struct {
     allocator: std.mem.Allocator,
     active_profile: []const u8,
     active_profile_owned: bool,
+    network_audio: network_mod.NetworkAudioSettings,
     channel_feed: ChannelFeed,
     destination_feed: DestinationFeed,
     channels: std.ArrayList(channels_mod.Channel),
@@ -41,6 +43,7 @@ pub const StateStore = struct {
             .allocator = allocator,
             .active_profile = "Default",
             .active_profile_owned = false,
+            .network_audio = .{ .enabled = true },
             .channel_feed = .bootstrap,
             .destination_feed = .unavailable,
             .channels = .empty,
@@ -106,6 +109,8 @@ pub const StateStore = struct {
             .level = channel.level,
             .volume = channel.volume,
             .muted = channel.muted,
+            .system_volume = channel.system_volume,
+            .system_muted = channel.system_muted,
         });
     }
 
@@ -117,8 +122,10 @@ pub const StateStore = struct {
             .hidden = bus.hidden,
             .volume = bus.volume,
             .muted = bus.muted,
+            .system_volume = bus.system_volume,
+            .system_muted = bus.system_muted,
             .expose_as_microphone = bus.expose_as_microphone,
-            .expose_on_web = bus.expose_on_web,
+            .share_on_network = bus.share_on_network,
         });
     }
 
@@ -155,6 +162,8 @@ pub const StateStore = struct {
             .level_left = destination.level_left,
             .level_right = destination.level_right,
             .level = destination.level,
+            .muted = destination.muted,
+            .volume = destination.volume,
             .pulse_sink_index = destination.pulse_sink_index,
             .pulse_sink_name = try self.allocator.dupe(u8, destination.pulse_sink_name),
             .pulse_card_index = destination.pulse_card_index,

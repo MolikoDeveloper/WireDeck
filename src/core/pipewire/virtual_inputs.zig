@@ -3,12 +3,13 @@ const std = @import("std");
 const channels_mod = @import("../audio/channels.zig");
 
 pub const VirtualInputManager = struct {
-    const config_revision: u32 = 2;
+    const config_revision: u32 = 3;
 
     pub const Config = struct {
         sink_prefix: []const u8,
         description_prefix: []const u8,
         sample_rate_hz: ?u32 = null,
+        device_class: []const u8 = "filter",
     };
 
     const input_config = Config{
@@ -20,6 +21,7 @@ pub const VirtualInputManager = struct {
         .sink_prefix = "wiredeck_fx_",
         .description_prefix = "WireDeck FX ",
         .sample_rate_hz = 48_000,
+        .device_class = "abstract",
     };
 
     const ManagedInput = struct {
@@ -160,8 +162,8 @@ pub const VirtualInputManager = struct {
 
         const sink_properties = try std.fmt.allocPrint(
             self.allocator,
-            "\"device.description='{s}' node.description='{s}' wiredeck.channel.id={s} node.virtual=true node.hidden=true device.class=filter media.class=Audio/Sink\"",
-            .{ description, description, channel.id },
+            "\"device.description='{s}' node.description='{s}' wiredeck.channel.id={s} wiredeck.internal=true node.virtual=true node.hidden=true device.class={s} media.class=Audio/Sink node.pause-on-idle=false node.always-process=true\"",
+            .{ description, description, channel.id, self.config.device_class },
         );
         defer self.allocator.free(sink_properties);
 
@@ -314,8 +316,13 @@ fn parseManagedInputLine(self: *VirtualInputManager, line: []const u8) !?Virtual
         .sink_name = try self.allocator.dupe(u8, sink_name),
         .module_id = module_id,
         .hidden = std.mem.indexOf(u8, args, "node.hidden=true") != null,
-        .filtered = std.mem.indexOf(u8, args, "device.class=filter") != null,
+        .filtered = hasExpectedDeviceClass(args, self.config.device_class),
     };
+}
+
+fn hasExpectedDeviceClass(args: []const u8, expected_device_class: []const u8) bool {
+    const device_class = extractPropertyValue(args, "device.class=") orelse return false;
+    return std.mem.eql(u8, device_class, expected_device_class);
 }
 
 fn stripDescriptionPrefix(label: []const u8, prefix: []const u8) []const u8 {

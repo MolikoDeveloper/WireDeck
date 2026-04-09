@@ -12,10 +12,8 @@ const LilvBackend = if (build_options.enable_lilv) struct {
     fn discover(allocator: std.mem.Allocator) ![]host.PluginDescriptor {
         const search_roots = try collectSearchRoots(allocator);
         defer freeStringList(allocator, search_roots);
-        const search_path = try buildLilvSearchPath(allocator, search_roots);
-        defer allocator.free(search_path);
-        const search_path_z = try allocator.dupeZ(u8, search_path);
-        defer allocator.free(search_path_z);
+        const bundle_paths = try collectBundlePaths(allocator, search_roots);
+        defer freeStringList(allocator, bundle_paths);
 
         const world = c.lilv_world_new() orelse return try discoverWithManifestFallback(allocator);
         defer c.lilv_world_free(world);
@@ -35,10 +33,14 @@ const LilvBackend = if (build_options.enable_lilv) struct {
         const bypass_designation = c.lilv_new_uri(world, lv2_bypass_uri) orelse return error.OutOfMemory;
         defer c.lilv_node_free(bypass_designation);
 
-        const path_value = c.lilv_new_string(world, search_path_z.ptr) orelse return try discoverWithManifestFallback(allocator);
-        defer c.lilv_node_free(path_value);
-        c.lilv_world_set_option(world, c.LILV_OPTION_LV2_PATH, path_value);
-        c.lilv_world_load_all(world);
+        c.lilv_world_load_specifications(world);
+        for (bundle_paths) |bundle_path| {
+            const bundle_path_z = try allocator.dupeZ(u8, bundle_path);
+            defer allocator.free(bundle_path_z);
+            const bundle_uri = c.lilv_new_file_uri(world, null, bundle_path_z.ptr) orelse continue;
+            defer c.lilv_node_free(bundle_uri);
+            c.lilv_world_load_bundle(world, bundle_uri);
+        }
 
         const plugins = c.lilv_world_get_all_plugins(world);
         var descriptors = std.ArrayList(host.PluginDescriptor).empty;
@@ -299,15 +301,20 @@ fn parseDescriptorFromTtl(allocator: std.mem.Allocator, bundle_path: []const u8,
     };
 }
 
-fn collectBundlePaths(allocator: std.mem.Allocator, search_roots: [][]u8) ![][]u8 {
+pub fn collectBundlePaths(allocator: std.mem.Allocator, search_roots: [][]u8) ![][]u8 {
     var bundles = std.ArrayList([]u8).empty;
     errdefer freeCollectedStrings(allocator, &bundles);
 
-    var unique = std.StringHashMap(void).init(allocator);
+    var unique_paths = std.StringHashMap(void).init(allocator);
+    var preferred_bundle_names = std.StringHashMap(void).init(allocator);
     defer {
-        var iter = unique.keyIterator();
+        var iter = unique_paths.keyIterator();
         while (iter.next()) |key| allocator.free(key.*);
-        unique.deinit();
+        unique_paths.deinit();
+
+        var names_iter = preferred_bundle_names.keyIterator();
+        while (names_iter.next()) |key| allocator.free(key.*);
+        preferred_bundle_names.deinit();
     }
 
     for (search_roots) |root_path| {
@@ -326,13 +333,25 @@ fn collectBundlePaths(allocator: std.mem.Allocator, search_roots: [][]u8) ![][]u
 
             const bundle_path = try std.fs.path.join(allocator, &.{ root_path, entry.path });
             errdefer allocator.free(bundle_path);
-            const key = try allocator.dupe(u8, bundle_path);
-            errdefer allocator.free(key);
+            const path_key = try allocator.dupe(u8, bundle_path);
+            errdefer allocator.free(path_key);
 
-            const result = try unique.getOrPut(key);
-            if (result.found_existing) {
+            const path_result = try unique_paths.getOrPut(path_key);
+            if (path_result.found_existing) {
                 allocator.free(bundle_path);
-                allocator.free(key);
+                allocator.free(path_key);
+                continue;
+            }
+
+            const bundle_name = std.fs.path.basename(bundle_path);
+            const bundle_name_key = try allocator.dupe(u8, bundle_name);
+            errdefer allocator.free(bundle_name_key);
+            const bundle_name_result = try preferred_bundle_names.getOrPut(bundle_name_key);
+            if (bundle_name_result.found_existing) {
+                _ = unique_paths.remove(path_key);
+                allocator.free(bundle_path);
+                allocator.free(bundle_name_key);
+                allocator.free(path_key);
                 continue;
             }
 
@@ -383,7 +402,7 @@ fn sortDescriptors(_: void, lhs: host.PluginDescriptor, rhs: host.PluginDescript
     return std.ascii.lessThanIgnoreCase(lhs.label, rhs.label);
 }
 
-fn collectSearchRoots(allocator: std.mem.Allocator) ![][]u8 {
+pub fn collectSearchRoots(allocator: std.mem.Allocator) ![][]u8 {
     var unique = std.StringHashMap(void).init(allocator);
     defer {
         var iter = unique.keyIterator();
@@ -496,6 +515,44 @@ test "collectBundlePaths finds lv2 bundles in nested directories" {
 
     try std.testing.expectEqual(@as(usize, 1), bundles.len);
     try std.testing.expect(std.mem.endsWith(u8, bundles[0], "downloads/LV2/demo.lv2"));
+}
+
+test "collectBundlePaths prefers earlier roots for duplicate bundle names" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("home/.lv2/demo.lv2");
+    try tmp.dir.makePath("usr/lib/lv2/demo.lv2");
+    try tmp.dir.writeFile(.{
+        .sub_path = "home/.lv2/demo.lv2/manifest.ttl",
+        .data =
+        \\@prefix lv2: <http://lv2plug.in/ns/lv2core#> .
+        \\<https://example.org/plugins/demo-dev> a lv2:Plugin .
+        ,
+    });
+    try tmp.dir.writeFile(.{
+        .sub_path = "usr/lib/lv2/demo.lv2/manifest.ttl",
+        .data =
+        \\@prefix lv2: <http://lv2plug.in/ns/lv2core#> .
+        \\<https://example.org/plugins/demo-system> a lv2:Plugin .
+        ,
+    });
+
+    const home_root = try tmp.dir.realpathAlloc(std.testing.allocator, "home/.lv2");
+    defer std.testing.allocator.free(home_root);
+    const system_root = try tmp.dir.realpathAlloc(std.testing.allocator, "usr/lib/lv2");
+    defer std.testing.allocator.free(system_root);
+
+    const roots = try std.testing.allocator.alloc([]u8, 2);
+    defer std.testing.allocator.free(roots);
+    roots[0] = home_root;
+    roots[1] = system_root;
+
+    const bundles = try collectBundlePaths(std.testing.allocator, roots);
+    defer freeStringList(std.testing.allocator, bundles);
+
+    try std.testing.expectEqual(@as(usize, 1), bundles.len);
+    try std.testing.expect(std.mem.startsWith(u8, bundles[0], home_root));
 }
 
 test "buildLilvSearchPath joins official roots" {

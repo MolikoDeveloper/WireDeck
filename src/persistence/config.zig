@@ -5,6 +5,7 @@ const buses_mod = @import("../core/audio/buses.zig");
 const sources_mod = @import("../core/audio/sources.zig");
 const destinations_mod = @import("../core/audio/destinations.zig");
 const sends_mod = @import("../core/audio/sends.zig");
+const network_mod = @import("../core/audio/network.zig");
 const plugins_mod = @import("../plugins/chain.zig");
 const host_mod = @import("../plugins/host.zig");
 
@@ -37,6 +38,7 @@ const StoredBus = struct {
     volume: f32 = 1.0,
     muted: bool = false,
     expose_as_microphone: bool = false,
+    share_on_network: bool = false,
     expose_on_web: bool = false,
 };
 
@@ -74,9 +76,25 @@ const StoredChannelPluginParam = struct {
     value: f32 = 0.0,
 };
 
+const StoredNetworkAudio = struct {
+    enabled: bool = true,
+    bind_port: u16 = 45920,
+    transport: network_mod.TransportKind = .udp,
+    codec: network_mod.CodecKind = .pcm_float32,
+    clock_mode: network_mod.ClockMode = .sender_timestamps,
+    sample_rate_hz: u32 = 48_000,
+    channels: u8 = 2,
+    frames_per_packet: u16 = 64,
+    jitter_buffer_packets: u8 = 2,
+    max_clients: u8 = 8,
+    allow_fec: bool = false,
+    require_encryption: bool = false,
+};
+
 const StoredConfig = struct {
-    version: u32 = 3,
+    version: u32 = 5,
     active_profile: []const u8 = "Default",
+    network_audio: StoredNetworkAudio = .{},
     channels: []StoredChannel = &.{},
     buses: []StoredBus = &.{},
     bus_destinations: []StoredBusDestination = &.{},
@@ -138,9 +156,21 @@ pub const ConfigStore = struct {
     }
 
     pub fn save(self: *const ConfigStore, state_store: *const StateStore) !void {
+        if (isSuspiciousRoutingState(state_store)) {
+            std.log.warn("config save skipped: suspicious routing state detected", .{});
+            return error.SuspiciousRoutingState;
+        }
+
         const parent_dir = std.fs.path.dirname(self.config_path) orelse return error.InvalidConfigPath;
         std.fs.makeDirAbsolute(parent_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
+            else => return err,
+        };
+
+        const backup_path = try std.fmt.allocPrint(self.allocator, "{s}.bak", .{self.config_path});
+        defer self.allocator.free(backup_path);
+        std.fs.copyFileAbsolute(self.config_path, backup_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => {},
             else => return err,
         };
 
@@ -189,10 +219,10 @@ fn makeStoredConfig(allocator: std.mem.Allocator, state_store: *const StateStore
             .custom_icon_name = channel.custom_icon_name,
             .custom_icon_path = channel.custom_icon_path,
             .source_ref_id = if (source) |item| item.id else channel.bound_source_id,
-            .source_ref_label = if (source) |item| item.label else null,
-            .source_ref_subtitle = if (source) |item| item.subtitle else null,
-            .source_ref_process_binary = if (source) |item| item.process_binary else null,
-            .source_ref_kind = if (source) |item| item.kind else null,
+            .source_ref_label = if (source) |item| item.label else fallbackStoredChannelLabel(channel),
+            .source_ref_subtitle = if (source) |item| item.subtitle else fallbackStoredChannelSubtitle(channel),
+            .source_ref_process_binary = if (source) |item| item.process_binary else fallbackStoredChannelProcessBinary(channel),
+            .source_ref_kind = if (source) |item| item.kind else storedChannelSourceKind(channel),
             .input_bus_id = channel.input_bus_id,
             .meter_stage = channel.meter_stage,
             .volume = channel.volume,
@@ -217,7 +247,8 @@ fn makeStoredConfig(allocator: std.mem.Allocator, state_store: *const StateStore
                 .volume = bus.volume,
                 .muted = bus.muted,
                 .expose_as_microphone = bus.expose_as_microphone,
-                .expose_on_web = bus.expose_on_web,
+                .share_on_network = bus.share_on_network,
+                .expose_on_web = bus.share_on_network,
             };
             index += 1;
         }
@@ -292,6 +323,20 @@ fn makeStoredConfig(allocator: std.mem.Allocator, state_store: *const StateStore
 
     return .{
         .active_profile = state_store.active_profile,
+        .network_audio = .{
+            .enabled = state_store.network_audio.enabled,
+            .bind_port = state_store.network_audio.bind_port,
+            .transport = state_store.network_audio.transport,
+            .codec = state_store.network_audio.codec,
+            .clock_mode = state_store.network_audio.clock_mode,
+            .sample_rate_hz = state_store.network_audio.sample_rate_hz,
+            .channels = state_store.network_audio.channels,
+            .frames_per_packet = state_store.network_audio.frames_per_packet,
+            .jitter_buffer_packets = state_store.network_audio.jitter_buffer_packets,
+            .max_clients = state_store.network_audio.max_clients,
+            .allow_fec = state_store.network_audio.allow_fec,
+            .require_encryption = state_store.network_audio.require_encryption,
+        },
         .channels = channels,
         .buses = buses,
         .bus_destinations = bus_destinations,
@@ -303,6 +348,20 @@ fn makeStoredConfig(allocator: std.mem.Allocator, state_store: *const StateStore
 
 fn applyLoadedConfig(state_store: *StateStore, config: StoredConfig) !void {
     try state_store.setActiveProfile(config.active_profile);
+    state_store.network_audio = .{
+        .enabled = config.network_audio.enabled,
+        .bind_port = config.network_audio.bind_port,
+        .transport = config.network_audio.transport,
+        .codec = config.network_audio.codec,
+        .clock_mode = config.network_audio.clock_mode,
+        .sample_rate_hz = config.network_audio.sample_rate_hz,
+        .channels = config.network_audio.channels,
+        .frames_per_packet = config.network_audio.frames_per_packet,
+        .jitter_buffer_packets = config.network_audio.jitter_buffer_packets,
+        .max_clients = config.network_audio.max_clients,
+        .allow_fec = config.network_audio.allow_fec,
+        .require_encryption = config.network_audio.require_encryption,
+    };
 
     state_store.clearChannelPluginParams();
     state_store.clearChannelPlugins();
@@ -311,6 +370,8 @@ fn applyLoadedConfig(state_store: *StateStore, config: StoredConfig) !void {
     state_store.clearChannelSources();
     state_store.clearBuses();
     state_store.clearChannels();
+
+    try seedStoredSourceReferences(state_store, config.channels);
 
     var loaded_channel_ids = std.ArrayList(LoadedChannelId).empty;
     defer {
@@ -332,16 +393,14 @@ fn applyLoadedConfig(state_store: *StateStore, config: StoredConfig) !void {
             .volume = bus.volume,
             .muted = bus.muted,
             .expose_as_microphone = bus.expose_as_microphone,
-            .expose_on_web = bus.expose_on_web,
+            .share_on_network = bus.share_on_network or bus.expose_on_web,
         });
     }
 
     var loaded_channel_index: usize = 0;
     for (config.channels) |channel| {
         const resolved_source_id = resolveStoredChannelSource(state_store, channel);
-        if (resolved_source_id) |source_id| {
-            if (hasChannelBoundSource(state_store, source_id)) continue;
-        }
+        if (hasEquivalentStoredChannel(state_store, channel, resolved_source_id)) continue;
         loaded_channel_index += 1;
         const channel_id = try std.fmt.allocPrint(state_store.allocator, "source-strip-{d}", .{loaded_channel_index});
         defer state_store.allocator.free(channel_id);
@@ -450,6 +509,22 @@ fn hasChannelBoundSource(state_store: *const StateStore, source_id: []const u8) 
     return false;
 }
 
+fn hasEquivalentStoredChannel(
+    state_store: *const StateStore,
+    stored_channel: StoredChannel,
+    resolved_source_id: ?[]const u8,
+) bool {
+    if (resolved_source_id) |source_id| {
+        if (hasChannelBoundSource(state_store, source_id)) return true;
+    }
+
+    for (state_store.channels.items) |channel| {
+        if (!channelRepresentsEquivalentStoredSource(channel, stored_channel)) continue;
+        return true;
+    }
+    return false;
+}
+
 fn resolveLoadedChannelIdForSend(
     loaded: []LoadedChannelId,
     state_store: *const StateStore,
@@ -550,6 +625,26 @@ fn ensureSendMatrix(state_store: *StateStore) !void {
     }
 }
 
+fn seedStoredSourceReferences(state_store: *StateStore, channels: []const StoredChannel) !void {
+    for (channels) |channel| {
+        const kind = channel.source_ref_kind orelse storedChannelSourceKind(channel) orelse continue;
+        const source_id = try storedReferenceSourceId(state_store.allocator, channel);
+        defer state_store.allocator.free(source_id);
+
+        if (findSource(state_store, source_id) != null) continue;
+
+        try state_store.addSource(.{
+            .id = source_id,
+            .label = if (channel.source_ref_label) |value| value else channel.label,
+            .subtitle = if (channel.source_ref_subtitle) |value| value else channel.subtitle,
+            .kind = kind,
+            .process_binary = if (channel.source_ref_process_binary) |value| value else (fallbackStoredChannelProcessBinaryLoaded(channel) orelse ""),
+            .icon_name = channel.icon_name,
+            .icon_path = channel.icon_path,
+        });
+    }
+}
+
 fn findStoredBusDestinationIndex(
     stored: []const StoredBusDestination,
     bus_id: []const u8,
@@ -584,6 +679,11 @@ fn resolveStoredChannelSource(state_store: *const StateStore, channel: StoredCha
     if (channel.source_ref_id) |source_ref_id| {
         if (findSource(state_store, source_ref_id)) |source| return source.id;
     }
+    if (channel.source_ref_id == null and channel.bound_source_id == null) {
+        const synthetic_ref_id = storedReferenceSourceId(state_store.allocator, channel) catch null orelse return null;
+        defer state_store.allocator.free(synthetic_ref_id);
+        if (findSource(state_store, synthetic_ref_id)) |source| return source.id;
+    }
     if (channel.source_ref_process_binary) |process_binary| {
         for (state_store.sources.items) |source| {
             if (source.process_binary.len == 0) continue;
@@ -606,7 +706,107 @@ fn resolveStoredChannelSource(state_store: *const StateStore, channel: StoredCha
             return source.id;
         }
     }
+    if (channel.source_kind == @intFromEnum(sources_mod.SourceKind.app) and channel.subtitle.len > 0) {
+        for (state_store.sources.items) |source| {
+            if (source.kind != .app) continue;
+            if (source.process_binary.len == 0) continue;
+            if (std.mem.eql(u8, source.process_binary, channel.subtitle)) return source.id;
+        }
+    }
+    if (channel.label.len > 0) {
+        const channel_kind = storedChannelSourceKind(channel);
+        for (state_store.sources.items) |source| {
+            if (!std.mem.eql(u8, source.label, channel.label)) continue;
+            if (channel.subtitle.len > 0 and !std.mem.eql(u8, source.subtitle, channel.subtitle)) continue;
+            if (channel_kind) |kind| {
+                if (source.kind != kind) continue;
+            }
+            return source.id;
+        }
+    }
     return null;
+}
+
+fn channelRepresentsEquivalentStoredSource(channel: channels_mod.Channel, stored_channel: StoredChannel) bool {
+    const channel_kind = storedChannelSourceKind(channel) orelse return false;
+    const stored_kind = storedChannelSourceKind(stored_channel) orelse return false;
+    if (channel_kind != stored_kind) return false;
+
+    if (stored_kind == .app) {
+        const stored_process_binary = storedChannelProcessBinary(stored_channel);
+        if (channel.subtitle.len > 0 and stored_process_binary.len > 0 and std.ascii.eqlIgnoreCase(channel.subtitle, stored_process_binary)) {
+            return true;
+        }
+
+        const stored_label = storedChannelLabel(stored_channel);
+        if (channel.label.len > 0 and stored_label.len > 0 and std.ascii.eqlIgnoreCase(channel.label, stored_label)) {
+            return true;
+        }
+
+        const stored_subtitle = storedChannelSubtitle(stored_channel);
+        if (channel.subtitle.len > 0 and stored_subtitle.len > 0 and std.ascii.eqlIgnoreCase(channel.subtitle, stored_subtitle)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    const stored_label = storedChannelLabel(stored_channel);
+    if (channel.label.len > 0 and stored_label.len > 0 and std.ascii.eqlIgnoreCase(channel.label, stored_label)) {
+        const stored_subtitle = storedChannelSubtitle(stored_channel);
+        if (channel.subtitle.len == 0 or stored_subtitle.len == 0) return true;
+        return std.ascii.eqlIgnoreCase(channel.subtitle, stored_subtitle);
+    }
+
+    return false;
+}
+
+fn storedChannelProcessBinary(channel: StoredChannel) []const u8 {
+    if (channel.source_ref_process_binary) |value| return value;
+    if (storedChannelSourceKind(channel) == .app) return channel.subtitle;
+    return "";
+}
+
+fn storedChannelLabel(channel: StoredChannel) []const u8 {
+    if (channel.source_ref_label) |value| return value;
+    return channel.label;
+}
+
+fn storedChannelSubtitle(channel: StoredChannel) []const u8 {
+    if (channel.source_ref_subtitle) |value| return value;
+    return channel.subtitle;
+}
+
+fn fallbackStoredChannelLabel(channel: channels_mod.Channel) ?[]const u8 {
+    if (channel.label.len == 0) return null;
+    return channel.label;
+}
+
+fn fallbackStoredChannelSubtitle(channel: channels_mod.Channel) ?[]const u8 {
+    if (channel.subtitle.len == 0) return null;
+    return channel.subtitle;
+}
+
+fn fallbackStoredChannelProcessBinary(channel: channels_mod.Channel) ?[]const u8 {
+    if (channel.source_kind != @intFromEnum(sources_mod.SourceKind.app)) return null;
+    if (channel.subtitle.len == 0) return null;
+    return channel.subtitle;
+}
+
+fn fallbackStoredChannelProcessBinaryLoaded(channel: StoredChannel) ?[]const u8 {
+    if (channel.source_kind != @intFromEnum(sources_mod.SourceKind.app)) return null;
+    if (channel.subtitle.len == 0) return null;
+    return channel.subtitle;
+}
+
+fn storedReferenceSourceId(allocator: std.mem.Allocator, channel: StoredChannel) ![]u8 {
+    if (channel.source_ref_id) |value| return allocator.dupe(u8, value);
+    if (channel.bound_source_id) |value| return allocator.dupe(u8, value);
+    return std.fmt.allocPrint(allocator, "stored-source-ref-{s}", .{channel.id});
+}
+
+fn storedChannelSourceKind(channel: anytype) ?sources_mod.SourceKind {
+    return std.meta.intToEnum(sources_mod.SourceKind, channel.source_kind) catch null;
 }
 
 fn findSource(state_store: *const StateStore, id: []const u8) ?sources_mod.Source {
@@ -652,5 +852,28 @@ fn hasPluginDescriptor(state_store: *const StateStore, id: []const u8) bool {
 }
 
 fn isWiredeckManagedSinkName(sink_name: []const u8) bool {
-    return std.mem.startsWith(u8, sink_name, "wiredeck-combine-");
+    return std.mem.startsWith(u8, sink_name, "wiredeck-combine-") or
+        std.mem.startsWith(u8, sink_name, "wiredeck_output_") or
+        std.mem.startsWith(u8, sink_name, "wiredeck_input_") or
+        std.mem.startsWith(u8, sink_name, "wiredeck_fx_") or
+        std.mem.startsWith(u8, sink_name, "wiredeck_busmic_sink_") or
+        std.mem.startsWith(u8, sink_name, "wiredeck_parking_sink");
+}
+
+fn isSuspiciousRoutingState(state_store: *const StateStore) bool {
+    var visible_bus_count: usize = 0;
+    for (state_store.buses.items) |bus| {
+        if (bus.hidden) continue;
+        if (bus.role == .input_stage) continue;
+        visible_bus_count += 1;
+    }
+
+    if (visible_bus_count > 1) return false;
+    if (state_store.channels.items.len <= 1) return false;
+
+    for (state_store.sends.items) |send| {
+        if (send.enabled) return false;
+    }
+
+    return true;
 }

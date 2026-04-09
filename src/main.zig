@@ -20,6 +20,7 @@ const CliOptions = struct {
 
 pub fn main() !void {
     const options = try parseArgs(std.heap.page_allocator);
+    wiredeck.RuntimeShutdown.installSignalHandlers();
 
     var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
     defer {
@@ -41,8 +42,6 @@ pub fn main() !void {
 
     var instance_guard = try SingleInstanceGuard.acquire(gpa);
     defer instance_guard.release();
-    try spawnCleanupWatchdog(gpa);
-
     var state_store = wiredeck.StateStore.init(gpa);
     defer state_store.deinit();
 
@@ -86,8 +85,6 @@ pub fn main() !void {
         try printSourceActivity(&app, &state_store, options.source_filter, options.activity_ticks);
         return;
     }
-
-    printBootstrapLog(&state_store);
 
     if (!options.headless) {
         try wiredeck.UiShell.run(.{
@@ -162,6 +159,9 @@ fn parseArgs(allocator: std.mem.Allocator) !CliOptions {
     var index: usize = 1;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
+        if (std.mem.eql(u8, arg, "--")) {
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--headless")) {
             options.headless = true;
             continue;
@@ -243,6 +243,7 @@ fn runCleanupWatchdog(allocator: std.mem.Allocator, pid: u32) !void {
 }
 
 fn cleanupManagedAudioState(allocator: std.mem.Allocator) !void {
+    std.log.info("shutdown cleanup: probing managed audio state", .{});
     var state_store = wiredeck.StateStore.init(allocator);
     defer state_store.deinit();
 
@@ -250,9 +251,11 @@ fn cleanupManagedAudioState(allocator: std.mem.Allocator) !void {
     defer app.deinit();
 
     try app.cleanupStartupBindings();
+    std.log.info("shutdown cleanup: startup bindings cleared", .{});
     wiredeck.OutputExposure.cleanupDefaultAudioSource(allocator) catch |err| {
         std.log.warn("default audio source cleanup failed: {s}", .{@errorName(err)});
     };
+    std.log.info("shutdown cleanup: default audio source restored", .{});
 }
 
 fn convertAppIcon(state_store: *const wiredeck.StateStore, app_name: []const u8) !void {
@@ -329,8 +332,75 @@ fn printSourceActivity(
                     channel.muted,
                 },
             );
+            if (app.audio_engine.channelLevels(channel.id, .post_fx)) |levels| {
+                var post_fx_left_db_buf: [24]u8 = undefined;
+                var post_fx_right_db_buf: [24]u8 = undefined;
+                var post_fx_peak_db_buf: [24]u8 = undefined;
+                std.debug.print(
+                    "    engine.post_fx L={d:.4} {s} R={d:.4} {s} peak={d:.4} {s}\n",
+                    .{
+                        levels.left,
+                        dbLabel(&post_fx_left_db_buf, levels.left),
+                        levels.right,
+                        dbLabel(&post_fx_right_db_buf, levels.right),
+                        levels.level,
+                        dbLabel(&post_fx_peak_db_buf, levels.level),
+                    },
+                );
+            }
+            if (app.audio_engine.channelLevels(channel.id, .post_fader)) |levels| {
+                var post_fader_left_db_buf: [24]u8 = undefined;
+                var post_fader_right_db_buf: [24]u8 = undefined;
+                var post_fader_peak_db_buf: [24]u8 = undefined;
+                std.debug.print(
+                    "    engine.post_fader L={d:.4} {s} R={d:.4} {s} peak={d:.4} {s}\n",
+                    .{
+                        levels.left,
+                        dbLabel(&post_fader_left_db_buf, levels.left),
+                        levels.right,
+                        dbLabel(&post_fader_right_db_buf, levels.right),
+                        levels.level,
+                        dbLabel(&post_fader_peak_db_buf, levels.level),
+                    },
+                );
+            }
         }
         if (!matched_channels) {
+            std.debug.print("  none\n", .{});
+        }
+
+        var matched_buses = false;
+        std.debug.print("engine buses\n", .{});
+        for (state_store.buses.items) |bus| {
+            const needle = source_filter orelse "";
+            const matches = source_filter == null or
+                containsIgnoreCase(bus.id, needle) or
+                containsIgnoreCase(bus.label, needle);
+            if (!matches) continue;
+            matched_buses = true;
+            if (app.audio_engine.busLevels(bus.id)) |levels| {
+                var bus_left_db_buf: [24]u8 = undefined;
+                var bus_right_db_buf: [24]u8 = undefined;
+                var bus_peak_db_buf: [24]u8 = undefined;
+                std.debug.print(
+                    "  bus={s}\n    label={s}\n    contributors={d}\n    L={d:.4} {s}\n    R={d:.4} {s}\n    peak={d:.4} {s}\n",
+                    .{
+                        bus.id,
+                        bus.label,
+                        levels.contributor_count,
+                        levels.mix.left,
+                        dbLabel(&bus_left_db_buf, levels.mix.left),
+                        levels.mix.right,
+                        dbLabel(&bus_right_db_buf, levels.mix.right),
+                        levels.mix.level,
+                        dbLabel(&bus_peak_db_buf, levels.mix.level),
+                    },
+                );
+            } else {
+                std.debug.print("  bus={s}\n    label={s}\n    no engine levels yet\n", .{ bus.id, bus.label });
+            }
+        }
+        if (!matched_buses) {
             std.debug.print("  none\n", .{});
         }
 
@@ -432,66 +502,6 @@ fn linearToDb(value: f32) f32 {
 fn dbLabel(buf: []u8, value: f32) []const u8 {
     if (value <= 0.000001) return "-inf dBFS";
     return std.fmt.bufPrint(buf, "{d:.1} dBFS", .{linearToDb(value)}) catch "-err dBFS";
-}
-
-fn printBootstrapLog(state_store: *const wiredeck.StateStore) void {
-    std.debug.print(
-        "WireDeck V2 bootstrap ready\nactive profile: {s}\nchannels: {d}\nbuses: {d}\nsources: {d}\ndestinations: {d}\n",
-        .{
-            state_store.active_profile,
-            state_store.channels.items.len,
-            state_store.buses.items.len,
-            state_store.sources.items.len,
-            state_store.destinations.items.len,
-        },
-    );
-
-    std.debug.print("\n[channels]\n", .{});
-    for (state_store.channels.items) |channel| {
-        std.debug.print(
-            "channel {s} label={s} subtitle={s} volume={d:.2} muted={any}\n",
-            .{ channel.id, channel.label, channel.subtitle, channel.volume, channel.muted },
-        );
-    }
-
-    std.debug.print("\n[buses]\n", .{});
-    for (state_store.buses.items) |bus| {
-        std.debug.print(
-            "bus {s} label={s} volume={d:.2} muted={any}\n",
-            .{ bus.id, bus.label, bus.volume, bus.muted },
-        );
-    }
-
-    std.debug.print("\n[sources]\n", .{});
-    for (state_store.sources.items) |source| {
-        std.debug.print(
-            "source {s} kind={s} label={s} subtitle={s} icon={s} icon_path={s} binary={s} level={d:.2} muted={any}\n",
-            .{
-                source.id,
-                @tagName(source.kind),
-                source.label,
-                source.subtitle,
-                source.icon_name,
-                source.icon_path,
-                source.process_binary,
-                source.level,
-                source.muted,
-            },
-        );
-    }
-
-    std.debug.print("\n[destinations]\n", .{});
-    for (state_store.destinations.items) |destination| {
-        std.debug.print(
-            "destination {s} kind={s} label={s} subtitle={s}\n",
-            .{
-                destination.id,
-                @tagName(destination.kind),
-                destination.label,
-                destination.subtitle,
-            },
-        );
-    }
 }
 
 test "state store initializes empty" {

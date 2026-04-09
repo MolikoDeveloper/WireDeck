@@ -20,6 +20,7 @@ pub const BoundOwner = struct {
 
     process_binary: ?[]const u8,
     app_name: ?[]const u8,
+    media_name: ?[]const u8,
     flatpak_app_id: ?[]const u8,
 
     pulse_client_index: ?u32,
@@ -30,6 +31,8 @@ pub const BoundOwner = struct {
     pw_node_ids: []u32,
 
     confidence: Confidence,
+    synthetic: bool = false,
+    wiredeck_managed: bool = false,
 
     pub const Confidence = enum {
         low,
@@ -48,7 +51,7 @@ pub fn bind(
 
     for (snapshot.sink_inputs) |si| {
         const match = findBestPwMatchForPlayback(registry, si);
-        const owner = try makeOwnerFromSinkInput(allocator, match, si);
+        const owner = try makeOwnerFromSinkInput(allocator, registry, match, si);
         if (findEquivalentIndex(out.items, owner)) |index| {
             try mergeBoundOwner(allocator, &out.items[index], owner);
             freeBoundOwner(allocator, owner);
@@ -59,7 +62,7 @@ pub fn bind(
 
     for (snapshot.source_outputs) |so| {
         const match = findBestPwMatchForCapture(registry, so);
-        const owner = try makeOwnerFromSourceOutput(allocator, match, so);
+        const owner = try makeOwnerFromSourceOutput(allocator, registry, match, so);
         if (findEquivalentIndex(out.items, owner)) |index| {
             try mergeBoundOwner(allocator, &out.items[index], owner);
             freeBoundOwner(allocator, owner);
@@ -82,6 +85,7 @@ fn freeBoundOwner(allocator: Allocator, item: BoundOwner) void {
     freeOpt(allocator, item.pid_rejection_reason);
     freeOpt(allocator, item.process_binary);
     freeOpt(allocator, item.app_name);
+    freeOpt(allocator, item.media_name);
     freeOpt(allocator, item.flatpak_app_id);
 
     allocator.free(item.pulse_sink_input_indexes);
@@ -91,6 +95,7 @@ fn freeBoundOwner(allocator: Allocator, item: BoundOwner) void {
 
 fn makeOwnerFromSinkInput(
     allocator: Allocator,
+    registry: *const pw.RegistryState,
     match: ?PwMatch,
     si: pulse.PulseSinkInput,
 ) !BoundOwner {
@@ -99,6 +104,8 @@ fn makeOwnerFromSinkInput(
 
     const binary = if (si.process_binary) |v| try allocator.dupe(u8, v) else null;
     errdefer freeOpt(allocator, binary);
+    const media_name = if (si.media_name) |v| try allocator.dupe(u8, v) else null;
+    errdefer freeOpt(allocator, media_name);
 
     const pid_info = try validatePid(allocator, si.process_id);
     errdefer freeOpt(allocator, pid_info.rejection_reason);
@@ -133,6 +140,10 @@ fn makeOwnerFromSinkInput(
         confidence = .medium;
     }
 
+    const wiredeck_managed = isWiredeckManagedPwMatch(registry, match) or
+        pulseStreamLooksWiredeckManaged(si.app_name, si.process_binary, si.media_name);
+    const synthetic = wiredeck_managed or pulseSinkInputLooksSynthetic(si, match);
+
     return .{
         .reported_pid = si.process_id,
         .real_pid = pid_info.validated_pid,
@@ -141,6 +152,7 @@ fn makeOwnerFromSinkInput(
 
         .process_binary = binary,
         .app_name = app_name,
+        .media_name = media_name,
         .flatpak_app_id = flatpak_app_id,
 
         .pulse_client_index = si.client_index,
@@ -151,11 +163,14 @@ fn makeOwnerFromSinkInput(
         .pw_node_ids = try pw_nodes.toOwnedSlice(allocator),
 
         .confidence = confidence,
+        .synthetic = synthetic,
+        .wiredeck_managed = wiredeck_managed,
     };
 }
 
 fn makeOwnerFromSourceOutput(
     allocator: Allocator,
+    registry: *const pw.RegistryState,
     match: ?PwMatch,
     so: pulse.PulseSourceOutput,
 ) !BoundOwner {
@@ -164,6 +179,8 @@ fn makeOwnerFromSourceOutput(
 
     const binary = if (so.process_binary) |v| try allocator.dupe(u8, v) else null;
     errdefer freeOpt(allocator, binary);
+    const media_name = if (so.media_name) |v| try allocator.dupe(u8, v) else null;
+    errdefer freeOpt(allocator, media_name);
 
     const pid_info = try validatePid(allocator, so.process_id);
     errdefer freeOpt(allocator, pid_info.rejection_reason);
@@ -198,6 +215,10 @@ fn makeOwnerFromSourceOutput(
         confidence = .medium;
     }
 
+    const wiredeck_managed = isWiredeckManagedPwMatch(registry, match) or
+        pulseStreamLooksWiredeckManaged(so.app_name, so.process_binary, so.media_name);
+    const synthetic = wiredeck_managed or pulseSourceOutputLooksSynthetic(so, match);
+
     return .{
         .reported_pid = so.process_id,
         .real_pid = pid_info.validated_pid,
@@ -206,6 +227,7 @@ fn makeOwnerFromSourceOutput(
 
         .process_binary = binary,
         .app_name = app_name,
+        .media_name = media_name,
         .flatpak_app_id = flatpak_app_id,
 
         .pulse_client_index = so.client_index,
@@ -216,6 +238,8 @@ fn makeOwnerFromSourceOutput(
         .pw_node_ids = try pw_nodes.toOwnedSlice(allocator),
 
         .confidence = confidence,
+        .synthetic = synthetic,
+        .wiredeck_managed = wiredeck_managed,
     };
 }
 
@@ -427,11 +451,75 @@ fn mergeBoundOwner(allocator: Allocator, target: *BoundOwner, candidate: BoundOw
     if (target.app_name == null and candidate.app_name != null) {
         target.app_name = try allocator.dupe(u8, candidate.app_name.?);
     }
+    if (target.media_name == null and candidate.media_name != null) {
+        target.media_name = try allocator.dupe(u8, candidate.media_name.?);
+    }
     if (target.confidence == .low and candidate.confidence != .low) {
         target.confidence = candidate.confidence;
     } else if (target.confidence == .medium and candidate.confidence == .high) {
         target.confidence = .high;
     }
+    target.synthetic = target.synthetic or candidate.synthetic;
+    target.wiredeck_managed = target.wiredeck_managed or candidate.wiredeck_managed;
+}
+
+fn pulseSinkInputLooksSynthetic(si: pulse.PulseSinkInput, match: ?PwMatch) bool {
+    const media_name = si.media_name orelse "";
+    if (std.mem.startsWith(u8, media_name, "loopback-")) return true;
+    if (match != null and std.mem.startsWith(u8, si.app_name orelse "", "output.loopback-")) return true;
+    return si.client_index == null and
+        si.process_id == null and
+        si.app_name == null and
+        si.process_binary == null;
+}
+
+fn pulseSourceOutputLooksSynthetic(so: pulse.PulseSourceOutput, match: ?PwMatch) bool {
+    const media_name = so.media_name orelse "";
+    if (std.mem.startsWith(u8, media_name, "loopback-")) return true;
+    if (match != null and std.mem.startsWith(u8, so.app_name orelse "", "input.loopback-")) return true;
+    return so.client_index == null and
+        so.process_id == null and
+        so.app_name == null and
+        so.process_binary == null;
+}
+
+fn pulseStreamLooksWiredeckManaged(app_name: ?[]const u8, process_binary: ?[]const u8, media_name: ?[]const u8) bool {
+    return containsIgnoreCase(app_name orelse "", "wiredeck") or
+        containsIgnoreCase(process_binary orelse "", "wiredeck") or
+        containsIgnoreCase(media_name orelse "", "wiredeck");
+}
+
+fn isWiredeckManagedPwMatch(registry: *const pw.RegistryState, match: ?PwMatch) bool {
+    const pw_match = match orelse return false;
+    for (registry.objects.items) |obj| {
+        if (obj.kind != .node) continue;
+        if (obj.id != pw_match.pw_node_id) continue;
+        return isWiredeckManagedNode(obj);
+    }
+    return false;
+}
+
+fn isWiredeckManagedNode(obj: pw.GlobalObject) bool {
+    if (obj.props.node_name) |node_name| {
+        if (std.mem.startsWith(u8, node_name, "wiredeck_input_") or
+            std.mem.startsWith(u8, node_name, "wiredeck_output_") or
+            std.mem.startsWith(u8, node_name, "wiredeck_busmic_") or
+            std.mem.startsWith(u8, node_name, "wiredeck_fx_") or
+            std.mem.startsWith(u8, node_name, "wiredeck_parking_sink") or
+            std.mem.startsWith(u8, node_name, "wiredeck_meter_") or
+            std.mem.startsWith(u8, node_name, "WireDeck FX ") or
+            std.mem.startsWith(u8, node_name, "output.loopback-") or
+            std.mem.startsWith(u8, node_name, "input.loopback-"))
+        {
+            return true;
+        }
+    }
+    return containsIgnoreCase(obj.props.node_description orelse "", "wiredeck") or
+        containsIgnoreCase(obj.props.media_name orelse "", "wiredeck");
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
 }
 
 fn appendUniqueU32s(allocator: Allocator, target: *[]u32, extra: []const u32) !void {

@@ -13,6 +13,8 @@ pub const PulseSink = struct {
     name: ?[]const u8 = null,
     description: ?[]const u8 = null,
     monitor_source_name: ?[]const u8 = null,
+    muted: bool = false,
+    volume: f32 = 1.0,
     card_index: ?u32 = null,
     bluez5_profile: ?[]const u8 = null,
     bluez5_codec: ?[]const u8 = null,
@@ -50,7 +52,9 @@ pub const PulseSinkInput = struct {
     index: u32,
     client_index: ?u32 = null,
     sink_index: ?u32 = null,
+    corked: bool = false,
     muted: bool = false,
+    volume: f32 = 1.0,
     app_name: ?[]const u8 = null,
     process_id: ?u32 = null,
     process_binary: ?[]const u8 = null,
@@ -60,6 +64,7 @@ pub const PulseSinkInput = struct {
 
 pub const PulseSourceOutput = struct {
     index: u32,
+    module_index: ?u32 = null,
     client_index: ?u32 = null,
     source_index: ?u32 = null,
     app_name: ?[]const u8 = null,

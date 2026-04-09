@@ -2,6 +2,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const chain = @import("chain.zig");
 const host = @import("host.zig");
+const lv2_discovery = @import("lv2.zig");
 const lv2_c = if (build_options.enable_lilv) @cImport({
     @cInclude("lilv/lilv.h");
     @cInclude("lv2/atom/atom.h");
@@ -9,6 +10,7 @@ const lv2_c = if (build_options.enable_lilv) @cImport({
     @cInclude("lv2/options/options.h");
     @cInclude("lv2/patch/patch.h");
 }) else struct {};
+const ChannelProcessStatus = @import("fx_runtime.zig").FxRuntime.ChannelProcessStatus;
 
 pub const Lv2Runtime = if (build_options.enable_lilv) struct {
     const c = @cImport({
@@ -27,9 +29,43 @@ pub const Lv2Runtime = if (build_options.enable_lilv) struct {
         features: [*]const ?*const c.LV2_Feature,
     };
 
+    const ChannelRuntime = struct {
+        channel_id: []u8,
+        instances: std.ArrayList(ManagedInstance),
+        mutex: std.Thread.Mutex = .{},
+        last_signature: u64 = 0,
+
+        fn init(allocator: std.mem.Allocator, channel_id: []const u8) !*ChannelRuntime {
+            const channel = try allocator.create(ChannelRuntime);
+            errdefer allocator.destroy(channel);
+            channel.* = .{
+                .channel_id = try allocator.dupe(u8, channel_id),
+                .instances = std.ArrayList(ManagedInstance).empty,
+            };
+            return channel;
+        }
+
+        fn deinit(self: *ChannelRuntime, allocator: std.mem.Allocator) void {
+            self.clearInstances(allocator);
+            self.instances.deinit(allocator);
+            allocator.free(self.channel_id);
+            allocator.destroy(self);
+        }
+
+        fn clearInstances(self: *ChannelRuntime, allocator: std.mem.Allocator) void {
+            for (self.instances.items) |*instance| instance.deinit(allocator);
+            self.instances.clearRetainingCapacity();
+            self.last_signature = 0;
+        }
+    };
+
     pub fn writeUiUpdateLines(self: *Lv2Runtime, plugin_id: []const u8, writer: anytype) !u64 {
-        const instance_index = findInstance(self.instances.items, plugin_id) orelse return 0;
-        const instance = &self.instances.items[instance_index];
+        self.sync_mutex.lock();
+        defer self.sync_mutex.unlock();
+        const located = self.findInstanceLocked(plugin_id) orelse return 0;
+        located.channel.mutex.lock();
+        defer located.channel.mutex.unlock();
+        const instance = &located.channel.instances.items[located.instance_index];
         var hasher = std.hash.Wyhash.init(0);
         var wrote_any = false;
 
@@ -252,25 +288,24 @@ pub const Lv2Runtime = if (build_options.enable_lilv) struct {
 
     allocator: std.mem.Allocator,
     world: ?*c.LilvWorld = null,
-    instances: std.ArrayList(ManagedInstance),
+    channels: std.ArrayList(*ChannelRuntime),
     feature_context: *FeatureContext,
-    instances_mutex: std.Thread.Mutex = .{},
+    sync_mutex: std.Thread.Mutex = .{},
     sample_rate_hz: u32 = 48_000,
-    last_signature: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Lv2Runtime {
         return .{
             .allocator = allocator,
-            .instances = std.ArrayList(ManagedInstance).empty,
+            .channels = std.ArrayList(*ChannelRuntime).empty,
             .feature_context = FeatureContext.init(allocator) catch @panic("failed to initialize LV2 feature context"),
         };
     }
 
     pub fn deinit(self: *Lv2Runtime) void {
-        self.instances_mutex.lock();
-        defer self.instances_mutex.unlock();
-        self.clearInstances();
-        self.instances.deinit(self.allocator);
+        self.sync_mutex.lock();
+        defer self.sync_mutex.unlock();
+        self.clearChannels();
+        self.channels.deinit(self.allocator);
         self.feature_context.deinit(self.allocator);
         if (self.world) |world| c.lilv_world_free(world);
     }
@@ -281,27 +316,146 @@ pub const Lv2Runtime = if (build_options.enable_lilv) struct {
         channel_plugins: []const chain.ChannelPlugin,
         channel_plugin_params: []const chain.ChannelPluginParam,
     ) !void {
-        self.instances_mutex.lock();
-        defer self.instances_mutex.unlock();
-
-        const signature = computeSignature(channel_plugins, channel_plugin_params);
-        if (signature == self.last_signature) return;
+        self.sync_mutex.lock();
+        defer self.sync_mutex.unlock();
 
         try self.ensureWorld();
 
-        var index = self.instances.items.len;
+        var index = self.channels.items.len;
         while (index > 0) {
             index -= 1;
-            if (!containsPlugin(channel_plugins, self.instances.items[index].plugin_id)) {
-                var removed = self.instances.orderedRemove(index);
+            const channel = self.channels.items[index];
+            if (!channelHasLv2Plugins(channel_plugins, channel.channel_id)) {
+                const removed = self.channels.orderedRemove(index);
                 removed.deinit(self.allocator);
             }
         }
 
         for (channel_plugins) |channel_plugin| {
             if (channel_plugin.backend != .lv2) continue;
+            if (findChannelRuntime(self.channels.items, channel_plugin.channel_id) != null) continue;
+            const channel = try ChannelRuntime.init(self.allocator, channel_plugin.channel_id);
+            errdefer channel.deinit(self.allocator);
+            try self.channels.append(self.allocator, channel);
+        }
+
+        for (self.channels.items) |channel| {
+            channel.mutex.lock();
+            defer channel.mutex.unlock();
+            try self.syncChannelLocked(channel, descriptors, channel_plugins, channel_plugin_params);
+        }
+    }
+
+    pub fn processChannelStatus(self: *Lv2Runtime, channel_id: []const u8, left: []f32, right: []f32) ChannelProcessStatus {
+        if (left.len == 0 or left.len != right.len) return .bypass_failed;
+        if (left.len > max_block_size) return .bypass_failed;
+
+        if (!self.sync_mutex.tryLock()) return .bypass_busy;
+        const channel = findChannelRuntime(self.channels.items, channel_id) orelse {
+            self.sync_mutex.unlock();
+            return .bypass_no_chain;
+        };
+        if (!channel.mutex.tryLock()) {
+            self.sync_mutex.unlock();
+            return .bypass_busy;
+        }
+        self.sync_mutex.unlock();
+        defer channel.mutex.unlock();
+
+        var scratch_left: [max_block_size]f32 = undefined;
+        var scratch_right: [max_block_size]f32 = undefined;
+        var temp_left: [max_block_size]f32 = undefined;
+        var temp_right: [max_block_size]f32 = undefined;
+
+        @memcpy(scratch_left[0..left.len], left);
+        @memcpy(scratch_right[0..left.len], right);
+
+        var processed_any = false;
+        for (channel.instances.items) |*instance| {
+            if (!instance.enabled and !instance.supports_plugin_state_sync) continue;
+            self.ensureActivated(instance);
+            if (!processStereoInstance(instance, scratch_left[0..left.len], scratch_right[0..right.len], temp_left[0..left.len], temp_right[0..right.len])) {
+                return .bypass_failed;
+            }
+            @memcpy(scratch_left[0..left.len], temp_left[0..left.len]);
+            @memcpy(scratch_right[0..right.len], temp_right[0..right.len]);
+            processed_any = true;
+        }
+        if (!processed_any) return .bypass_no_chain;
+
+        @memcpy(left, scratch_left[0..left.len]);
+        @memcpy(right, scratch_right[0..right.len]);
+        return .processed;
+    }
+
+    pub fn processChannel(self: *Lv2Runtime, channel_id: []const u8, left: []f32, right: []f32) bool {
+        return switch (self.processChannelStatus(channel_id, left, right)) {
+            .processed, .bypass_no_chain => true,
+            .bypass_busy, .bypass_failed => false,
+        };
+    }
+
+    pub fn getUiRuntimeHandle(self: *Lv2Runtime, plugin_id: []const u8) ?UiRuntimeHandle {
+        self.sync_mutex.lock();
+        defer self.sync_mutex.unlock();
+        const located = self.findInstanceLocked(plugin_id) orelse return null;
+        located.channel.mutex.lock();
+        defer located.channel.mutex.unlock();
+        const instance = &located.channel.instances.items[located.instance_index];
+        return .{
+            .instance = instance.instance,
+            .features = &self.feature_context.feature_ptrs,
+        };
+    }
+
+    pub fn setSampleRate(self: *Lv2Runtime, sample_rate_hz: u32) void {
+        self.sync_mutex.lock();
+        defer self.sync_mutex.unlock();
+
+        if (sample_rate_hz == 0 or sample_rate_hz == self.sample_rate_hz) return;
+        self.sample_rate_hz = sample_rate_hz;
+        for (self.channels.items) |channel| {
+            channel.mutex.lock();
+            channel.clearInstances(self.allocator);
+            channel.mutex.unlock();
+        }
+    }
+
+    pub fn channelLatencyFrames(self: *Lv2Runtime, channel_id: []const u8) u32 {
+        _ = self;
+        _ = channel_id;
+        return 0;
+    }
+
+    fn clearChannels(self: *Lv2Runtime) void {
+        for (self.channels.items) |channel| channel.deinit(self.allocator);
+        self.channels.clearRetainingCapacity();
+    }
+
+    fn syncChannelLocked(
+        self: *Lv2Runtime,
+        channel: *ChannelRuntime,
+        descriptors: []const host.PluginDescriptor,
+        channel_plugins: []const chain.ChannelPlugin,
+        channel_plugin_params: []const chain.ChannelPluginParam,
+    ) !void {
+        const signature = computeChannelSignature(channel.channel_id, channel_plugins, channel_plugin_params);
+        if (signature == channel.last_signature) return;
+
+        var index = channel.instances.items.len;
+        while (index > 0) {
+            index -= 1;
+            if (!containsPluginForChannel(channel.channel_id, channel_plugins, channel.instances.items[index].plugin_id)) {
+                var removed = channel.instances.orderedRemove(index);
+                removed.deinit(self.allocator);
+            }
+        }
+
+        for (channel_plugins) |channel_plugin| {
+            if (channel_plugin.backend != .lv2) continue;
+            if (!std.mem.eql(u8, channel_plugin.channel_id, channel.channel_id)) continue;
             const descriptor = findDescriptor(descriptors, channel_plugin.descriptor_id) orelse continue;
-            if (findInstance(self.instances.items, channel_plugin.id) == null) {
+            if (findInstance(channel.instances.items, channel_plugin.id) == null) {
                 var instance = self.instantiatePlugin(channel_plugin, descriptor, channel_plugin_params) catch |err| {
                     std.debug.print(
                         "lv2: skipping plugin '{s}' ({s}) on channel '{s}': {s}\n",
@@ -310,11 +464,11 @@ pub const Lv2Runtime = if (build_options.enable_lilv) struct {
                     continue;
                 };
                 errdefer instance.deinit(self.allocator);
-                try self.instances.append(self.allocator, instance);
+                try channel.instances.append(self.allocator, instance);
             }
         }
 
-        for (self.instances.items) |*instance| {
+        for (channel.instances.items) |*instance| {
             applyControlValues(instance, descriptors, channel_plugins, channel_plugin_params);
             self.ensureActivated(instance);
             for (instance.atom_buffers) |atom_buffer| {
@@ -333,82 +487,36 @@ pub const Lv2Runtime = if (build_options.enable_lilv) struct {
             }
         }
 
-        std.mem.sort(ManagedInstance, self.instances.items, {}, sortManagedInstances);
-        self.last_signature = signature;
+        std.mem.sort(ManagedInstance, channel.instances.items, {}, sortManagedInstances);
+        channel.last_signature = signature;
     }
 
-    pub fn processChannel(self: *Lv2Runtime, channel_id: []const u8, left: []f32, right: []f32) bool {
-        self.instances_mutex.lock();
-        defer self.instances_mutex.unlock();
-
-        if (left.len == 0 or left.len != right.len) return false;
-        if (left.len > max_block_size) return false;
-
-        var scratch_left: [max_block_size]f32 = undefined;
-        var scratch_right: [max_block_size]f32 = undefined;
-        var temp_left: [max_block_size]f32 = undefined;
-        var temp_right: [max_block_size]f32 = undefined;
-
-        @memcpy(scratch_left[0..left.len], left);
-        @memcpy(scratch_right[0..left.len], right);
-
-        var processed_any = false;
-        for (self.instances.items) |*instance| {
-            if (!std.mem.eql(u8, instance.channel_id, channel_id)) continue;
-            if (!instance.enabled and !instance.supports_plugin_state_sync) continue;
-            self.ensureActivated(instance);
-            if (!processStereoInstance(instance, scratch_left[0..left.len], scratch_right[0..right.len], temp_left[0..left.len], temp_right[0..right.len])) return false;
-            @memcpy(scratch_left[0..left.len], temp_left[0..left.len]);
-            @memcpy(scratch_right[0..right.len], temp_right[0..right.len]);
-            processed_any = true;
-        }
-        if (!processed_any) return false;
-
-        @memcpy(left, scratch_left[0..left.len]);
-        @memcpy(right, scratch_right[0..right.len]);
-        return true;
-    }
-
-    pub fn getUiRuntimeHandle(self: *Lv2Runtime, plugin_id: []const u8) ?UiRuntimeHandle {
-        self.instances_mutex.lock();
-        defer self.instances_mutex.unlock();
-
-        for (self.instances.items) |*instance| {
-            if (!std.mem.eql(u8, instance.plugin_id, plugin_id)) continue;
-            return .{
-                .instance = instance.instance,
-                .features = &self.feature_context.feature_ptrs,
-            };
+    fn findInstanceLocked(self: *Lv2Runtime, plugin_id: []const u8) ?struct { channel: *ChannelRuntime, instance_index: usize } {
+        for (self.channels.items) |channel| {
+            if (findInstance(channel.instances.items, plugin_id)) |instance_index| {
+                return .{ .channel = channel, .instance_index = instance_index };
+            }
         }
         return null;
-    }
-
-    pub fn setSampleRate(self: *Lv2Runtime, sample_rate_hz: u32) void {
-        self.instances_mutex.lock();
-        defer self.instances_mutex.unlock();
-
-        if (sample_rate_hz == 0 or sample_rate_hz == self.sample_rate_hz) return;
-        self.sample_rate_hz = sample_rate_hz;
-        self.clearInstances();
-    }
-
-    pub fn channelLatencyFrames(self: *Lv2Runtime, channel_id: []const u8) u32 {
-        _ = self;
-        _ = channel_id;
-        return 0;
-    }
-
-    fn clearInstances(self: *Lv2Runtime) void {
-        for (self.instances.items) |*instance| instance.deinit(self.allocator);
-        self.instances.clearRetainingCapacity();
-        self.last_signature = 0;
     }
 
     fn ensureWorld(self: *Lv2Runtime) !void {
         if (self.world != null) return;
         const world = c.lilv_world_new() orelse return error.OutOfMemory;
         errdefer c.lilv_world_free(world);
-        c.lilv_world_load_all(world);
+        const search_roots = try lv2_discovery.collectSearchRoots(self.allocator);
+        defer freeOwnedStrings(self.allocator, search_roots);
+        const bundle_paths = try lv2_discovery.collectBundlePaths(self.allocator, search_roots);
+        defer freeOwnedStrings(self.allocator, bundle_paths);
+
+        c.lilv_world_load_specifications(world);
+        for (bundle_paths) |bundle_path| {
+            const bundle_path_z = try self.allocator.dupeZ(u8, bundle_path);
+            defer self.allocator.free(bundle_path_z);
+            const bundle_uri = c.lilv_new_file_uri(world, null, bundle_path_z.ptr) orelse continue;
+            defer c.lilv_node_free(bundle_uri);
+            c.lilv_world_load_bundle(world, bundle_uri);
+        }
         self.world = world;
     }
 
@@ -543,6 +651,11 @@ pub const Lv2Runtime = if (build_options.enable_lilv) struct {
         };
     }
 
+    fn freeOwnedStrings(allocator: std.mem.Allocator, items: [][]u8) void {
+        for (items) |item| allocator.free(item);
+        allocator.free(items);
+    }
+
     fn ensureActivated(self: *Lv2Runtime, instance: *ManagedInstance) void {
         _ = self;
         if (instance.activated) return;
@@ -587,12 +700,19 @@ pub const Lv2Runtime = if (build_options.enable_lilv) struct {
         _ = channel_plugin_params;
     }
 
-    pub fn processChannel(self: *Lv2Runtime, channel_id: []const u8, left: []f32, right: []f32) bool {
+    pub fn processChannelStatus(self: *Lv2Runtime, channel_id: []const u8, left: []f32, right: []f32) ChannelProcessStatus {
         _ = self;
         _ = channel_id;
         _ = left;
         _ = right;
-        return false;
+        return .bypass_no_chain;
+    }
+
+    pub fn processChannel(self: *Lv2Runtime, channel_id: []const u8, left: []f32, right: []f32) bool {
+        return switch (self.processChannelStatus(channel_id, left, right)) {
+            .processed, .bypass_no_chain => true,
+            .bypass_busy, .bypass_failed => false,
+        };
     }
 
     pub fn setSampleRate(self: *Lv2Runtime, sample_rate_hz: u32) void {
@@ -639,11 +759,59 @@ fn computeSignature(channel_plugins: []const chain.ChannelPlugin, channel_plugin
     return hasher.final();
 }
 
+fn computeChannelSignature(channel_id: []const u8, channel_plugins: []const chain.ChannelPlugin, channel_plugin_params: []const chain.ChannelPluginParam) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    var plugin_found = false;
+    for (channel_plugins) |channel_plugin| {
+        if (channel_plugin.backend != .lv2) continue;
+        if (!std.mem.eql(u8, channel_plugin.channel_id, channel_id)) continue;
+        plugin_found = true;
+        hasher.update(channel_plugin.id);
+        hasher.update(channel_plugin.descriptor_id);
+        hasher.update(channel_plugin.channel_id);
+        hasher.update(&[_]u8{
+            @intFromBool(channel_plugin.enabled),
+            @intCast(channel_plugin.slot & 0xff),
+        });
+        for (channel_plugin_params) |channel_plugin_param| {
+            if (!std.mem.eql(u8, channel_plugin_param.plugin_id, channel_plugin.id)) continue;
+            hasher.update(channel_plugin_param.plugin_id);
+            hasher.update(channel_plugin_param.symbol);
+            hasher.update(std.mem.asBytes(&channel_plugin_param.value));
+        }
+    }
+    return if (plugin_found) hasher.final() else 0;
+}
+
 fn containsPlugin(channel_plugins: []const chain.ChannelPlugin, plugin_id: []const u8) bool {
     for (channel_plugins) |channel_plugin| {
         if (channel_plugin.backend == .lv2 and std.mem.eql(u8, channel_plugin.id, plugin_id)) return true;
     }
     return false;
+}
+
+fn containsPluginForChannel(channel_id: []const u8, channel_plugins: []const chain.ChannelPlugin, plugin_id: []const u8) bool {
+    for (channel_plugins) |channel_plugin| {
+        if (channel_plugin.backend != .lv2) continue;
+        if (!std.mem.eql(u8, channel_plugin.channel_id, channel_id)) continue;
+        if (std.mem.eql(u8, channel_plugin.id, plugin_id)) return true;
+    }
+    return false;
+}
+
+fn channelHasLv2Plugins(channel_plugins: []const chain.ChannelPlugin, channel_id: []const u8) bool {
+    for (channel_plugins) |channel_plugin| {
+        if (channel_plugin.backend != .lv2) continue;
+        if (std.mem.eql(u8, channel_plugin.channel_id, channel_id)) return true;
+    }
+    return false;
+}
+
+fn findChannelRuntime(items: []const *Lv2Runtime.ChannelRuntime, channel_id: []const u8) ?*Lv2Runtime.ChannelRuntime {
+    for (items) |channel| {
+        if (std.mem.eql(u8, channel.channel_id, channel_id)) return channel;
+    }
+    return null;
 }
 
 fn findDescriptor(descriptors: []const host.PluginDescriptor, descriptor_id: []const u8) ?host.PluginDescriptor {
@@ -722,8 +890,6 @@ fn syncedToggleValue(control_port: host.PluginControlPort, enabled: bool) f32 {
 }
 
 fn sortManagedInstances(_: void, lhs: Lv2Runtime.ManagedInstance, rhs: Lv2Runtime.ManagedInstance) bool {
-    const channel_cmp = std.mem.order(u8, lhs.channel_id, rhs.channel_id);
-    if (channel_cmp != .eq) return channel_cmp == .lt;
     if (lhs.slot != rhs.slot) return lhs.slot < rhs.slot;
     return pluginNumericSuffix(lhs.plugin_id) < pluginNumericSuffix(rhs.plugin_id);
 }

@@ -11,6 +11,8 @@ pub const Bus = struct {
     hidden: bool = false,
     volume: f32 = 1.0,
     muted: bool = false,
+    system_volume: f32 = 1.0,
+    system_muted: bool = false,
     expose_as_microphone: bool = false,
-    expose_on_web: bool = false,
+    share_on_network: bool = false,
 };
