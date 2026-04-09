@@ -109,6 +109,8 @@ pub const StateStore = struct {
             .level = channel.level,
             .volume = channel.volume,
             .muted = channel.muted,
+            .system_volume = channel.system_volume,
+            .system_muted = channel.system_muted,
         });
     }
 
@@ -120,6 +122,8 @@ pub const StateStore = struct {
             .hidden = bus.hidden,
             .volume = bus.volume,
             .muted = bus.muted,
+            .system_volume = bus.system_volume,
+            .system_muted = bus.system_muted,
             .expose_as_microphone = bus.expose_as_microphone,
             .share_on_network = bus.share_on_network,
         });
@@ -158,6 +162,8 @@ pub const StateStore = struct {
             .level_left = destination.level_left,
             .level_right = destination.level_right,
             .level = destination.level,
+            .muted = destination.muted,
+            .volume = destination.volume,
             .pulse_sink_index = destination.pulse_sink_index,
             .pulse_sink_name = try self.allocator.dupe(u8, destination.pulse_sink_name),
             .pulse_card_index = destination.pulse_card_index,

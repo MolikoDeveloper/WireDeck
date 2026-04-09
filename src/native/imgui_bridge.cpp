@@ -3102,11 +3102,31 @@ namespace
                 const WireDeckUiBusDestination *bus_destination = find_bus_destination(snapshot, bus_id, destination.id);
                 if (bus_destination != nullptr && bus_destination->enabled != 0)
                 {
-                    return destination.label ? destination.label : destination.id;
+                    std::string preview = destination.label ? destination.label : destination.id;
+                    if (destination.muted != 0)
+                    {
+                        preview += " (Muted)";
+                    }
+                    else
+                    {
+                        const int volume_percent = static_cast<int>(std::round(std::clamp(destination.volume, 0.0f, 4.0f) * 100.0f));
+                        preview += " (" + std::to_string(volume_percent) + "%)";
+                    }
+                    return preview;
                 }
             }
         }
         return std::to_string(selected_count) + " destinations";
+    }
+
+    std::string system_capture_status_label(const WireDeckUiBus &bus)
+    {
+        if (bus.system_muted != 0)
+        {
+            return "System capture muted";
+        }
+        const int volume_percent = static_cast<int>(std::round(std::clamp(bus.system_volume, 0.0f, 4.0f) * 100.0f));
+        return "System capture " + std::to_string(volume_percent) + "%";
     }
 
     const char *destination_kind_label(int kind)
@@ -3687,6 +3707,14 @@ namespace
         ImGui::TextUnformatted("Physical destination");
         ImGui::PopStyleColor();
 
+        const std::string system_capture_label = system_capture_status_label(bus);
+        ImGui::SameLine();
+        ImGui::PushStyleColor(
+            ImGuiCol_Text,
+            bus.system_muted != 0 ? ImVec4(0.96f, 0.52f, 0.52f, 0.92f) : ImVec4(0.58f, 0.80f, 0.98f, 0.82f));
+        ImGui::TextUnformatted(system_capture_label.c_str());
+        ImGui::PopStyleColor();
+
         const float combo_y = 56.0f;
         const float combo_x = pad_x;
         const float combo_w = win_size.x - pad_x * 2.0f;
@@ -3792,6 +3820,11 @@ namespace
                 ImGui::PopStyleVar();
 
                 const bool enabled = bus_destination->enabled != 0;
+                const std::string status_text = enabled
+                    ? ((destination.muted != 0)
+                        ? "Enabled | Muted"
+                        : ("Enabled | " + std::to_string(static_cast<int>(std::round(std::clamp(destination.volume, 0.0f, 4.0f) * 100.0f))) + "%"))
+                    : "Disabled";
                 if (enabled)
                 {
                     popup_draw_list->AddRectFilled(
@@ -3809,7 +3842,7 @@ namespace
                 popup_draw_list->AddText(
                     ImVec2(item_min.x + 18.0f, item_min.y + 24.0f),
                     ImGui::GetColorU32(hovered_item ? ImVec4(0.76f, 0.78f, 0.86f, 0.82f) : ImVec4(0.66f, 0.68f, 0.77f, 0.72f)),
-                    enabled ? "Enabled" : "Disabled");
+                    status_text.c_str());
                 if (i < snapshot->destination_count - 1)
                 {
                     popup_draw_list->AddLine(

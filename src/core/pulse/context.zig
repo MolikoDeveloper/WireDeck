@@ -595,6 +595,8 @@ fn sinkInfoCb(
         .name = dupCStr(self.allocator, i.name),
         .description = dupCStr(self.allocator, i.description),
         .monitor_source_name = dupCStr(self.allocator, i.monitor_source_name),
+        .muted = i.mute != 0,
+        .volume = pulseLinearVolume(&i.volume),
         .card_index = if (i.card != c.PA_INVALID_INDEX) i.card else null,
         .bluez5_profile = dupProp(self.allocator, i.proplist, "api.bluez5.profile"),
         .bluez5_codec = dupProp(self.allocator, i.proplist, "api.bluez5.codec"),

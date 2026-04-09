@@ -21,4 +21,6 @@ pub const Channel = struct {
     level: f32 = 0.0,
     volume: f32 = 1.0,
     muted: bool = false,
+    system_volume: f32 = 1.0,
+    system_muted: bool = false,
 };

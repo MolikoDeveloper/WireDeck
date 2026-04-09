@@ -52,6 +52,8 @@ const BusState = struct {
     id: []u8,
     volume: f32 = 1.0,
     muted: bool = false,
+    system_volume: f32 = 1.0,
+    system_muted: bool = false,
     metrics: BusMetrics = .{},
     tap_cycle_token: u64 = 0,
     tap_sample_rate_hz: u32 = 0,
@@ -220,6 +222,8 @@ pub const AudioEngine = struct {
                 .id = try self.allocator.dupe(u8, bus.id),
                 .volume = bus.volume,
                 .muted = bus.muted,
+                .system_volume = bus.system_volume,
+                .system_muted = bus.system_muted,
                 .metrics = if (previous) |state| state.metrics else .{},
                 .tap_cycle_token = if (previous) |state| state.tap_cycle_token else 0,
                 .tap_sample_rate_hz = if (previous) |state| state.tap_sample_rate_hz else 0,
@@ -322,6 +326,15 @@ pub const AudioEngine = struct {
 
         const input_levels = measureLevels(left, right);
         const processed = runtime.processChannelStatus(channel_id, left, right);
+
+        var channel_volume: f32 = 1.0;
+        var channel_muted = false;
+        self.state_mutex.lock();
+        if (findChannelStatePtr(self.channels.items, channel_id)) |channel| {
+            channel_volume = channel.volume;
+            channel_muted = channel.muted;
+        }
+        self.state_mutex.unlock();
         const post_fx_levels = measureLevels(left, right);
 
         self.state_mutex.lock();
@@ -329,7 +342,7 @@ pub const AudioEngine = struct {
             self.render_generation += 1;
             channel.metrics.input = input_levels;
             channel.metrics.post_fx = post_fx_levels;
-            channel.metrics.post_fader = applyChannelFader(post_fx_levels, channel.volume, channel.muted);
+            channel.metrics.post_fader = applyChannelFader(post_fx_levels, channel_volume, channel_muted);
             channel.metrics.latency_frames = runtime.channelLatencyFrames(channel_id);
             channel.metrics.sample_rate_hz = sample_rate_hz;
             channel.metrics.frame_count = @intCast(left.len);
@@ -502,7 +515,7 @@ pub const AudioEngine = struct {
 
     fn recomputeBusMetricsLocked(self: *AudioEngine) void {
         for (self.buses.items) |*bus| {
-            if (bus.muted) {
+            if (bus.muted or bus.system_muted) {
                 bus.metrics = .{};
                 continue;
             }
@@ -520,7 +533,7 @@ pub const AudioEngine = struct {
                 if (channel.muted) continue;
 
                 const source = if (send.pre_fader) channel.metrics.post_fx else channel.metrics.post_fader;
-                const send_gain = std.math.clamp(send.gain * bus.volume, 0.0, 4.0);
+                const send_gain = std.math.clamp(send.gain * bus.volume * bus.system_volume, 0.0, 4.0);
                 const left = std.math.clamp(source.left * send_gain, 0.0, 1.0);
                 const right = std.math.clamp(source.right * send_gain, 0.0, 1.0);
                 if (left <= 0.00001 and right <= 0.00001) continue;
@@ -618,6 +631,10 @@ fn applyChannelFader(levels: MeterLevels, channel_volume: f32, channel_muted: bo
     };
 }
 
+fn approxEq(left: f32, right: f32) bool {
+    return @abs(left - right) <= 0.001;
+}
+
 fn clearChannelStates(allocator: std.mem.Allocator, items: *std.ArrayList(ChannelState)) void {
     for (items.items) |*item| item.deinit(allocator);
     items.clearRetainingCapacity();
@@ -649,12 +666,16 @@ fn computeGraphSignature(
         hasher.update(channel.id);
         hasher.update(std.mem.asBytes(&channel.volume));
         hasher.update(std.mem.asBytes(&channel.muted));
+        hasher.update(std.mem.asBytes(&channel.system_volume));
+        hasher.update(std.mem.asBytes(&channel.system_muted));
         if (channel.bound_source_id) |bound_source_id| hasher.update(bound_source_id);
     }
     for (buses) |bus| {
         hasher.update(bus.id);
         hasher.update(std.mem.asBytes(&bus.volume));
         hasher.update(std.mem.asBytes(&bus.muted));
+        hasher.update(std.mem.asBytes(&bus.system_volume));
+        hasher.update(std.mem.asBytes(&bus.system_muted));
         hasher.update(std.mem.asBytes(&bus.share_on_network));
         hasher.update(std.mem.asBytes(&bus.expose_as_microphone));
     }
@@ -906,13 +927,13 @@ fn renderBusQuantumLocked(self: *AudioEngine, frame_count: usize) void {
 
         const channel = findChannelStatePtr(self.channels.items, send.channel_id) orelse continue;
         const bus = findBusStatePtr(self.buses.items, send.bus_id) orelse continue;
-        if (bus.muted) continue;
+        if (bus.muted or bus.system_muted) continue;
         if (channel.muted) continue;
 
         const gain = if (send.pre_fader)
-            std.math.clamp(send.gain * bus.volume, 0.0, 4.0)
+            std.math.clamp(send.gain * bus.volume * bus.system_volume, 0.0, 4.0)
         else
-            std.math.clamp(send.gain * bus.volume * channel.volume, 0.0, 4.0);
+            std.math.clamp(send.gain * bus.volume * bus.system_volume * channel.volume, 0.0, 4.0);
         if (gain <= 0.00001) continue;
 
         for (0..frame_count) |frame_index| {

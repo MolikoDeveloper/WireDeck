@@ -27,6 +27,8 @@ pub const UiBus = extern struct {
     level: f32,
     volume: f32,
     muted: c_int,
+    system_volume: f32,
+    system_muted: c_int,
     expose_as_microphone: c_int,
     share_on_network: c_int,
 };
@@ -66,6 +68,8 @@ pub const UiDestination = extern struct {
     level_left: f32,
     level_right: f32,
     level: f32,
+    muted: c_int,
+    volume: f32,
 };
 
 pub const UiBusDestination = extern struct {

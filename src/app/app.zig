@@ -47,6 +47,8 @@ pub const App = struct {
         sources: []sources_mod.Source,
         destinations: []destinations_mod.Destination,
         meter_specs: []pulse.MeterSpec,
+        parking_sink_volume: f32 = 1.0,
+        parking_sink_muted: bool = false,
 
         fn deinit(self: *InventoryRefresh, allocator: std.mem.Allocator) void {
             for (self.sources) |source| {
@@ -1237,6 +1239,7 @@ pub const App = struct {
         fx_route_specs: []const FxRouteSpec,
     ) !void {
         _ = registry;
+        const parking_sink_gain = currentParkingSinkGain(pulse_snapshot);
         for (state_store.channels.items) |channel| {
             const bound_source_id = channel.bound_source_id orelse continue;
             const source = findStateSource(state_store.sources.items, bound_source_id) orelse continue;
@@ -1285,27 +1288,32 @@ pub const App = struct {
                             }
                             removeBlockedSinkInput(&self.blocked_sink_inputs, sink_input_index);
                             if (findRecordedRoutedSinkInput(self.routed_sink_inputs.items, sink_input_index)) |recorded| {
+                                const adjusted = applyParkingSinkGain(recorded.original_volume, recorded.original_muted, parking_sink_gain);
                                 const current_sink_index = sink_input.sink_index orelse recorded.original_sink_index;
                                 if (current_sink_index != recorded.original_sink_index or
-                                    sink_input.muted != recorded.original_muted or
-                                    !approxEqVolume(sink_input.volume, recorded.original_volume))
+                                    sink_input.muted != adjusted.muted or
+                                    !approxEqVolume(sink_input.volume, adjusted.volume))
                                 {
                                     try out.append(self.allocator, .{
                                         .channel_id = channel.id,
                                         .sink_input_index = sink_input_index,
                                         .target_sink_index = recorded.original_sink_index,
-                                        .muted = recorded.original_muted,
-                                        .volume = recorded.original_volume,
+                                        .muted = adjusted.muted,
+                                        .volume = adjusted.volume,
                                         .block_on_failure = false,
                                     });
                                 }
-                            } else if (sink_input.muted or !approxEqVolume(sink_input.volume, 1.0)) {
+                            } else {
+                                const adjusted = applyParkingSinkGain(preserved_volume, false, parking_sink_gain);
+                                if (sink_input.muted == adjusted.muted and approxEqVolume(sink_input.volume, adjusted.volume)) {
+                                    continue;
+                                }
                                 try out.append(self.allocator, .{
                                     .channel_id = channel.id,
                                     .sink_input_index = sink_input_index,
                                     .target_sink_index = null,
-                                    .muted = false,
-                                    .volume = preserved_volume,
+                                    .muted = adjusted.muted,
+                                    .volume = adjusted.volume,
                                     .block_on_failure = false,
                                 });
                             }
@@ -1350,13 +1358,14 @@ pub const App = struct {
                                 break :blk false;
                             };
                             if (findRecordedRoutedSinkInput(self.routed_sink_inputs.items, sink_input_index)) |recorded| {
+                                const adjusted = applyParkingSinkGain(recorded.original_volume, recorded.original_muted, parking_sink_gain);
                                 const active_sink_index = sink_input.sink_index orelse recorded.original_sink_index;
                                 const desired_sink_index: ?u32 = if (keep_on_parking)
                                     (parking_target_sink_index orelse recorded.original_sink_index)
                                 else
                                     null;
                                 const desired_volume = if (keep_on_parking)
-                                    recorded.original_volume
+                                    adjusted.volume
                                 else
                                     0.0;
                                 const needs_sink_move = if (desired_sink_index) |sink_index|
@@ -1364,30 +1373,31 @@ pub const App = struct {
                                 else
                                     false;
                                 if (needs_sink_move or
-                                    sink_input.muted != recorded.original_muted or
+                                    sink_input.muted != adjusted.muted or
                                     !approxEqVolume(sink_input.volume, desired_volume))
                                 {
                                     try out.append(self.allocator, .{
                                         .channel_id = channel.id,
                                         .sink_input_index = sink_input_index,
                                         .target_sink_index = desired_sink_index,
-                                        .muted = recorded.original_muted,
+                                        .muted = adjusted.muted,
                                         .volume = desired_volume,
                                         .block_on_failure = false,
                                     });
                                 }
                             } else {
+                                const adjusted = applyParkingSinkGain(preserved_volume, false, parking_sink_gain);
                                 const desired_sink_index: ?u32 = if (keep_on_parking) parking_target_sink_index else null;
-                                const desired_volume = if (keep_on_parking) preserved_volume else 0.0;
+                                const desired_volume = if (keep_on_parking) adjusted.volume else 0.0;
                                 if ((desired_sink_index != null and current_sink_index != desired_sink_index.?) or
-                                    sink_input.muted or
+                                    sink_input.muted != adjusted.muted or
                                     !approxEqVolume(sink_input.volume, desired_volume))
                                 {
                                     try out.append(self.allocator, .{
                                         .channel_id = channel.id,
                                         .sink_input_index = sink_input_index,
                                         .target_sink_index = desired_sink_index,
-                                        .muted = false,
+                                        .muted = adjusted.muted,
                                         .volume = desired_volume,
                                         .block_on_failure = false,
                                     });
@@ -1415,49 +1425,56 @@ pub const App = struct {
                                 removeBlockedSinkInput(&self.blocked_sink_inputs, sink_input_index);
                             } else if (containsBlockedSinkInput(self.blocked_sink_inputs.items, sink_input_index)) {
                                 if (findRecordedRoutedSinkInput(self.routed_sink_inputs.items, sink_input_index)) |recorded| {
+                                    const adjusted = applyParkingSinkGain(recorded.original_volume, recorded.original_muted, parking_sink_gain);
                                     const current_sink_index = sink_input.sink_index orelse recorded.original_sink_index;
                                     if (current_sink_index != recorded.original_sink_index or
-                                        sink_input.muted != recorded.original_muted or
-                                        !approxEqVolume(sink_input.volume, recorded.original_volume))
+                                        sink_input.muted != adjusted.muted or
+                                        !approxEqVolume(sink_input.volume, adjusted.volume))
                                     {
                                         try out.append(self.allocator, .{
                                             .channel_id = channel.id,
                                             .sink_input_index = sink_input_index,
                                             .target_sink_index = recorded.original_sink_index,
-                                            .muted = recorded.original_muted,
-                                            .volume = recorded.original_volume,
+                                            .muted = adjusted.muted,
+                                            .volume = adjusted.volume,
                                             .block_on_failure = false,
                                         });
                                     }
-                                } else if (sink_input.muted or !approxEqVolume(sink_input.volume, 1.0)) {
+                                } else {
+                                    const adjusted = applyParkingSinkGain(preserved_volume, false, parking_sink_gain);
+                                    if (sink_input.muted == adjusted.muted and approxEqVolume(sink_input.volume, adjusted.volume)) {
+                                        continue;
+                                    }
                                     try out.append(self.allocator, .{
                                         .channel_id = channel.id,
                                         .sink_input_index = sink_input_index,
                                         .target_sink_index = null,
-                                        .muted = false,
-                                        .volume = preserved_volume,
+                                        .muted = adjusted.muted,
+                                        .volume = adjusted.volume,
                                         .block_on_failure = false,
                                     });
                                 }
                                 continue;
                             }
                             const current_sink_index = sink_input.sink_index orelse continue;
-                            const target_volume = preserved_volume;
-                            if (current_sink_index == target.sink_index and !sink_input.muted and approxEqVolume(sink_input.volume, target_volume)) continue;
+                            const adjusted = applyParkingSinkGain(preserved_volume, false, parking_sink_gain);
+                            const target_volume = adjusted.volume;
+                            if (current_sink_index == target.sink_index and sink_input.muted == adjusted.muted and approxEqVolume(sink_input.volume, target_volume)) continue;
                             try out.append(self.allocator, .{
                                 .channel_id = channel.id,
                                 .sink_input_index = sink_input_index,
                                 .target_sink_index = target.sink_index,
-                                .muted = false,
+                                .muted = adjusted.muted,
                                 .volume = target_volume,
                                 .block_on_failure = needs_legacy_capture_move,
                             });
                         } else if (findRecordedRoutedSinkInput(self.routed_sink_inputs.items, sink_input_index)) |recorded| {
+                            const adjusted = applyParkingSinkGain(recorded.original_volume, recorded.original_muted, parking_sink_gain);
                             const current_sink_index = sink_input.sink_index orelse recorded.original_sink_index;
                             removeBlockedSinkInput(&self.blocked_sink_inputs, sink_input_index);
                             if (current_sink_index == recorded.original_sink_index and
-                                sink_input.muted == recorded.original_muted and
-                                approxEqVolume(sink_input.volume, recorded.original_volume))
+                                sink_input.muted == adjusted.muted and
+                                approxEqVolume(sink_input.volume, adjusted.volume))
                             {
                                 continue;
                             }
@@ -1465,8 +1482,8 @@ pub const App = struct {
                                 .channel_id = channel.id,
                                 .sink_input_index = sink_input_index,
                                 .target_sink_index = recorded.original_sink_index,
-                                .muted = recorded.original_muted,
-                                .volume = recorded.original_volume,
+                                .muted = adjusted.muted,
+                                .volume = adjusted.volume,
                                 .block_on_failure = false,
                             });
                         } else {
@@ -1827,6 +1844,8 @@ pub const App = struct {
             .sources = try sources.toOwnedSlice(allocator),
             .destinations = try destinations.toOwnedSlice(allocator),
             .meter_specs = try meter_specs.toOwnedSlice(allocator),
+            .parking_sink_volume = if (findPulseSinkByName(snapshot, parking_sink_name)) |sink| sink.volume else 1.0,
+            .parking_sink_muted = if (findPulseSinkByName(snapshot, parking_sink_name)) |sink| sink.muted else false,
         };
     }
 
@@ -1851,6 +1870,17 @@ pub const App = struct {
 
         self.state_store.clearDestinations();
         self.state_store.clearBusDestinations();
+        var parking_state_changed = false;
+        for (self.state_store.buses.items) |*bus| {
+            const next_system_volume: f32 = if (bus.role != .input_stage) refresh.parking_sink_volume else 1.0;
+            const next_system_muted: bool = if (bus.role != .input_stage) refresh.parking_sink_muted else false;
+            parking_state_changed = parking_state_changed or
+                !approxEqVolume(bus.system_volume, next_system_volume) or
+                bus.system_muted != next_system_muted;
+            bus.system_volume = next_system_volume;
+            bus.system_muted = next_system_muted;
+        }
+        if (parking_state_changed) self.markRoutingDirty();
         for (refresh.destinations) |destination| {
             try self.state_store.addDestination(destination);
         }
@@ -2565,6 +2595,8 @@ fn appendDestinationsToList(
             .label = label,
             .subtitle = subtitle,
             .kind = destinationKindForRegistryNode(obj),
+            .muted = if (matched_sink) |sink| sink.muted else false,
+            .volume = if (matched_sink) |sink| sink.volume else 1.0,
             .pulse_sink_index = if (matched_sink) |sink| sink.index else null,
             .pulse_sink_name = try allocator.dupe(u8, pulse_sink_name),
             .pulse_card_index = null,
@@ -2636,6 +2668,15 @@ fn inventoryRefreshMatchesState(state_store: *const StateStore, refresh: App.Inv
     if (state_store.sources.items.len != refresh.sources.len) return false;
     if (state_store.destinations.items.len != refresh.destinations.len) return false;
 
+    if (state_store.buses.items.len != 0) {
+        for (state_store.buses.items) |bus| {
+            const expected_system_volume: f32 = if (bus.role != .input_stage) refresh.parking_sink_volume else 1.0;
+            const expected_system_muted: bool = if (bus.role != .input_stage) refresh.parking_sink_muted else false;
+            if (!approxEqVolume(bus.system_volume, expected_system_volume)) return false;
+            if (bus.system_muted != expected_system_muted) return false;
+        }
+    }
+
     for (state_store.sources.items, refresh.sources) |current, next| {
         if (!std.mem.eql(u8, current.id, next.id)) return false;
         if (!std.mem.eql(u8, current.label, next.label)) return false;
@@ -2652,6 +2693,8 @@ fn inventoryRefreshMatchesState(state_store: *const StateStore, refresh: App.Inv
         if (!std.mem.eql(u8, current.subtitle, next.subtitle)) return false;
         if (current.kind != next.kind) return false;
         if (current.pulse_sink_index != next.pulse_sink_index) return false;
+        if (current.muted != next.muted) return false;
+        if (!approxEqVolume(current.volume, next.volume)) return false;
     }
 
     return true;
@@ -3442,6 +3485,11 @@ const DesiredSinkMove = struct {
     block_on_failure: bool = false,
 };
 
+const ParkingSinkGain = struct {
+    volume: f32 = 1.0,
+    muted: bool = false,
+};
+
 fn buildSourceId(allocator: std.mem.Allocator, owner: binder.BoundOwner) ![]u8 {
     if (owner.real_pid) |pid| {
         if (owner.process_binary) |binary| {
@@ -3576,6 +3624,24 @@ fn containsDesiredMove(items: []const DesiredSinkMove, sink_input_index: u32) bo
         if (item.sink_input_index == sink_input_index) return true;
     }
     return false;
+}
+
+
+fn currentParkingSinkGain(pulse_snapshot: pulse.PulseSnapshot) ParkingSinkGain {
+    if (findPulseSinkByName(pulse_snapshot, parking_sink_name)) |sink| {
+        return .{
+            .volume = sink.volume,
+            .muted = sink.muted,
+        };
+    }
+    return .{};
+}
+
+fn applyParkingSinkGain(base_volume: f32, base_muted: bool, gain: ParkingSinkGain) ParkingSinkGain {
+    return .{
+        .volume = std.math.clamp(base_volume * gain.volume, 0.0, 4.0),
+        .muted = base_muted or gain.muted,
+    };
 }
 
 fn hasRecordedOriginal(items: []const App.RoutedSinkInput, sink_input_index: u32) bool {
@@ -3995,6 +4061,8 @@ fn appendBluetoothProfileDestination(
         .label = label,
         .subtitle = subtitle,
         .kind = .physical,
+        .muted = if (isProfileActive(card, profile.name) and active_sink != null) active_sink.?.muted else false,
+        .volume = if (isProfileActive(card, profile.name) and active_sink != null) active_sink.?.volume else 1.0,
         .pulse_sink_index = if (isProfileActive(card, profile.name) and active_sink != null) active_sink.?.index else null,
         .pulse_sink_name = try allocator.dupe(u8, if (isProfileActive(card, profile.name) and active_sink != null) (active_sink.?.name orelse "") else ""),
         .pulse_card_index = card.index,

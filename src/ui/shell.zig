@@ -501,6 +501,8 @@ pub const UiShell = struct {
                 .level = levels.level,
                 .volume = bus.volume,
                 .muted = @intFromBool(bus.muted),
+                .system_volume = bus.system_volume,
+                .system_muted = @intFromBool(bus.system_muted),
                 .expose_as_microphone = @intFromBool(bus.expose_as_microphone),
                 .share_on_network = @intFromBool(bus.share_on_network),
             };
@@ -548,6 +550,8 @@ pub const UiShell = struct {
                 .level_left = destination.level_left,
                 .level_right = destination.level_right,
                 .level = destination.level,
+                .muted = @intFromBool(destination.muted),
+                .volume = destination.volume,
             };
         }
         var bus_destination_index: usize = 0;

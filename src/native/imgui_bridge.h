@@ -34,6 +34,8 @@ typedef struct WireDeckUiBus {
     float level;
     float volume;
     int muted;
+    float system_volume;
+    int system_muted;
     int expose_as_microphone;
     int share_on_network;
 } WireDeckUiBus;
@@ -73,6 +75,8 @@ typedef struct WireDeckUiDestination {
     float level_left;
     float level_right;
     float level;
+    int muted;
+    float volume;
 } WireDeckUiDestination;
 
 typedef struct WireDeckUiBusDestination {
