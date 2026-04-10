@@ -3064,19 +3064,37 @@ fn resolveFxInputBinding(
     };
 
     if (source.kind == .app) {
-        if (try resolveDirectAppPipewireNodeTarget(self.allocator, registry, owners, pulse_snapshot, source)) |target| {
+        if (appSourceHasLiveFallbackCaptureOwner(self.allocator, owners, source)) {
+            if (!appSourcePrefersStableMonitorCapture(source)) {
+                if (try resolveDirectAppPipewireNodeTarget(self.allocator, registry, owners, pulse_snapshot, source)) |target| {
+                    const binding: FxInputBinding = .{
+                        .target_name = target.node_name,
+                        .target_node_id = target.node_id,
+                        .port_kind = .output,
+                    };
+                    try self.rememberRecentAppFxBinding(channel.id, source.id, binding);
+                    if (enable_routing_info_logs) {
+                        std.log.info("routing fx input: channel={s} source={s} mode=direct_output target={s} node_id={d}", .{
+                            channel.id,
+                            bound_source_id,
+                            target.node_name,
+                            target.node_id,
+                        });
+                    }
+                    return binding;
+                }
+            }
+            const target_name = try virtual_inputs.allocSinkName(self.allocator, "wiredeck_input_", channel.id);
             const binding: FxInputBinding = .{
-                .target_name = target.node_name,
-                .target_node_id = target.node_id,
-                .port_kind = .output,
+                .target_name = target_name,
+                .port_kind = .monitor,
             };
             try self.rememberRecentAppFxBinding(channel.id, source.id, binding);
             if (enable_routing_info_logs) {
-                std.log.info("routing fx input: channel={s} source={s} mode=direct_output target={s} node_id={d}", .{
+                std.log.info("routing fx input: channel={s} source={s} mode=fallback_monitor reason={s}", .{
                     channel.id,
                     bound_source_id,
-                    target.node_name,
-                    target.node_id,
+                    if (appSourcePrefersStableMonitorCapture(source)) "stable_app_capture" else "sticky_app_virtual_capture",
                 });
             }
             return binding;
@@ -3097,21 +3115,6 @@ fn resolveFxInputBinding(
                     .port_kind = recent_binding.port_kind,
                 };
             }
-        }
-        if (appSourceHasLiveFallbackCaptureOwner(self.allocator, owners, source)) {
-            const target_name = try virtual_inputs.allocSinkName(self.allocator, "wiredeck_input_", channel.id);
-            const binding: FxInputBinding = .{
-                .target_name = target_name,
-                .port_kind = .monitor,
-            };
-            try self.rememberRecentAppFxBinding(channel.id, source.id, binding);
-            if (enable_routing_info_logs) {
-                std.log.info("routing fx input: channel={s} source={s} mode=fallback_monitor reason=sticky_app_virtual_capture", .{
-                    channel.id,
-                    bound_source_id,
-                });
-            }
-            return binding;
         }
         if (self.recentAppFxBinding(channel.id, source.id)) |recent_binding| {
             if (enable_routing_info_logs) {
@@ -3167,10 +3170,9 @@ fn resolveDirectAppPipewireNodeTarget(
     for (owners) |owner| {
         if (!try ownerMatchesAppSource(allocator, owner, source)) continue;
         matched_owner_count += 1;
-        for (owner.pw_node_ids) |pw_node_id| {
-            const obj = findRegistryNodeById(registry, pw_node_id) orelse continue;
-            const media_class = obj.props.media_class orelse continue;
-            if (!std.mem.eql(u8, media_class, "Stream/Output/Audio")) continue;
+        for (registry.objects.items) |obj| {
+            if (!registryOutputNodeBelongsToOwner(obj, owner)) continue;
+            const pw_node_id = obj.id;
             matched_output_node_count += 1;
             const node_name = obj.props.node_name orelse continue;
 
@@ -3248,6 +3250,31 @@ fn resolveDirectAppPipewireNodeTarget(
     }
 
     return active_target;
+}
+
+fn registryOutputNodeBelongsToOwner(obj: pw.GlobalObject, owner: binder.BoundOwner) bool {
+    if (obj.kind != .node) return false;
+    const media_class = obj.props.media_class orelse return false;
+    if (!std.mem.eql(u8, media_class, "Stream/Output/Audio")) return false;
+
+    if (owner.pw_client_id != null and obj.props.client_id != null and owner.pw_client_id.? == obj.props.client_id.?) {
+        return true;
+    }
+
+    if (owner.process_binary) |binary| {
+        if (sameAppIdentityText(binary, obj.props.app_process_binary orelse "")) return true;
+    }
+    if (owner.app_name) |app_name| {
+        if (sameAppIdentityText(app_name, obj.props.app_name orelse "")) return true;
+        if (sameAppIdentityText(app_name, obj.props.node_name orelse "")) return true;
+        if (sameAppIdentityText(app_name, obj.props.media_name orelse "")) return true;
+    }
+    if (owner.media_name) |media_name| {
+        if (sameAppIdentityText(media_name, obj.props.media_name orelse "")) return true;
+        if (sameAppIdentityText(media_name, obj.props.node_name orelse "")) return true;
+    }
+
+    return false;
 }
 
 fn collectActiveFxChannels(
@@ -3871,6 +3898,42 @@ fn looksLikeDiscordSource(source: sources_mod.Source) bool {
         containsIgnoreCase(source.subtitle, "discord") or
         containsIgnoreCase(source.process_binary, "discord") or
         containsIgnoreCase(source.id, "discord");
+}
+
+fn looksLikeBrowserSource(source: sources_mod.Source) bool {
+    if (source.kind != .app) return false;
+    return containsIgnoreCase(source.label, "firefox") or
+        containsIgnoreCase(source.subtitle, "firefox") or
+        containsIgnoreCase(source.process_binary, "firefox") or
+        containsIgnoreCase(source.id, "firefox") or
+        containsIgnoreCase(source.label, "chromium") or
+        containsIgnoreCase(source.subtitle, "chromium") or
+        containsIgnoreCase(source.process_binary, "chromium") or
+        containsIgnoreCase(source.id, "chromium") or
+        containsIgnoreCase(source.label, "chrome") or
+        containsIgnoreCase(source.subtitle, "chrome") or
+        containsIgnoreCase(source.process_binary, "chrome") or
+        containsIgnoreCase(source.id, "chrome") or
+        containsIgnoreCase(source.label, "brave") or
+        containsIgnoreCase(source.subtitle, "brave") or
+        containsIgnoreCase(source.process_binary, "brave") or
+        containsIgnoreCase(source.id, "brave") or
+        containsIgnoreCase(source.label, "vivaldi") or
+        containsIgnoreCase(source.subtitle, "vivaldi") or
+        containsIgnoreCase(source.process_binary, "vivaldi") or
+        containsIgnoreCase(source.id, "vivaldi") or
+        containsIgnoreCase(source.label, "opera") or
+        containsIgnoreCase(source.subtitle, "opera") or
+        containsIgnoreCase(source.process_binary, "opera") or
+        containsIgnoreCase(source.id, "opera") or
+        containsIgnoreCase(source.label, "edge") or
+        containsIgnoreCase(source.subtitle, "edge") or
+        containsIgnoreCase(source.process_binary, "edge") or
+        containsIgnoreCase(source.id, "edge");
+}
+
+fn appSourcePrefersStableMonitorCapture(source: sources_mod.Source) bool {
+    return looksLikeBrowserSource(source);
 }
 
 fn looksLikeDiscordCaptureOwner(owner: binder.BoundOwner) bool {
