@@ -1,2 +1,0 @@
-[console_scripts]
-wiredeck-rnnoise = wiredeck_rnnoise_trainer.cli:main
