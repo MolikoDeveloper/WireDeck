@@ -19,6 +19,7 @@
 - [ ] Keep audio behavior stable regardless of whether the main UI is visible, hidden, or never started
 - [ ] Keep real-time audio behavior stable in debug/development runs, or explicitly separate unsupported debug-only diagnostics from the RT path
 - [x] Remove `sleep(5ms)` scheduling from active physical bus playback so output timing follows the engine quantum instead of a slower helper cadence
+- [x] Move virtual mic exposure off direct engine pulls and onto the same buffered internal bus-consumer model used by stable playback/UDP edges
 - [ ] Replace remaining shared `AudioEngine.audio_mutex` hot-path contention between FX callbacks, render worker, and bus consumers with lock-free or per-bus/channel buffering
 - [ ] Remove hot-path dynamic buffer growth/compaction from channel render and bus tap streaming
 - [ ] Decouple UI-visible metering/discovery work further so visible windows do not measurably change RT behavior
@@ -33,7 +34,7 @@
 
 Current runtime status:
 - Bus playback is now exposed through hidden PipeWire sources named `wiredeck_output_bus_*`, and Pulse loopbacks route those sources to the selected physical sinks.
-- Virtual mic exposure still uses `wiredeck_busmic_*` and is fed from the internal engine.
+- Virtual mic exposure now publishes a system-facing `Audio/Source/Virtual` node named `WireDeck_*`, while a hidden `wiredeck_busmic_*` feeder stream drains from the internal bus-consumer buffer and targets that visible source.
 - Resolvable app channels such as Firefox and RHVoice now use direct PipeWire capture in the FX graph (`input=output:*`) without being moved to hidden `wiredeck_input_*` sinks.
 - Persisted app channels that no longer have a live matching owner now skip FX route creation entirely instead of creating idle `wiredeck_input_*` monitor sinks; only live-but-unresolved sticky app captures still fall back to monitor-based virtual capture.
 - Synthetic `loopback-*` and WireDeck-managed owners are no longer exposed as app sources, which removed the bogus `appgrp-unknown` source and the `legacy capture move blocked` spam.
@@ -57,6 +58,7 @@ Current runtime status:
 - Normal routing/info logs for FX links, bus exposure, app capture decisions, Pulse bus playback summaries, and virtual-mic state transitions are now disabled by default behind local feature flags, so normal runs are much quieter while warnings/errors still surface.
 - PipeWire bus playback now drains from a per-stream consumer buffer populated by its helper thread instead of reading `AudioEngine` directly inside the playback callback, reducing mutex contention between physical bus outputs and channel FX processing.
 - Pulse bus playback, which is the active physical-output path in the current runtime, now also pre-fills a per-stream consumer buffer from a feeder thread so the Pulse write callback usually drains ready PCM instead of pulling from `AudioEngine` under callback pressure.
+- Virtual mic exposure now follows the same model: a feeder thread aligned to the engine quantum prebuffers bus audio for each hidden `wiredeck_busmic_*` feeder, and the PipeWire callback only drains ready PCM or emits silence during startup/rebuffer, which should eliminate the old mic-only global jitter trigger while keeping the visible microphone compatible with PipeWire/Pulse/GNOME enumeration.
 - The Pulse bus playback feeder and the equivalent PipeWire playback trigger helper now wake on the engine render quantum (with a short catch-up cadence when buffers run low) instead of sleeping at a coarse fixed `5 ms` interval, so output buffering follows the mixer cadence more closely.
 - `AudioEngine` now uses separate state and audio-buffer mutexes instead of one global mutex, so channel metric/config work no longer serializes every bus tap read and channel render append behind the same lock.
 - UI-side meter reads now use non-blocking `AudioEngine` metric access, so the visible UI can skip a meter frame instead of blocking audio-state updates.

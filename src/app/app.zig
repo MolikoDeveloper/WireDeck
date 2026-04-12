@@ -30,7 +30,6 @@ const parking_sink_label = "WireDeck Parking";
 const enable_routing_info_logs = false;
 const enable_shutdown_info_logs = false;
 const enable_shutdown_stage_logs = false;
-const live_audio_apply_warn_threshold_ns: i128 = 6 * std.time.ns_per_ms;
 const live_audio_worker_warn_threshold_ns: i128 = 12 * std.time.ns_per_ms;
 const live_audio_warn_log_interval_ns: i128 = 1000 * std.time.ns_per_ms;
 
@@ -140,7 +139,6 @@ pub const App = struct {
     pipewire_live: pw.PipeWireLiveProfiler,
     pulse_peak: pulse.PeakMonitor,
     last_live_generation: u64,
-    last_live_audio_apply_warn_ns: i128,
     last_live_audio_worker_warn_ns: i128,
     live_audio_thread: ?std.Thread,
     live_audio_mutex: std.Thread.Mutex,
@@ -187,7 +185,6 @@ pub const App = struct {
             .pipewire_live = pw.PipeWireLiveProfiler.init(allocator),
             .pulse_peak = pulse.PeakMonitor.init(allocator),
             .last_live_generation = 0,
-            .last_live_audio_apply_warn_ns = 0,
             .last_live_audio_worker_warn_ns = 0,
             .live_audio_thread = null,
             .live_audio_mutex = .{},
@@ -254,6 +251,9 @@ pub const App = struct {
         self.fx_virtual_inputs.deinit();
         if (enable_shutdown_info_logs) std.log.info("shutdown: restore output routing", .{});
         self.restoreOutputRouting() catch {};
+        output_exposure_mod.cleanupManagedVirtualMicState(self.allocator) catch |err| {
+            std.log.warn("shutdown virtual mic cleanup failed: {s}", .{@errorName(err)});
+        };
         for (self.routed_sink_inputs.items) |item| {
             self.allocator.free(item.channel_id);
         }
@@ -436,8 +436,6 @@ pub const App = struct {
     }
 
     pub fn pumpLiveAudio(self: *App) !void {
-        const started_ns = std.time.nanoTimestamp();
-        var had_pending_discovery = false;
         const fx_runtime_signature = computeFxRuntimeSignature(
             self.state_store.plugin_descriptors.items,
             self.state_store.channel_plugins.items,
@@ -465,7 +463,6 @@ pub const App = struct {
                 discovery.deinit(worker_allocator);
                 worker_allocator.destroy(discovery_ptr);
             }
-            had_pending_discovery = true;
 
             for (self.state_store.sources.items) |*source| {
                 source.level_left = 0.0;
@@ -520,21 +517,6 @@ pub const App = struct {
                     channel.level = levels.level;
                 },
             }
-        }
-
-        const duration_ns = std.time.nanoTimestamp() - started_ns;
-        if (duration_ns >= live_audio_apply_warn_threshold_ns and
-            (self.last_live_audio_apply_warn_ns == 0 or started_ns - self.last_live_audio_apply_warn_ns >= live_audio_warn_log_interval_ns))
-        {
-            self.last_live_audio_apply_warn_ns = started_ns;
-            std.log.warn(
-                "live audio apply slow: duration_ns={d} had_pending_discovery={any} live_generation={d}",
-                .{
-                    duration_ns,
-                    had_pending_discovery,
-                    self.last_live_generation,
-                },
-            );
         }
     }
 
@@ -2939,7 +2921,7 @@ fn resolvePreferredVirtualMicSourceIndex(
 ) !?u32 {
     for (state_store.buses.items) |bus| {
         if (!bus.expose_as_microphone) continue;
-        const source_name = try output_exposure_mod.allocVirtualMicSourceName(allocator, bus.id);
+        const source_name = try output_exposure_mod.allocVirtualMicNodeName(allocator, bus.label, bus.id);
         defer allocator.free(source_name);
         return findPulseSourceIndexByName(snapshot, source_name);
     }
@@ -3787,9 +3769,11 @@ fn findMappedStateSourceIndex(
 ) !?usize {
     if (findSourceIndex(items, discovered_source.id)) |index| return index;
 
-    const grouped_id = try buildGroupedSourceIdForDiscovered(allocator, discovered_source);
-    defer allocator.free(grouped_id);
-    if (findSourceIndex(items, grouped_id)) |index| return index;
+    if (discovered_source.kind == .app) {
+        const grouped_id = try buildGroupedSourceIdForDiscovered(allocator, discovered_source);
+        defer allocator.free(grouped_id);
+        if (findSourceIndex(items, grouped_id)) |index| return index;
+    }
 
     for (items, 0..) |item, index| {
         if (item.kind != discovered_source.kind) continue;
@@ -3991,7 +3975,8 @@ fn isWiredeckManagedRegistryObject(obj: pw.types.GlobalObject) bool {
         if (containsIgnoreCase(node_description, "wiredeck input ") or
             containsIgnoreCase(node_description, "wiredeck fx ") or
             containsIgnoreCase(node_description, "wiredeck level ") or
-            containsIgnoreCase(node_description, "wiredeck output "))
+            containsIgnoreCase(node_description, "wiredeck output ") or
+            containsIgnoreCase(node_description, "wiredeck "))
         {
             return true;
         }
