@@ -172,7 +172,7 @@ pub fn build(b: *std.Build) void {
 
     mod.addIncludePath(b.path("src/native"));
     mod.addIncludePath(b.path("src/core/pipewire"));
-    mod.addIncludePath(b.path("OBS/src/wiredeck_obs_output_source/include"));
+    mod.addIncludePath(b.path("../WireOBS/src/wiredeck_obs_output_source/include"));
     mod.addIncludePath(b.path("vendor/cimgui/imgui"));
     mod.addIncludePath(b.path("vendor/cimgui/imgui/backends"));
 
