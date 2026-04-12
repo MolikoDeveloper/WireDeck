@@ -919,6 +919,12 @@ fn isManagedWireDeckNode(props: *const c.struct_spa_dict) bool {
         if (std.mem.startsWith(u8, path, "wiredeck_parking_sink")) return true;
         if (std.mem.startsWith(u8, path, "wiredeck_meter_")) return true;
     }
+    if (lookupProp(props, "node.description")) |description| {
+        if (containsIgnoreCase(description, "wiredeck ")) return true;
+    }
+    if (lookupProp(props, "device.description")) |description| {
+        if (containsIgnoreCase(description, "wiredeck ")) return true;
+    }
     return false;
 }
 
