@@ -38,6 +38,7 @@ typedef struct WireDeckUiBus {
     int system_muted;
     int expose_as_microphone;
     int share_on_network;
+    unsigned int dirty_flags;
 } WireDeckUiBus;
 
 typedef struct WireDeckUiSend {

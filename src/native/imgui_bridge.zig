@@ -31,6 +31,7 @@ pub const UiBus = extern struct {
     system_muted: c_int,
     expose_as_microphone: c_int,
     share_on_network: c_int,
+    dirty_flags: c_uint,
 };
 
 pub const UiSend = extern struct {

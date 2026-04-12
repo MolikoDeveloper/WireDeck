@@ -32,6 +32,11 @@
 
 std::string g_last_error;
 
+constexpr unsigned int kUiBusDirtyVolume = 1u << 0;
+constexpr unsigned int kUiBusDirtyMuted = 1u << 1;
+constexpr unsigned int kUiBusDirtyExposeAsMicrophone = 1u << 2;
+constexpr unsigned int kUiBusDirtyShareOnNetwork = 1u << 3;
+
 bool safe_streq(const char *a, const char *b)
 {
     if (a == nullptr || b == nullptr)
@@ -3677,6 +3682,7 @@ namespace
         if (render_mic_exposure_button(bridge, "##output_mic_exposure", expose_as_microphone, ImVec2(seg_btn_w, seg_h), 9.0f))
         {
             bus.expose_as_microphone = expose_as_microphone ? 0 : 1;
+            bus.dirty_flags |= kUiBusDirtyExposeAsMicrophone;
         }
         if (ImGui::IsItemHovered())
         {
@@ -3687,6 +3693,7 @@ namespace
         if (render_web_exposure_button(bridge, "##output_network_share", share_on_network, ImVec2(seg_btn_w, seg_h), 9.0f))
         {
             bus.share_on_network = share_on_network ? 0 : 1;
+            bus.dirty_flags |= kUiBusDirtyShareOnNetwork;
         }
         if (ImGui::IsItemHovered())
         {
@@ -3948,6 +3955,7 @@ namespace
         if (render_mute_icon_button(bridge, "##mixer_bus_mute_toggle", muted, ImVec2(30.0f, 30.0f), 2.0f))
         {
             bus.muted = muted ? 0 : 1;
+            bus.dirty_flags |= kUiBusDirtyMuted;
         }
 
         ImGui::Dummy(ImVec2(0.0f, 10.0f));
@@ -3956,6 +3964,7 @@ namespace
         if (render_stereo_meter_with_volume("mixer_meter_volume_overlay", "##mixer_bus_volume", left_level, right_level, &bus_percent))
         {
             bus.volume = bus_percent / 100.0f;
+            bus.dirty_flags |= kUiBusDirtyVolume;
         }
 
         ImGui::Dummy(ImVec2(0.0f, 6.0f));

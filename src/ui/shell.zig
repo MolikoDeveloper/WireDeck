@@ -27,8 +27,10 @@ const lv2_ui_pump_interval_ns = 50 * std.time.ns_per_ms;
 const config_save_debounce_ns = 800 * std.time.ns_per_ms;
 const visible_frame_interval_ns = 50 * std.time.ns_per_ms;
 const hidden_frame_interval_ns = 250 * std.time.ns_per_ms;
-const ui_frame_warn_threshold_ns = 20 * std.time.ns_per_ms;
-const ui_warn_log_interval_ns = 1000 * std.time.ns_per_ms;
+const ui_bus_dirty_volume: u32 = 1 << 0;
+const ui_bus_dirty_muted: u32 = 1 << 1;
+const ui_bus_dirty_expose_as_microphone: u32 = 1 << 2;
+const ui_bus_dirty_share_on_network: u32 = 1 << 3;
 
 pub const UiShell = struct {
     const MutationResult = struct {
@@ -83,7 +85,6 @@ pub const UiShell = struct {
         var last_snapshot_refresh_ns: i128 = 0;
         var last_housekeeping_ns: i128 = 0;
         var last_lv2_ui_pump_ns: i128 = 0;
-        var last_ui_warn_ns: i128 = 0;
         var pending_config_save = false;
         var last_config_change_ns: i128 = 0;
 
@@ -138,14 +139,8 @@ pub const UiShell = struct {
 
         while (true) {
             const loop_started_ns = std.time.nanoTimestamp();
-            var pump_events_duration_ns: i128 = 0;
-            var snapshot_duration_ns: i128 = 0;
-            var render_duration_ns: i128 = 0;
-            var ui_changes_duration_ns: i128 = 0;
             if (runtime_shutdown.isRequested()) break;
-            const pump_events_started_ns = std.time.nanoTimestamp();
             const ui_state = imgui.wiredeck_imgui_pump_events(bridge);
-            pump_events_duration_ns = std.time.nanoTimestamp() - pump_events_started_ns;
             if (ui_state < 0) {
                 std.debug.print("UI event pump failed: {s}\n", .{imgui.wiredeck_imgui_last_error() orelse "unknown error"});
                 return error.UiFrameFailed;
@@ -183,7 +178,6 @@ pub const UiShell = struct {
             if (snapshot_due) {
                 app.pumpLiveAudio() catch {};
                 _ = pumpLv2UiIfDue(&lv2_ui_manager, app, state_store, &last_lv2_ui_pump_ns, std.time.nanoTimestamp(), true);
-                const snapshot_started_ns = std.time.nanoTimestamp();
                 try ensureSnapshotCapacity(
                     allocator,
                     state_store,
@@ -201,13 +195,10 @@ pub const UiShell = struct {
                     &snapshot,
                 );
                 try rebuildUiSnapshot(state_store, &snapshot, &recent_event_labels, &ui_strings);
-                snapshot_duration_ns = std.time.nanoTimestamp() - snapshot_started_ns;
                 last_snapshot_refresh_ns = now_ns;
             }
 
-            const render_started_ns = std.time.nanoTimestamp();
             const keep_running = imgui.wiredeck_imgui_render_frame(bridge, &snapshot);
-            render_duration_ns = std.time.nanoTimestamp() - render_started_ns;
             if (keep_running < 0) {
                 std.debug.print("UI frame failed: {s}\n", .{imgui.wiredeck_imgui_last_error() orelse "unknown error"});
                 return error.UiFrameFailed;
@@ -215,7 +206,6 @@ pub const UiShell = struct {
             if (keep_running == 0) break;
             if (runtime_shutdown.isRequested()) break;
 
-            const ui_changes_started_ns = std.time.nanoTimestamp();
             const ui_changes = try syncUiChanges(state_store, &snapshot);
             var state_changed = ui_changes.changed;
             var routing_changed = ui_changes.routing_changed;
@@ -238,28 +228,7 @@ pub const UiShell = struct {
                 pending_config_save = true;
                 last_config_change_ns = std.time.nanoTimestamp();
             }
-            ui_changes_duration_ns = std.time.nanoTimestamp() - ui_changes_started_ns;
             flushPendingConfigSave(config_store, state_store, &pending_config_save, last_config_change_ns, std.time.nanoTimestamp());
-
-            const loop_duration_ns = std.time.nanoTimestamp() - loop_started_ns;
-            if (loop_duration_ns >= ui_frame_warn_threshold_ns and
-                (last_ui_warn_ns == 0 or loop_started_ns - last_ui_warn_ns >= ui_warn_log_interval_ns))
-            {
-                last_ui_warn_ns = loop_started_ns;
-                std.log.warn(
-                    "ui frame slow: duration_ns={d} state={d} snapshot_due={any} lv2_ui_changed={any} pump_events_ns={d} snapshot_ns={d} render_ns={d} ui_changes_ns={d}",
-                    .{
-                        loop_duration_ns,
-                        ui_state,
-                        snapshot_due,
-                        lv2_ui_changed,
-                        pump_events_duration_ns,
-                        snapshot_duration_ns,
-                        render_duration_ns,
-                        ui_changes_duration_ns,
-                    },
-                );
-            }
 
             platform.nextFrame();
             sleepForFrameBudget(loop_started_ns, visible_frame_interval_ns);
@@ -505,6 +474,7 @@ pub const UiShell = struct {
                 .system_muted = @intFromBool(bus.system_muted),
                 .expose_as_microphone = @intFromBool(bus.expose_as_microphone),
                 .share_on_network = @intFromBool(bus.share_on_network),
+                .dirty_flags = 0,
             };
             bus_index += 1;
         }
@@ -603,7 +573,7 @@ pub const UiShell = struct {
         }
     }
 
-    fn syncUiChanges(state_store: *StateStore, snapshot: *const imgui.UiSnapshot) !MutationResult {
+    fn syncUiChanges(state_store: *StateStore, snapshot: *imgui.UiSnapshot) !MutationResult {
         var result: MutationResult = .{};
         for (state_store.channels.items, 0..) |*channel, index| {
             const next_volume = snapshot.channels[index].volume;
@@ -617,20 +587,22 @@ pub const UiShell = struct {
         var visible_bus_index: usize = 0;
         for (state_store.buses.items) |*bus| {
             if (bus.hidden) continue;
+            const dirty_flags = snapshot.buses[visible_bus_index].dirty_flags;
             const next_volume = snapshot.buses[visible_bus_index].volume;
             const next_muted = snapshot.buses[visible_bus_index].muted != 0;
             const next_expose_as_microphone = snapshot.buses[visible_bus_index].expose_as_microphone != 0;
             const next_share_on_network = snapshot.buses[visible_bus_index].share_on_network != 0;
-            const bus_changed = bus.volume != next_volume or
-                bus.muted != next_muted or
-                bus.expose_as_microphone != next_expose_as_microphone or
-                bus.share_on_network != next_share_on_network;
+            const bus_changed = (dirty_flags & ui_bus_dirty_volume != 0 and bus.volume != next_volume) or
+                (dirty_flags & ui_bus_dirty_muted != 0 and bus.muted != next_muted) or
+                (dirty_flags & ui_bus_dirty_expose_as_microphone != 0 and bus.expose_as_microphone != next_expose_as_microphone) or
+                (dirty_flags & ui_bus_dirty_share_on_network != 0 and bus.share_on_network != next_share_on_network);
             result.changed = result.changed or bus_changed;
             result.routing_changed = result.routing_changed or bus_changed;
-            bus.volume = next_volume;
-            bus.muted = next_muted;
-            bus.expose_as_microphone = next_expose_as_microphone;
-            bus.share_on_network = next_share_on_network;
+            if (dirty_flags & ui_bus_dirty_volume != 0) bus.volume = next_volume;
+            if (dirty_flags & ui_bus_dirty_muted != 0) bus.muted = next_muted;
+            if (dirty_flags & ui_bus_dirty_expose_as_microphone != 0) bus.expose_as_microphone = next_expose_as_microphone;
+            if (dirty_flags & ui_bus_dirty_share_on_network != 0) bus.share_on_network = next_share_on_network;
+            snapshot.buses[visible_bus_index].dirty_flags = 0;
             visible_bus_index += 1;
         }
         var visible_send_index: usize = 0;
