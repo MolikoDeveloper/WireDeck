@@ -67,8 +67,13 @@ pub fn main() !void {
                 std.log.warn("startup routing reconcile failed: {s}", .{@errorName(err)});
             }
         };
-        app.markRoutingDirty();
     }
+    app.reconcileCurrentRoutingNow() catch |err| {
+        if (err != error.CaptureSinkPending) {
+            std.log.warn("startup routing reconcile failed: {s}", .{@errorName(err)});
+        }
+    };
+    if (loaded_config) app.markRoutingDirty();
     app.startBackgroundServices();
     defer {
         config_store.save(&state_store) catch |err| {
@@ -252,8 +257,8 @@ fn cleanupManagedAudioState(allocator: std.mem.Allocator) !void {
 
     try app.cleanupStartupBindings();
     std.log.info("shutdown cleanup: startup bindings cleared", .{});
-    wiredeck.OutputExposure.cleanupDefaultAudioSource(allocator) catch |err| {
-        std.log.warn("default audio source cleanup failed: {s}", .{@errorName(err)});
+    wiredeck.OutputExposure.cleanupManagedVirtualMicState(allocator) catch |err| {
+        std.log.warn("managed virtual mic cleanup failed: {s}", .{@errorName(err)});
     };
     std.log.info("shutdown cleanup: default audio source restored", .{});
 }
