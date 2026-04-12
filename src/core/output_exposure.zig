@@ -1,19 +1,23 @@
 const std = @import("std");
 const enable_output_exposure_info_logs = false;
+const enable_virtual_mic_debug_logs = false;
 const StateStore = @import("../app/state_store.zig").StateStore;
 const audio_engine_mod = @import("audio/engine.zig");
 const bus_buffer_mod = @import("audio/bus_consumer_buffer.zig");
 const buses_mod = @import("audio/buses.zig");
 const destinations_mod = @import("audio/destinations.zig");
 const bus_playback_mod = @import("pulse/bus_playback.zig");
+const pipewire_context_mod = @import("pipewire/context.zig");
+const pw_c = @import("pipewire/c.zig").c;
 const virtual_mic_source_mod = @import("pipewire/virtual_mic_source.zig");
 const pulse = @import("pulse.zig");
 
 const default_http_port: u16 = 8787;
 const output_sink_prefix = "wiredeck_output_";
 const remap_source_prefix = "wiredeck_busmic_";
-const mic_description_prefix = "WireDeck Mic ";
+const mic_description_prefix = "WireDeck ";
 const output_description_prefix = "WireDeck Output ";
+const virtual_mic_create_warn_threshold_ns: i128 = 50 * std.time.ns_per_ms;
 
 pub const BusTargetSummary = struct {
     count: usize = 0,
@@ -221,6 +225,15 @@ pub const OutputExposureManager = struct {
             &desired_bus_destination_loopbacks,
             &desired_mics,
         );
+        if (enable_virtual_mic_debug_logs) {
+            std.log.info("virtual mic sync begin: desired={d} existing={d}", .{
+                desired_mics.items.len,
+                self.virtual_mics.items.len,
+            });
+            for (desired_mics.items) |item| {
+                std.log.info("virtual mic desired: bus={s} label={s}", .{ item.bus_id, item.bus_label });
+            }
+        }
         const plan_signature = computeExposurePlanSignature(state_store, pulse_snapshot);
         if (plan_signature != self.last_plan_signature) {
             self.last_plan_signature = plan_signature;
@@ -246,6 +259,8 @@ pub const OutputExposureManager = struct {
             pulsectx.unloadModule(module.index) catch {};
         }
 
+        try destroyStaleVirtualMicNodes(self.allocator);
+
         for (self.virtual_mics.items) |*mic| mic.deinit(self.allocator);
         self.virtual_mics.clearRetainingCapacity();
         for (self.bus_destination_loopbacks.items) |*item| item.deinit(self.allocator);
@@ -253,6 +268,35 @@ pub const OutputExposureManager = struct {
         for (self.output_buses.items) |*bus| bus.deinit(self.allocator);
         self.output_buses.clearRetainingCapacity();
         self.clearRoutes();
+    }
+
+    fn destroyStaleVirtualMicNodes(allocator: std.mem.Allocator) !void {
+        const pipewire = try pipewire_context_mod.PipewireContext.init(allocator);
+        defer pipewire.deinit();
+        try pipewire.scan();
+
+        for (pipewire.registry_state.objects.items) |obj| {
+            if (obj.kind != .node) continue;
+            const media_class = obj.props.media_class orelse continue;
+            if (!std.mem.eql(u8, media_class, "Audio/Source/Virtual") and
+                !std.mem.eql(u8, media_class, "Audio/Source"))
+            {
+                continue;
+            }
+            const node_name = obj.props.node_name orelse "";
+            const node_description = obj.props.node_description orelse "";
+            const media_name = obj.props.media_name orelse "";
+            if (!std.mem.startsWith(u8, node_name, "WireDeck_") and
+                !std.mem.startsWith(u8, node_description, mic_description_prefix) and
+                !std.mem.startsWith(u8, media_name, mic_description_prefix))
+            {
+                continue;
+            }
+            _ = pw_c.pw_registry_destroy(pipewire.registry, obj.id);
+        }
+
+        // Flush any pending removals before continuing startup.
+        try pipewire.scan();
     }
 
     fn clearRoutes(self: *OutputExposureManager) void {
@@ -285,16 +329,33 @@ pub const OutputExposureManager = struct {
             const existing = self.virtual_mics.items[index];
             const desired_item = findDesiredMic(desired, existing.bus_id);
             if (desired_item == null or !std.mem.eql(u8, existing.bus_label, desired_item.?.bus_label)) {
+                if (enable_virtual_mic_debug_logs) {
+                    std.log.info("virtual mic remove: bus={s} current_label={s} reason={s}", .{
+                        existing.bus_id,
+                        existing.bus_label,
+                        if (desired_item == null) "no_longer_desired" else "label_changed",
+                    });
+                }
                 try unloadVirtualMic(self, existing, pulsectx);
                 var removed = self.virtual_mics.orderedRemove(index);
                 removed.deinit(self.allocator);
                 continue;
+            }
+            if (enable_virtual_mic_debug_logs) {
+                std.log.info("virtual mic keep: bus={s} label={s} source={s}", .{
+                    existing.bus_id,
+                    existing.bus_label,
+                    existing.source_name,
+                });
             }
             index += 1;
         }
 
         for (desired) |item| {
             if (findManagedMic(self.virtual_mics.items, item.bus_id) != null) continue;
+            if (enable_virtual_mic_debug_logs) {
+                std.log.info("virtual mic add: bus={s} label={s}", .{ item.bus_id, item.bus_label });
+            }
             const managed = try loadVirtualMic(self, item, pulsectx);
             try self.virtual_mics.append(self.allocator, managed);
         }
@@ -354,6 +415,13 @@ pub const OutputExposureManager = struct {
 
     fn syncDefaultVirtualMicSource(self: *OutputExposureManager) !void {
         const preferred_source_name = if (self.virtual_mics.items.len > 0) self.virtual_mics.items[0].source_name else null;
+        if (enable_virtual_mic_debug_logs) {
+            std.log.info("virtual mic default sync: preferred={s} existing={s} active_count={d}", .{
+                preferred_source_name orelse "<none>",
+                self.default_virtual_mic_source_name orelse "<none>",
+                self.virtual_mics.items.len,
+            });
+        }
         if (preferred_source_name == null) {
             if (self.default_virtual_mic_source_name) |value| {
                 self.allocator.free(value);
@@ -367,9 +435,7 @@ pub const OutputExposureManager = struct {
             self.allocator.free(value);
             self.default_virtual_mic_source_name = null;
         }
-
-        try setPipeWireDefaultAudioSource(self.allocator, preferred_source_name.?);
-        self.default_virtual_mic_source_name = try self.allocator.dupe(u8, preferred_source_name.?);
+        // Do not auto-assign virtual microphones as the default system source.
     }
 
     fn unloadAllOutputBuses(self: *OutputExposureManager) !void {
@@ -395,11 +461,26 @@ pub fn allocVirtualMicSourceName(allocator: std.mem.Allocator, bus_id: []const u
     return allocSafeName(allocator, remap_source_prefix, bus_id);
 }
 
-pub fn cleanupDefaultAudioSource(allocator: std.mem.Allocator) !void {
-    const current = (try currentDefaultAudioSourceName(allocator)) orelse return;
-    defer allocator.free(current);
+pub fn allocVirtualMicNodeName(allocator: std.mem.Allocator, bus_label: []const u8, bus_id: []const u8) ![]u8 {
+    const label = if (bus_label.len > 0) bus_label else bus_id;
+    return allocSafeNamePreserveCase(allocator, "WireDeck_", label);
+}
 
-    if (!std.mem.startsWith(u8, current, remap_source_prefix)) return;
+pub fn allocVirtualMicDisplayName(allocator: std.mem.Allocator, bus_label: []const u8, bus_id: []const u8) ![]u8 {
+    const label = if (bus_label.len > 0) bus_label else bus_id;
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ mic_description_prefix, label });
+}
+
+pub fn cleanupDefaultAudioSource(allocator: std.mem.Allocator) !void {
+    const output = try runHostCommandCapture(allocator, &.{ "pw-metadata", "-n", "default" });
+    defer allocator.free(output);
+
+    const configured = try parseDefaultAudioSourceNameForKey(allocator, output, "default.configured.audio.source");
+    defer if (configured) |value| allocator.free(value);
+    const effective = try parseDefaultAudioSourceNameForKey(allocator, output, "default.audio.source");
+    defer if (effective) |value| allocator.free(value);
+
+    const current = configured orelse effective orelse return;
 
     const pulsectx = try pulse.PulseContext.init(allocator);
     defer pulsectx.deinit();
@@ -407,13 +488,39 @@ pub fn cleanupDefaultAudioSource(allocator: std.mem.Allocator) !void {
     const snapshot = try pulsectx.snapshot(allocator);
     defer pulse.freeSnapshot(allocator, snapshot);
 
+    const current_is_managed = isManagedVirtualMicSourceName(snapshot, current) or
+        std.mem.startsWith(u8, current, remap_source_prefix) or
+        std.mem.startsWith(u8, current, "WireDeck_") or
+        std.mem.startsWith(u8, current, mic_description_prefix);
+    if (!current_is_managed) return;
+
+    if (effective) |source_name| {
+        const effective_is_managed = isManagedVirtualMicSourceName(snapshot, source_name) or
+            std.mem.startsWith(u8, source_name, remap_source_prefix) or
+            std.mem.startsWith(u8, source_name, "WireDeck_") or
+            std.mem.startsWith(u8, source_name, mic_description_prefix);
+        if (!effective_is_managed) {
+            try setPipeWireDefaultAudioSource(allocator, source_name);
+            return;
+        }
+    }
+
     for (snapshot.sources) |source| {
         const source_name = source.name orelse continue;
         if (source.monitor_of_sink != null) continue;
-        if (std.mem.startsWith(u8, source_name, remap_source_prefix)) continue;
+        if (isManagedVirtualMicSource(snapshot, source)) continue;
         try setPipeWireDefaultAudioSource(allocator, source_name);
         return;
     }
+}
+
+pub fn cleanupManagedVirtualMicState(allocator: std.mem.Allocator) !void {
+    cleanupDefaultAudioSource(allocator) catch |err| switch (err) {
+        error.HostCommandFailed => {},
+        else => return err,
+    };
+    try deleteManagedDefaultAudioSourceMetadata(allocator);
+    try cleanupStaleVirtualMicNodes(allocator);
 }
 
 fn serverMain(manager: *OutputExposureManager) void {
@@ -436,6 +543,34 @@ fn serverMain(manager: *OutputExposureManager) void {
         };
         thread.detach();
     }
+}
+
+pub fn cleanupStaleVirtualMicNodes(allocator: std.mem.Allocator) !void {
+    const pipewire = try pipewire_context_mod.PipewireContext.init(allocator);
+    defer pipewire.deinit();
+    try pipewire.scan();
+
+    for (pipewire.registry_state.objects.items) |obj| {
+        if (obj.kind != .node) continue;
+        const media_class = obj.props.media_class orelse continue;
+        if (!std.mem.eql(u8, media_class, "Audio/Source/Virtual") and
+            !std.mem.eql(u8, media_class, "Audio/Source"))
+        {
+            continue;
+        }
+        const node_name = obj.props.node_name orelse "";
+        const node_description = obj.props.node_description orelse "";
+        const media_name = obj.props.media_name orelse "";
+        if (!std.mem.startsWith(u8, node_name, "WireDeck_") and
+            !std.mem.startsWith(u8, node_description, mic_description_prefix) and
+            !std.mem.startsWith(u8, media_name, mic_description_prefix))
+        {
+            continue;
+        }
+        _ = pw_c.pw_registry_destroy(pipewire.registry, obj.id);
+    }
+
+    try pipewire.scan();
 }
 
 fn handleConnectionThread(manager: *OutputExposureManager, connection: std.net.Server.Connection) void {
@@ -941,9 +1076,22 @@ fn collectDesiredOutputs(
         }
 
         if (bus.expose_as_microphone) {
+            if (enable_virtual_mic_debug_logs) {
+                std.log.info("virtual mic desired-from-bus: bus={s} label={s} hidden={any} role={s}", .{
+                    bus.id,
+                    bus.label,
+                    bus.hidden,
+                    @tagName(bus.role),
+                });
+            }
             try desired_mics.append(allocator, .{
                 .bus_id = bus.id,
                 .bus_label = bus.label,
+            });
+        } else if (enable_virtual_mic_debug_logs) {
+            std.log.info("virtual mic skipped-bus: bus={s} label={s} expose_as_microphone=false", .{
+                bus.id,
+                bus.label,
             });
         }
     }
@@ -1186,6 +1334,7 @@ fn loadOutputBus(
         engine,
         desired.bus_id,
         source_name,
+        source_name,
         description,
     );
     std.log.info("output exposure: created bus source {s} for bus {s}", .{
@@ -1248,22 +1397,32 @@ fn loadVirtualMic(
     pulsectx: *pulse.PulseContext,
 ) !OutputExposureManager.ManagedVirtualMic {
     _ = pulsectx;
+    const started_ns = std.time.nanoTimestamp();
     const engine = manager.engine orelse return error.AudioEngineUnavailable;
-    const source_name = try allocSafeName(manager.allocator, remap_source_prefix, desired.bus_id);
+    const consumer_id = try allocSafeName(manager.allocator, remap_source_prefix, desired.bus_id);
+    errdefer manager.allocator.free(consumer_id);
+    const source_name = try allocVirtualMicNodeName(manager.allocator, desired.bus_label, desired.bus_id);
     errdefer manager.allocator.free(source_name);
-
-    const escaped_label = try escapePactlValue(manager.allocator, desired.bus_label);
-    defer manager.allocator.free(escaped_label);
-    const description = try std.fmt.allocPrint(manager.allocator, "{s}{s}", .{ mic_description_prefix, escaped_label });
+    const description = try allocVirtualMicDisplayName(manager.allocator, desired.bus_label, desired.bus_id);
     defer manager.allocator.free(description);
 
     const source = try virtual_mic_source_mod.VirtualMicSource.init(
         manager.allocator,
         engine,
         desired.bus_id,
+        consumer_id,
         source_name,
         description,
     );
+    manager.allocator.free(consumer_id);
+    const duration_ns = std.time.nanoTimestamp() - started_ns;
+    if (duration_ns >= virtual_mic_create_warn_threshold_ns) {
+        std.log.warn("virtual mic create slow: bus={s} source={s} duration_ns={d}", .{
+            desired.bus_id,
+            source_name,
+            duration_ns,
+        });
+    }
 
     return .{
         .bus_id = try manager.allocator.dupe(u8, desired.bus_id),
@@ -1283,6 +1442,35 @@ fn unloadVirtualMic(
     mic.source.deinit();
 }
 
+fn isManagedVirtualMicSourceName(snapshot: pulse.PulseSnapshot, source_name: []const u8) bool {
+    for (snapshot.sources) |source| {
+        const current_name = source.name orelse continue;
+        if (!std.mem.eql(u8, current_name, source_name)) continue;
+        return isManagedVirtualMicSource(snapshot, source);
+    }
+    return false;
+}
+
+fn isManagedVirtualMicSource(snapshot: pulse.PulseSnapshot, source: pulse.PulseSource) bool {
+    const current_name = source.name orelse "";
+    const description = source.description orelse "";
+    if (std.mem.startsWith(u8, current_name, remap_source_prefix)) return true;
+    if (std.mem.startsWith(u8, current_name, "WireDeck_")) return true;
+    if (std.mem.startsWith(u8, description, mic_description_prefix)) return true;
+
+    if (source.monitor_of_sink) |sink_index| {
+        for (snapshot.sinks) |sink| {
+            if (sink.index != sink_index) continue;
+            const sink_description = sink.description orelse "";
+            if (std.mem.startsWith(u8, sink_description, mic_description_prefix)) return true;
+            const sink_name = sink.name orelse "";
+            if (std.mem.startsWith(u8, sink_name, remap_source_prefix)) return true;
+            if (std.mem.startsWith(u8, sink_name, "WireDeck_")) return true;
+        }
+    }
+    return false;
+}
+
 fn unloadOutputBus(
     manager: *OutputExposureManager,
     bus: OutputExposureManager.ManagedOutputBus,
@@ -1298,6 +1486,15 @@ fn allocSafeName(allocator: std.mem.Allocator, prefix: []const u8, id: []const u
     @memcpy(name[0..prefix.len], prefix);
     for (id, prefix.len..) |char, index| {
         name[index] = if (std.ascii.isAlphanumeric(char)) std.ascii.toLower(char) else '_';
+    }
+    return name;
+}
+
+fn allocSafeNamePreserveCase(allocator: std.mem.Allocator, prefix: []const u8, id: []const u8) ![]u8 {
+    var name = try allocator.alloc(u8, prefix.len + id.len);
+    @memcpy(name[0..prefix.len], prefix);
+    for (id, prefix.len..) |char, index| {
+        name[index] = if (std.ascii.isAlphanumeric(char)) char else '_';
     }
     return name;
 }
@@ -1322,24 +1519,66 @@ fn setPipeWireDefaultAudioSource(allocator: std.mem.Allocator, source_name: []co
     try runHostCommand(allocator, &.{ "pw-metadata", "-n", "default", "0", "default.audio.source", effective_value });
 }
 
+fn deleteManagedDefaultAudioSourceMetadata(allocator: std.mem.Allocator) !void {
+    const output = try runHostCommandCapture(allocator, &.{ "pw-metadata", "-n", "default" });
+    defer allocator.free(output);
+
+    if (try parseDefaultAudioSourceNameForKey(allocator, output, "default.configured.audio.source")) |value| {
+        defer allocator.free(value);
+        if (isManagedVirtualMicIdentifier(value)) {
+            runHostCommand(allocator, &.{ "pw-metadata", "-n", "default", "-d", "0", "default.configured.audio.source" }) catch |err| switch (err) {
+                error.HostCommandFailed => {},
+                else => return err,
+            };
+        }
+    }
+
+    if (try parseDefaultAudioSourceNameForKey(allocator, output, "default.audio.source")) |value| {
+        defer allocator.free(value);
+        if (isManagedVirtualMicIdentifier(value)) {
+            runHostCommand(allocator, &.{ "pw-metadata", "-n", "default", "-d", "0", "default.audio.source" }) catch |err| switch (err) {
+                error.HostCommandFailed => {},
+                else => return err,
+            };
+        }
+    }
+}
+
+fn isManagedVirtualMicIdentifier(value: []const u8) bool {
+    return std.mem.startsWith(u8, value, remap_source_prefix) or
+        std.mem.startsWith(u8, value, "WireDeck_") or
+        std.mem.startsWith(u8, value, mic_description_prefix);
+}
+
 fn currentDefaultAudioSourceName(allocator: std.mem.Allocator) !?[]u8 {
     const output = try runHostCommandCapture(allocator, &.{ "pw-metadata", "-n", "default" });
     defer allocator.free(output);
 
+    if (try parseDefaultAudioSourceNameForKey(allocator, output, "default.configured.audio.source")) |value| {
+        return value;
+    }
+    return parseDefaultAudioSourceNameForKey(allocator, output, "default.audio.source");
+}
+
+fn parseDefaultAudioSourceNameForKey(allocator: std.mem.Allocator, output: []const u8, key: []const u8) !?[]u8 {
     var lines = std.mem.splitScalar(u8, output, '\n');
     while (lines.next()) |line| {
-        if (std.mem.indexOf(u8, line, "key:'default.audio.source'") == null) continue;
+        const key_pattern = try std.fmt.allocPrint(allocator, "key:'{s}'", .{key});
+        defer allocator.free(key_pattern);
+        if (std.mem.indexOf(u8, line, key_pattern) == null) continue;
         const marker = "value:'";
         const start = std.mem.indexOf(u8, line, marker) orelse continue;
         const value_start = start + marker.len;
         const value_end = std.mem.lastIndexOfScalar(u8, line, '\'') orelse continue;
         if (value_end <= value_start) continue;
         const json = line[value_start..value_end];
-        const name_marker = "\"name\":\"";
-        const name_start = std.mem.indexOf(u8, json, name_marker) orelse continue;
-        const source_start = name_start + name_marker.len;
-        const source_end_rel = std.mem.indexOfScalarPos(u8, json, source_start, '"') orelse continue;
-        const value = try allocator.dupe(u8, json[source_start..source_end_rel]);
+        const name_key_start = std.mem.indexOf(u8, json, "\"name\"") orelse continue;
+        const colon_index = std.mem.indexOfScalarPos(u8, json, name_key_start + "\"name\"".len, ':') orelse continue;
+        const source_start = std.mem.indexOfScalarPos(u8, json, colon_index + 1, '"') orelse continue;
+        const source_end_rel = std.mem.indexOfScalarPos(u8, json, source_start + 1, '"') orelse continue;
+        if (source_end_rel <= source_start + 1) continue;
+        const actual_start = source_start + 1;
+        const value = try allocator.dupe(u8, json[actual_start..source_end_rel]);
         return value;
     }
     return null;
