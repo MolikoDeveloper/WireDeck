@@ -2362,8 +2362,8 @@ fn logAppInventoryRefresh(state_store: *const StateStore, next_sources: []const 
 fn syntheticSourceForChannelBinding(channel: channels_mod.Channel, source_id: []const u8) sources_mod.Source {
     return .{
         .id = source_id,
-        .label = channel.label,
-        .subtitle = channel.subtitle,
+        .label = channelSourceReferenceLabel(channel),
+        .subtitle = channelSourceReferenceSubtitle(channel),
         .kind = channelSourceKind(channel) orelse .physical,
         .process_binary = syntheticProcessBinaryForChannel(channel),
         .icon_name = channel.icon_name,
@@ -2373,12 +2373,12 @@ fn syntheticSourceForChannelBinding(channel: channels_mod.Channel, source_id: []
 
 fn syntheticSourceForUnboundChannel(channel: channels_mod.Channel) ?sources_mod.Source {
     const kind = channelSourceKind(channel) orelse return null;
-    if (channel.label.len == 0 and channel.subtitle.len == 0) return null;
+    if (channelSourceReferenceLabel(channel).len == 0 and channelSourceReferenceSubtitle(channel).len == 0) return null;
 
     return .{
         .id = "",
-        .label = channel.label,
-        .subtitle = channel.subtitle,
+        .label = channelSourceReferenceLabel(channel),
+        .subtitle = channelSourceReferenceSubtitle(channel),
         .kind = kind,
         .process_binary = syntheticProcessBinaryForChannel(channel),
         .icon_name = channel.icon_name,
@@ -3269,10 +3269,15 @@ fn collectActiveFxChannels(
     _ = app;
     _ = pulse_snapshot;
     for (state_store.channels.items) |channel| {
-        const bound_source_id = channel.bound_source_id orelse continue;
-        if (findStateSource(state_store.sources.items, bound_source_id) == null) continue;
+        if (!channelShouldRemainFxActive(state_store, channel)) continue;
         try channels.append(allocator, channel);
     }
+}
+
+fn channelShouldRemainFxActive(state_store: *const StateStore, channel: channels_mod.Channel) bool {
+    const bound_source_id = channel.bound_source_id orelse return false;
+    if (findStateSource(state_store.sources.items, bound_source_id) != null) return true;
+    return channelSourceKind(channel) == .app;
 }
 
 fn collectExternalCaptureFxChannels(
@@ -3310,6 +3315,47 @@ fn channelUsesInternalInputPath(state_store: *const StateStore, channel: channel
     const bound_source_id = channel.bound_source_id orelse return false;
     const source = findStateSource(state_store.sources.items, bound_source_id) orelse return false;
     return isNetworkIngressSource(source);
+}
+
+test "channelShouldRemainFxActive keeps app channel alive across transient source loss" {
+    var state_store = StateStore.init(std.testing.allocator);
+    defer state_store.deinit();
+
+    try state_store.addChannel(.{
+        .id = "source-strip-1",
+        .label = "Firefox",
+        .subtitle = "firefox-bin",
+        .bound_source_id = "appgrp-firefox.desktop",
+        .source_kind = @intFromEnum(sources_mod.SourceKind.app),
+        .source_ref_label = "Firefox",
+        .source_ref_subtitle = "firefox-bin",
+        .source_ref_process_binary = "firefox-bin",
+        .icon_name = "firefox",
+        .icon_path = "",
+        .custom_icon_name = "",
+        .custom_icon_path = "",
+    });
+
+    try std.testing.expect(channelShouldRemainFxActive(&state_store, state_store.channels.items[0]));
+}
+
+test "channelShouldRemainFxActive drops missing physical source" {
+    var state_store = StateStore.init(std.testing.allocator);
+    defer state_store.deinit();
+
+    try state_store.addChannel(.{
+        .id = "source-strip-1",
+        .label = "USB Mic",
+        .subtitle = "Audio/Source",
+        .bound_source_id = "pw-source-usb-mic",
+        .source_kind = @intFromEnum(sources_mod.SourceKind.physical),
+        .icon_name = "audio-input-microphone",
+        .icon_path = "",
+        .custom_icon_name = "",
+        .custom_icon_path = "",
+    });
+
+    try std.testing.expect(!channelShouldRemainFxActive(&state_store, state_store.channels.items[0]));
 }
 
 fn channelRequiresExternalCapture(state_store: *const StateStore, channel: channels_mod.Channel) bool {
@@ -3775,32 +3821,158 @@ fn findMappedStateSourceIndex(
         if (findSourceIndex(items, grouped_id)) |index| return index;
     }
 
-    for (items, 0..) |item, index| {
-        if (item.kind != discovered_source.kind) continue;
-
-        if (item.kind == .app) {
-            if (sameText(item.icon_name, discovered_source.icon_name) and item.icon_name.len > 0) return index;
-            if (sameText(item.process_binary, discovered_source.process_binary) and item.process_binary.len > 0) return index;
-            if (sameText(item.label, discovered_source.label) and item.label.len > 0) return index;
-            if (looksLikeDiscordVoiceEngine(discovered_source) and looksLikeDiscordSource(item)) return index;
-
-            if (item.label.len > 0 and discovered_source.label.len > 0 and
-                (containsIgnoreCase(item.label, discovered_source.label) or containsIgnoreCase(discovered_source.label, item.label)))
-            {
-                return index;
-            }
-            if (item.process_binary.len > 0 and discovered_source.process_binary.len > 0 and
-                (containsIgnoreCase(item.process_binary, discovered_source.process_binary) or containsIgnoreCase(discovered_source.process_binary, item.process_binary)))
-            {
-                return index;
-            }
-        } else {
-            if (sameText(item.label, discovered_source.label) and item.label.len > 0) return index;
-            if (sameText(item.subtitle, discovered_source.subtitle) and item.subtitle.len > 0) return index;
+    if (discovered_source.kind == .app) {
+        if (findUniqueSourceIndexByExactMetadata(
+            items,
+            .app,
+            nonEmptyText(discovered_source.label),
+            nonEmptyText(discovered_source.subtitle),
+            nonEmptyText(discovered_source.process_binary),
+        )) |index| return index;
+        if (findUniqueSourceIndexByExactMetadata(
+            items,
+            .app,
+            nonEmptyText(discovered_source.label),
+            null,
+            nonEmptyText(discovered_source.process_binary),
+        )) |index| return index;
+        if (findUniqueSourceIndexByExactMetadata(
+            items,
+            .app,
+            null,
+            null,
+            nonEmptyText(discovered_source.process_binary),
+        )) |index| return index;
+        if (findUniqueSourceIndexByExactMetadata(
+            items,
+            .app,
+            nonEmptyText(discovered_source.label),
+            nonEmptyText(discovered_source.subtitle),
+            null,
+        )) |index| return index;
+        if (discovered_source.process_binary.len == 0 and discovered_source.subtitle.len == 0) {
+            if (findUniqueSourceIndexByExactMetadata(
+                items,
+                .app,
+                nonEmptyText(discovered_source.label),
+                null,
+                null,
+            )) |index| return index;
+        }
+        if (looksLikeDiscordVoiceEngine(discovered_source) or looksLikeDiscordSource(discovered_source)) {
+            if (findUniqueDiscordSourceIndex(items)) |index| return index;
+        }
+    } else {
+        if (findUniqueSourceIndexByExactMetadata(
+            items,
+            discovered_source.kind,
+            nonEmptyText(discovered_source.label),
+            nonEmptyText(discovered_source.subtitle),
+            null,
+        )) |index| return index;
+        if (discovered_source.subtitle.len == 0) {
+            if (findUniqueSourceIndexByExactMetadata(
+                items,
+                discovered_source.kind,
+                nonEmptyText(discovered_source.label),
+                null,
+                null,
+            )) |index| return index;
         }
     }
 
     return null;
+}
+
+fn findUniqueSourceIndexByExactMetadata(
+    items: []const sources_mod.Source,
+    kind: sources_mod.SourceKind,
+    label: ?[]const u8,
+    subtitle: ?[]const u8,
+    process_binary: ?[]const u8,
+) ?usize {
+    var matched_index: ?usize = null;
+    for (items, 0..) |item, index| {
+        if (item.kind != kind) continue;
+        if (label) |value| {
+            if (!sameText(item.label, value)) continue;
+        }
+        if (subtitle) |value| {
+            if (!sameText(item.subtitle, value)) continue;
+        }
+        if (process_binary) |value| {
+            if (!sameText(item.process_binary, value)) continue;
+        }
+        if (matched_index != null) return null;
+        matched_index = index;
+    }
+    return matched_index;
+}
+
+fn findUniqueDiscordSourceIndex(items: []const sources_mod.Source) ?usize {
+    var matched_index: ?usize = null;
+    for (items, 0..) |item, index| {
+        if (item.kind != .app) continue;
+        if (!looksLikeDiscordSource(item) and !looksLikeDiscordVoiceEngine(item)) continue;
+        if (matched_index != null) return null;
+        matched_index = index;
+    }
+    return matched_index;
+}
+
+fn nonEmptyText(value: []const u8) ?[]const u8 {
+    if (value.len == 0) return null;
+    return value;
+}
+
+test "findMappedStateSourceIndex leaves ambiguous physical matches unresolved" {
+    const items = [_]sources_mod.Source{
+        .{ .id = "physical-1", .label = "USB Mic", .subtitle = "Audio/Source", .kind = .physical },
+        .{ .id = "physical-2", .label = "USB Mic", .subtitle = "Audio/Source", .kind = .physical },
+    };
+    const discovered: sources_mod.Source = .{
+        .id = "missing-source",
+        .label = "USB Mic",
+        .subtitle = "Audio/Source",
+        .kind = .physical,
+    };
+
+    try std.testing.expectEqual(@as(?usize, null), try findMappedStateSourceIndex(std.testing.allocator, items[0..], discovered));
+}
+
+test "findMappedStateSourceIndex uses unique exact app metadata" {
+    const items = [_]sources_mod.Source{
+        .{ .id = "appgrp-discord", .label = "Discord", .subtitle = "discord", .kind = .app, .process_binary = "discord" },
+        .{ .id = "appgrp-chrome", .label = "Google Chrome", .subtitle = "chrome", .kind = .app, .process_binary = "chrome" },
+    };
+    const discovered: sources_mod.Source = .{
+        .id = "stream-42",
+        .label = "Discord",
+        .subtitle = "discord",
+        .kind = .app,
+        .process_binary = "discord",
+    };
+
+    try std.testing.expectEqual(@as(?usize, 0), try findMappedStateSourceIndex(std.testing.allocator, items[0..], discovered));
+}
+
+test "synthetic app source preserves source reference metadata across stream restarts" {
+    const items = [_]sources_mod.Source{
+        .{ .id = "appgrp-firefox", .label = "Firefox", .subtitle = "firefox", .kind = .app, .process_binary = "firefox" },
+        .{ .id = "appgrp-discord", .label = "Discord", .subtitle = "discord", .kind = .app, .process_binary = "discord" },
+    };
+    const channel: channels_mod.Channel = .{
+        .id = "source-strip-1",
+        .label = "Browser Music",
+        .subtitle = "Renamed by user",
+        .source_kind = @intFromEnum(sources_mod.SourceKind.app),
+        .source_ref_label = "Firefox",
+        .source_ref_subtitle = "firefox",
+        .source_ref_process_binary = "firefox",
+    };
+
+    const discovered = syntheticSourceForChannelBinding(channel, "missing-firefox-stream");
+    try std.testing.expectEqual(@as(?usize, 0), try findMappedStateSourceIndex(std.testing.allocator, items[0..], discovered));
 }
 
 fn normalizedOwnerLabel(owner: binder.BoundOwner) []const u8 {
@@ -3939,7 +4111,18 @@ fn channelSourceKind(channel: channels_mod.Channel) ?sources_mod.SourceKind {
     return std.meta.intToEnum(sources_mod.SourceKind, channel.source_kind) catch null;
 }
 
+fn channelSourceReferenceLabel(channel: channels_mod.Channel) []const u8 {
+    if (channel.source_ref_label.len > 0) return channel.source_ref_label;
+    return channel.label;
+}
+
+fn channelSourceReferenceSubtitle(channel: channels_mod.Channel) []const u8 {
+    if (channel.source_ref_subtitle.len > 0) return channel.source_ref_subtitle;
+    return channel.subtitle;
+}
+
 fn syntheticProcessBinaryForChannel(channel: channels_mod.Channel) []const u8 {
+    if (channel.source_ref_process_binary.len > 0) return channel.source_ref_process_binary;
     if (channelSourceKind(channel) == .app) return channel.subtitle;
     return "";
 }

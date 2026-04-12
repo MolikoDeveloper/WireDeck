@@ -870,6 +870,9 @@ fn addChannelFromSource(state_store: *StateStore, source_id: []const u8) !void {
         .subtitle = selected_source.subtitle,
         .bound_source_id = selected_source.id,
         .source_kind = @intFromEnum(selected_source.kind),
+        .source_ref_label = selected_source.label,
+        .source_ref_subtitle = selected_source.subtitle,
+        .source_ref_process_binary = selected_source.process_binary,
         .icon_name = selected_source.icon_name,
         .icon_path = selected_source.icon_path,
         .custom_icon_name = "",
@@ -1117,12 +1120,27 @@ fn syncChannelBindingSelections(state_store: *StateStore) !bool {
             changed = true;
         }
 
-        if (!optionalSlicesEql(channel.bound_source_id, selected_source_id)) {
+        if (selected_source_id == null and channel.bound_source_id != null and previous_source == null) {
+            // Preserve the last known binding while inventory refresh is between
+            // app stream identities so routing does not briefly drop to "no source".
+        } else if (!optionalSlicesEql(channel.bound_source_id, selected_source_id)) {
             try replaceOwnedOptionalString(state_store.allocator, &channel.bound_source_id, selected_source_id);
             changed = true;
         }
 
         if (selected_source) |source| {
+            if (!std.mem.eql(u8, channel.source_ref_label, source.label)) {
+                try replaceOwnedString(state_store.allocator, &channel.source_ref_label, source.label);
+                changed = true;
+            }
+            if (!std.mem.eql(u8, channel.source_ref_subtitle, source.subtitle)) {
+                try replaceOwnedString(state_store.allocator, &channel.source_ref_subtitle, source.subtitle);
+                changed = true;
+            }
+            if (!std.mem.eql(u8, channel.source_ref_process_binary, source.process_binary)) {
+                try replaceOwnedString(state_store.allocator, &channel.source_ref_process_binary, source.process_binary);
+                changed = true;
+            }
             if (shouldSyncChannelLabelWithSource(channel.*, previous_source, source)) {
                 try replaceOwnedString(state_store.allocator, &channel.label, source.label);
                 if (channel.input_bus_id) |input_bus_id| {
@@ -1217,11 +1235,16 @@ fn channelRepresentsEquivalentSource(channel: channels_mod.Channel, source: sour
         const source_has_generic_identity = appSourceUsesGenericWrapperIdentity(source);
         const channel_has_generic_identity = appChannelUsesGenericWrapperIdentity(channel);
         if (!source_has_generic_identity and !channel_has_generic_identity and
-            channel.subtitle.len > 0 and source.process_binary.len > 0 and std.ascii.eqlIgnoreCase(channel.subtitle, source.process_binary))
+            channelSourceReferenceProcessBinary(channel).len > 0 and
+            source.process_binary.len > 0 and
+            std.ascii.eqlIgnoreCase(channelSourceReferenceProcessBinary(channel), source.process_binary))
         {
             return true;
         }
-        if (channel.label.len > 0 and source.label.len > 0 and std.ascii.eqlIgnoreCase(channel.label, source.label)) {
+        if (channelSourceReferenceLabel(channel).len > 0 and
+            source.label.len > 0 and
+            std.ascii.eqlIgnoreCase(channelSourceReferenceLabel(channel), source.label))
+        {
             return true;
         }
         if (!source_has_generic_identity and !channel_has_generic_identity and
@@ -1238,9 +1261,12 @@ fn channelRepresentsEquivalentSource(channel: channels_mod.Channel, source: sour
         return false;
     }
 
-    if (channel.label.len > 0 and source.label.len > 0 and std.ascii.eqlIgnoreCase(channel.label, source.label)) {
-        if (channel.subtitle.len == 0 or source.subtitle.len == 0) return true;
-        return std.ascii.eqlIgnoreCase(channel.subtitle, source.subtitle);
+    if (channelSourceReferenceLabel(channel).len > 0 and
+        source.label.len > 0 and
+        std.ascii.eqlIgnoreCase(channelSourceReferenceLabel(channel), source.label))
+    {
+        if (channelSourceReferenceSubtitle(channel).len == 0 or source.subtitle.len == 0) return true;
+        return std.ascii.eqlIgnoreCase(channelSourceReferenceSubtitle(channel), source.subtitle);
     }
     return false;
 }
@@ -1252,9 +1278,24 @@ fn appSourceUsesGenericWrapperIdentity(source: sources_mod.Source) bool {
 }
 
 fn appChannelUsesGenericWrapperIdentity(channel: channels_mod.Channel) bool {
-    return sourceLabelLooksGeneric(channel.label) or
-        processBinaryLooksWrapper(channel.subtitle) or
+    return sourceLabelLooksGeneric(channelSourceReferenceLabel(channel)) or
+        processBinaryLooksWrapper(channelSourceReferenceProcessBinary(channel)) or
         iconLooksWrapper(channel.icon_name);
+}
+
+fn channelSourceReferenceLabel(channel: channels_mod.Channel) []const u8 {
+    if (channel.source_ref_label.len > 0) return channel.source_ref_label;
+    return channel.label;
+}
+
+fn channelSourceReferenceSubtitle(channel: channels_mod.Channel) []const u8 {
+    if (channel.source_ref_subtitle.len > 0) return channel.source_ref_subtitle;
+    return channel.subtitle;
+}
+
+fn channelSourceReferenceProcessBinary(channel: channels_mod.Channel) []const u8 {
+    if (channel.source_ref_process_binary.len > 0) return channel.source_ref_process_binary;
+    return channel.subtitle;
 }
 
 fn sourceLabelLooksGeneric(label: []const u8) bool {
@@ -1464,6 +1505,9 @@ fn freeChannel(allocator: std.mem.Allocator, channel: channels_mod.Channel) void
     allocator.free(channel.label);
     allocator.free(channel.subtitle);
     if (channel.bound_source_id) |value| allocator.free(value);
+    allocator.free(channel.source_ref_label);
+    allocator.free(channel.source_ref_subtitle);
+    allocator.free(channel.source_ref_process_binary);
     allocator.free(channel.icon_name);
     allocator.free(channel.icon_path);
     allocator.free(channel.custom_icon_name);
@@ -1503,6 +1547,31 @@ fn optionalSlicesEql(left: ?[]const u8, right: ?[]const u8) bool {
     if (left == null and right == null) return true;
     if (left == null or right == null) return false;
     return std.mem.eql(u8, left.?, right.?);
+}
+
+test "syncChannelBindingSelections preserves missing bound source during transient app refresh" {
+    var state_store = StateStore.init(std.testing.allocator);
+    defer state_store.deinit();
+
+    try state_store.addChannel(.{
+        .id = "source-strip-1",
+        .label = "Firefox",
+        .subtitle = "firefox-bin",
+        .bound_source_id = "appgrp-firefox.desktop",
+        .source_kind = @intFromEnum(sources_mod.SourceKind.app),
+        .source_ref_label = "Firefox",
+        .source_ref_subtitle = "firefox-bin",
+        .source_ref_process_binary = "firefox-bin",
+        .icon_name = "firefox",
+        .icon_path = "",
+        .custom_icon_name = "",
+        .custom_icon_path = "",
+    });
+
+    const changed = try syncChannelBindingSelections(&state_store);
+    try std.testing.expect(!changed);
+    try std.testing.expect(state_store.channels.items[0].bound_source_id != null);
+    try std.testing.expectEqualStrings("appgrp-firefox.desktop", state_store.channels.items[0].bound_source_id.?);
 }
 
 fn freeBus(allocator: std.mem.Allocator, bus: buses_mod.Bus) void {

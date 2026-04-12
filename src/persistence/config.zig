@@ -421,6 +421,9 @@ fn applyLoadedConfig(state_store: *StateStore, config: StoredConfig) !void {
             .subtitle = channel.subtitle,
             .bound_source_id = resolved_source_id,
             .source_kind = channel.source_kind,
+            .source_ref_label = channel.source_ref_label orelse "",
+            .source_ref_subtitle = channel.source_ref_subtitle orelse "",
+            .source_ref_process_binary = channel.source_ref_process_binary orelse "",
             .icon_name = channel.icon_name,
             .icon_path = channel.icon_path,
             .custom_icon_name = channel.custom_icon_name,
@@ -679,52 +682,126 @@ fn resolveStoredChannelSource(state_store: *const StateStore, channel: StoredCha
     if (channel.source_ref_id) |source_ref_id| {
         if (findSource(state_store, source_ref_id)) |source| return source.id;
     }
+
+    const source_kind = channel.source_ref_kind orelse storedChannelSourceKind(channel);
+
     if (channel.source_ref_id == null and channel.bound_source_id == null) {
         const synthetic_ref_id = storedReferenceSourceId(state_store.allocator, channel) catch null orelse return null;
         defer state_store.allocator.free(synthetic_ref_id);
         if (findSource(state_store, synthetic_ref_id)) |source| return source.id;
     }
-    if (channel.source_ref_process_binary) |process_binary| {
-        for (state_store.sources.items) |source| {
-            if (source.process_binary.len == 0) continue;
-            if (!std.mem.eql(u8, source.process_binary, process_binary)) continue;
-            if (channel.source_ref_kind) |kind| {
-                if (source.kind != kind) continue;
+
+    if (source_kind) |kind| {
+        if (kind == .app) {
+            if (findUniqueSourceIdByExactMetadata(
+                state_store.sources.items,
+                kind,
+                nonEmptyStoredText(storedChannelLabel(channel)),
+                nonEmptyStoredText(storedChannelSubtitle(channel)),
+                nonEmptyStoredText(storedChannelProcessBinary(channel)),
+            )) |source_id| return source_id;
+            if (findUniqueSourceIdByExactMetadata(
+                state_store.sources.items,
+                kind,
+                nonEmptyStoredText(storedChannelLabel(channel)),
+                null,
+                nonEmptyStoredText(storedChannelProcessBinary(channel)),
+            )) |source_id| return source_id;
+            if (findUniqueSourceIdByExactMetadata(
+                state_store.sources.items,
+                kind,
+                null,
+                null,
+                nonEmptyStoredText(storedChannelProcessBinary(channel)),
+            )) |source_id| return source_id;
+            if (findUniqueSourceIdByExactMetadata(
+                state_store.sources.items,
+                kind,
+                nonEmptyStoredText(storedChannelLabel(channel)),
+                nonEmptyStoredText(storedChannelSubtitle(channel)),
+                null,
+            )) |source_id| return source_id;
+            if (storedChannelProcessBinary(channel).len == 0 and channel.subtitle.len > 0) {
+                if (findUniqueSourceIdByExactMetadata(
+                    state_store.sources.items,
+                    .app,
+                    null,
+                    null,
+                    nonEmptyStoredText(channel.subtitle),
+                )) |source_id| return source_id;
             }
-            return source.id;
+        } else {
+            if (findUniqueSourceIdByExactMetadata(
+                state_store.sources.items,
+                kind,
+                nonEmptyStoredText(storedChannelLabel(channel)),
+                nonEmptyStoredText(storedChannelSubtitle(channel)),
+                null,
+            )) |source_id| return source_id;
+            if (storedChannelSubtitle(channel).len == 0) {
+                if (findUniqueSourceIdByExactMetadata(
+                    state_store.sources.items,
+                    kind,
+                    nonEmptyStoredText(storedChannelLabel(channel)),
+                    null,
+                    null,
+                )) |source_id| return source_id;
+            }
         }
     }
-    if (channel.source_ref_label) |label| {
-        for (state_store.sources.items) |source| {
-            if (!std.mem.eql(u8, source.label, label)) continue;
-            if (channel.source_ref_subtitle) |subtitle| {
-                if (!std.mem.eql(u8, source.subtitle, subtitle)) continue;
-            }
-            if (channel.source_ref_kind) |kind| {
-                if (source.kind != kind) continue;
-            }
-            return source.id;
-        }
-    }
-    if (channel.source_kind == @intFromEnum(sources_mod.SourceKind.app) and channel.subtitle.len > 0) {
-        for (state_store.sources.items) |source| {
-            if (source.kind != .app) continue;
-            if (source.process_binary.len == 0) continue;
-            if (std.mem.eql(u8, source.process_binary, channel.subtitle)) return source.id;
-        }
-    }
-    if (channel.label.len > 0) {
-        const channel_kind = storedChannelSourceKind(channel);
-        for (state_store.sources.items) |source| {
-            if (!std.mem.eql(u8, source.label, channel.label)) continue;
-            if (channel.subtitle.len > 0 and !std.mem.eql(u8, source.subtitle, channel.subtitle)) continue;
-            if (channel_kind) |kind| {
-                if (source.kind != kind) continue;
-            }
-            return source.id;
-        }
-    }
+
     return null;
+}
+
+fn findUniqueSourceIdByExactMetadata(
+    items: []const sources_mod.Source,
+    kind: sources_mod.SourceKind,
+    label: ?[]const u8,
+    subtitle: ?[]const u8,
+    process_binary: ?[]const u8,
+) ?[]const u8 {
+    var matched_id: ?[]const u8 = null;
+    for (items) |source| {
+        if (source.kind != kind) continue;
+        if (label) |value| {
+            if (!sameStoredText(source.label, value)) continue;
+        }
+        if (subtitle) |value| {
+            if (!sameStoredText(source.subtitle, value)) continue;
+        }
+        if (process_binary) |value| {
+            if (!sameStoredText(source.process_binary, value)) continue;
+        }
+        if (matched_id != null) return null;
+        matched_id = source.id;
+    }
+    return matched_id;
+}
+
+fn sameStoredText(a: []const u8, b: []const u8) bool {
+    if (a.len == 0 or b.len == 0) return false;
+    return std.ascii.eqlIgnoreCase(a, b);
+}
+
+fn nonEmptyStoredText(value: []const u8) ?[]const u8 {
+    if (value.len == 0) return null;
+    return value;
+}
+
+fn runtimeChannelSourceLabel(channel: channels_mod.Channel) []const u8 {
+    if (channel.source_ref_label.len > 0) return channel.source_ref_label;
+    return channel.label;
+}
+
+fn runtimeChannelSourceSubtitle(channel: channels_mod.Channel) []const u8 {
+    if (channel.source_ref_subtitle.len > 0) return channel.source_ref_subtitle;
+    return channel.subtitle;
+}
+
+fn runtimeChannelSourceProcessBinary(channel: channels_mod.Channel) []const u8 {
+    if (channel.source_ref_process_binary.len > 0) return channel.source_ref_process_binary;
+    if (storedChannelSourceKind(channel) == .app) return channel.subtitle;
+    return "";
 }
 
 fn channelRepresentsEquivalentStoredSource(channel: channels_mod.Channel, stored_channel: StoredChannel) bool {
@@ -734,17 +811,23 @@ fn channelRepresentsEquivalentStoredSource(channel: channels_mod.Channel, stored
 
     if (stored_kind == .app) {
         const stored_process_binary = storedChannelProcessBinary(stored_channel);
-        if (channel.subtitle.len > 0 and stored_process_binary.len > 0 and std.ascii.eqlIgnoreCase(channel.subtitle, stored_process_binary)) {
+        const channel_process_binary = runtimeChannelSourceProcessBinary(channel);
+        if (channel_process_binary.len > 0 and
+            stored_process_binary.len > 0 and
+            std.ascii.eqlIgnoreCase(channel_process_binary, stored_process_binary))
+        {
             return true;
         }
 
         const stored_label = storedChannelLabel(stored_channel);
-        if (channel.label.len > 0 and stored_label.len > 0 and std.ascii.eqlIgnoreCase(channel.label, stored_label)) {
+        const channel_label = runtimeChannelSourceLabel(channel);
+        if (channel_label.len > 0 and stored_label.len > 0 and std.ascii.eqlIgnoreCase(channel_label, stored_label)) {
             return true;
         }
 
         const stored_subtitle = storedChannelSubtitle(stored_channel);
-        if (channel.subtitle.len > 0 and stored_subtitle.len > 0 and std.ascii.eqlIgnoreCase(channel.subtitle, stored_subtitle)) {
+        const channel_subtitle = runtimeChannelSourceSubtitle(channel);
+        if (channel_subtitle.len > 0 and stored_subtitle.len > 0 and std.ascii.eqlIgnoreCase(channel_subtitle, stored_subtitle)) {
             return true;
         }
 
@@ -752,10 +835,12 @@ fn channelRepresentsEquivalentStoredSource(channel: channels_mod.Channel, stored
     }
 
     const stored_label = storedChannelLabel(stored_channel);
-    if (channel.label.len > 0 and stored_label.len > 0 and std.ascii.eqlIgnoreCase(channel.label, stored_label)) {
+    const channel_label = runtimeChannelSourceLabel(channel);
+    if (channel_label.len > 0 and stored_label.len > 0 and std.ascii.eqlIgnoreCase(channel_label, stored_label)) {
         const stored_subtitle = storedChannelSubtitle(stored_channel);
-        if (channel.subtitle.len == 0 or stored_subtitle.len == 0) return true;
-        return std.ascii.eqlIgnoreCase(channel.subtitle, stored_subtitle);
+        const channel_subtitle = runtimeChannelSourceSubtitle(channel);
+        if (channel_subtitle.len == 0 or stored_subtitle.len == 0) return true;
+        return std.ascii.eqlIgnoreCase(channel_subtitle, stored_subtitle);
     }
 
     return false;
@@ -778,16 +863,19 @@ fn storedChannelSubtitle(channel: StoredChannel) []const u8 {
 }
 
 fn fallbackStoredChannelLabel(channel: channels_mod.Channel) ?[]const u8 {
+    if (channel.source_ref_label.len > 0) return channel.source_ref_label;
     if (channel.label.len == 0) return null;
     return channel.label;
 }
 
 fn fallbackStoredChannelSubtitle(channel: channels_mod.Channel) ?[]const u8 {
+    if (channel.source_ref_subtitle.len > 0) return channel.source_ref_subtitle;
     if (channel.subtitle.len == 0) return null;
     return channel.subtitle;
 }
 
 fn fallbackStoredChannelProcessBinary(channel: channels_mod.Channel) ?[]const u8 {
+    if (channel.source_ref_process_binary.len > 0) return channel.source_ref_process_binary;
     if (channel.source_kind != @intFromEnum(sources_mod.SourceKind.app)) return null;
     if (channel.subtitle.len == 0) return null;
     return channel.subtitle;
@@ -876,4 +964,28 @@ fn isSuspiciousRoutingState(state_store: *const StateStore) bool {
     }
 
     return true;
+}
+
+test "findUniqueSourceIdByExactMetadata rejects ambiguous physical metadata" {
+    const sources = [_]sources_mod.Source{
+        .{ .id = "physical-1", .label = "USB Mic", .subtitle = "Audio/Source", .kind = .physical },
+        .{ .id = "physical-2", .label = "USB Mic", .subtitle = "Audio/Source", .kind = .physical },
+    };
+
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        findUniqueSourceIdByExactMetadata(sources[0..], .physical, "USB Mic", "Audio/Source", null),
+    );
+}
+
+test "findUniqueSourceIdByExactMetadata restores unique app identity" {
+    const sources = [_]sources_mod.Source{
+        .{ .id = "appgrp-discord", .label = "Discord", .subtitle = "discord", .kind = .app, .process_binary = "discord" },
+        .{ .id = "appgrp-firefox", .label = "Firefox", .subtitle = "firefox", .kind = .app, .process_binary = "firefox" },
+    };
+
+    try std.testing.expectEqualStrings(
+        "appgrp-discord",
+        findUniqueSourceIdByExactMetadata(sources[0..], .app, "Discord", "discord", "discord").?,
+    );
 }

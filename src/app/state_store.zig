@@ -98,6 +98,9 @@ pub const StateStore = struct {
             .subtitle = try self.allocator.dupe(u8, channel.subtitle),
             .bound_source_id = if (channel.bound_source_id) |value| try self.allocator.dupe(u8, value) else null,
             .source_kind = channel.source_kind,
+            .source_ref_label = try self.allocator.dupe(u8, channel.source_ref_label),
+            .source_ref_subtitle = try self.allocator.dupe(u8, channel.source_ref_subtitle),
+            .source_ref_process_binary = try self.allocator.dupe(u8, channel.source_ref_process_binary),
             .icon_name = try self.allocator.dupe(u8, channel.icon_name),
             .icon_path = try self.allocator.dupe(u8, channel.icon_path),
             .custom_icon_name = try self.allocator.dupe(u8, channel.custom_icon_name),
@@ -345,6 +348,9 @@ pub const StateStore = struct {
             self.allocator.free(item.label);
             self.allocator.free(item.subtitle);
             if (item.bound_source_id) |value| self.allocator.free(value);
+            self.allocator.free(item.source_ref_label);
+            self.allocator.free(item.source_ref_subtitle);
+            self.allocator.free(item.source_ref_process_binary);
             self.allocator.free(item.icon_name);
             self.allocator.free(item.icon_path);
             self.allocator.free(item.custom_icon_name);
