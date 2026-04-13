@@ -885,6 +885,7 @@ fn addChannelFromSource(state_store: *StateStore, source_id: []const u8) !void {
     defer state_store.allocator.free(id);
     const input_bus_id = try std.fmt.allocPrint(state_store.allocator, "input-stage-{d}", .{index});
     defer state_store.allocator.free(input_bus_id);
+    const auto_route_bus_id = preferredAutoRouteBusIdForNewSource(state_store, selected_source);
 
     try state_store.addBus(.{
         .id = input_bus_id,
@@ -915,7 +916,44 @@ fn addChannelFromSource(state_store: *StateStore, source_id: []const u8) !void {
     }
     for (state_store.buses.items) |bus| {
         try state_store.addSend(.{ .channel_id = channel_id, .bus_id = bus.id, .enabled = false });
+        if (auto_route_bus_id) |preferred_bus_id| {
+            if (std.mem.eql(u8, bus.id, preferred_bus_id)) {
+                state_store.sends.items[state_store.sends.items.len - 1].enabled = true;
+            }
+        }
     }
+}
+
+fn preferredAutoRouteBusIdForNewSource(state_store: *const StateStore, source: sources_mod.Source) ?[]const u8 {
+    if (!isNetworkIngressSource(source)) return null;
+
+    for (state_store.buses.items) |bus| {
+        if (bus.hidden or bus.role == .input_stage) continue;
+        if (!busHasEnabledDestination(state_store, bus.id)) continue;
+        return bus.id;
+    }
+
+    for (state_store.buses.items) |bus| {
+        if (bus.hidden or bus.role == .input_stage) continue;
+        return bus.id;
+    }
+
+    return null;
+}
+
+fn busHasEnabledDestination(state_store: *const StateStore, bus_id: []const u8) bool {
+    for (state_store.bus_destinations.items) |bus_destination| {
+        if (!std.mem.eql(u8, bus_destination.bus_id, bus_id)) continue;
+        if (!bus_destination.enabled) continue;
+        if (findDestination(state_store, bus_destination.destination_id) == null) continue;
+        return true;
+    }
+    return false;
+}
+
+fn isNetworkIngressSource(source: sources_mod.Source) bool {
+    return (source.kind == .virtual and std.mem.eql(u8, source.process_binary, "wiredeck-client")) or
+        std.mem.startsWith(u8, source.id, "wdnet-");
 }
 
 fn addBus(state_store: *StateStore) !void {

@@ -298,6 +298,7 @@ fn printSourceActivity(
     var tick: u32 = 0;
     while (tick < activity_ticks) : (tick += 1) {
         try app.pumpLiveAudio();
+        app.refreshAudioInventory() catch {};
         var discovery = try app.pipewire_live.snapshotDiscovery(std.heap.page_allocator);
         defer discovery.deinit(std.heap.page_allocator);
 

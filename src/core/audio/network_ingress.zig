@@ -348,7 +348,20 @@ fn handleHelloPacket(
     const address_text = formatSourceAddress(service.allocator, source_addr) catch return;
     defer service.allocator.free(address_text);
 
-    if (findRemoteSource(service.remote_sources.items, source_id)) |remote| {
+    if (findRemoteSourceByStreamId(service.remote_sources.items, header.stream_id)) |remote| {
+        if (remote.client_id.len == 0 and client_id.len > 0) {
+            remote.client_id = replaceOwnedString(service.allocator, remote.client_id, client_id) catch remote.client_id;
+        }
+        remote.client_name = replaceOwnedString(service.allocator, remote.client_name, client_name) catch remote.client_name;
+        remote.stream_name = replaceOwnedString(service.allocator, remote.stream_name, stream_name) catch remote.stream_name;
+        remote.address_text = replaceOwnedString(service.allocator, remote.address_text, address_text) catch remote.address_text;
+        remote.platform = hello.platform;
+        remote.capture_mode = hello.capture_mode;
+        remote.codec = header.codec;
+        remote.channels = header.channels;
+        remote.sample_rate_hz = header.sample_rate_hz;
+        remote.last_seen_ns = std.time.nanoTimestamp();
+    } else if (findRemoteSource(service.remote_sources.items, source_id)) |remote| {
         remote.client_name = replaceOwnedString(service.allocator, remote.client_name, client_name) catch remote.client_name;
         remote.stream_name = replaceOwnedString(service.allocator, remote.stream_name, stream_name) catch remote.stream_name;
         remote.address_text = replaceOwnedString(service.allocator, remote.address_text, address_text) catch remote.address_text;

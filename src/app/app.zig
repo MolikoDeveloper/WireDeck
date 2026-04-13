@@ -285,10 +285,10 @@ pub const App = struct {
             self.allocator.free(binding.target_name);
         }
         self.recent_app_fx_bindings.deinit(self.allocator);
-        if (enable_shutdown_stage_logs) std.log.info("shutdown stage: deinit audio engine", .{});
-        self.audio_engine.deinit();
         if (enable_shutdown_stage_logs) std.log.info("shutdown stage: deinit network audio", .{});
         self.network_audio.deinit();
+        if (enable_shutdown_stage_logs) std.log.info("shutdown stage: deinit audio engine", .{});
+        self.audio_engine.deinit();
         if (enable_shutdown_stage_logs) std.log.info("shutdown stage: deinit fx runtime", .{});
         self.fx_runtime.deinit();
         if (enable_shutdown_stage_logs) std.log.info("shutdown stage: deinit pulse peak", .{});
