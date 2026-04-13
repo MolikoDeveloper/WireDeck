@@ -52,6 +52,7 @@ pub const NetworkAudioService = struct {
 
     const RemoteSource = struct {
         id: []u8,
+        stream_id: u32 = 0,
         client_id: []u8,
         client_name: []u8,
         stream_name: []u8,
@@ -242,7 +243,7 @@ pub const NetworkAudioService = struct {
                 .label = try allocator.dupe(u8, source.stream_name),
                 .subtitle = subtitle,
                 .kind = .virtual,
-                .process_binary = try allocator.dupe(u8, "wiredeck-client"),
+                .process_binary = try allocator.dupe(u8, remoteProcessBinary(source)),
                 .icon_name = try allocator.dupe(u8, "world"),
                 .icon_path = try allocator.dupe(u8, ""),
                 .level_left = source.level_left,
@@ -349,21 +350,39 @@ fn handleHelloPacket(
     defer service.allocator.free(address_text);
 
     if (findRemoteSource(service.remote_sources.items, source_id)) |remote| {
-        remote.client_name = replaceOwnedString(service.allocator, remote.client_name, client_name) catch remote.client_name;
-        remote.stream_name = replaceOwnedString(service.allocator, remote.stream_name, stream_name) catch remote.stream_name;
+        remote.client_name = replaceOwnedString(service.allocator, remote.client_name, fallbackClientName(client_name)) catch remote.client_name;
+        remote.stream_name = replaceOwnedString(service.allocator, remote.stream_name, fallbackStreamName(stream_name)) catch remote.stream_name;
         remote.address_text = replaceOwnedString(service.allocator, remote.address_text, address_text) catch remote.address_text;
         remote.platform = hello.platform;
         remote.capture_mode = hello.capture_mode;
         remote.codec = header.codec;
         remote.channels = header.channels;
         remote.sample_rate_hz = header.sample_rate_hz;
+        remote.stream_id = header.stream_id;
+        remote.last_seen_ns = std.time.nanoTimestamp();
+    } else if (findRemoteSourceByStreamId(service.remote_sources.items, header.stream_id)) |remote| {
+        if (!std.mem.eql(u8, remote.id, source_id)) {
+            if (service.engine) |engine| engine.deactivateRemoteSource(remote.id);
+            remote.id = replaceOwnedString(service.allocator, remote.id, source_id) catch remote.id;
+        }
+        remote.client_id = replaceOwnedString(service.allocator, remote.client_id, client_id) catch remote.client_id;
+        remote.client_name = replaceOwnedString(service.allocator, remote.client_name, fallbackClientName(client_name)) catch remote.client_name;
+        remote.stream_name = replaceOwnedString(service.allocator, remote.stream_name, fallbackStreamName(stream_name)) catch remote.stream_name;
+        remote.address_text = replaceOwnedString(service.allocator, remote.address_text, address_text) catch remote.address_text;
+        remote.platform = hello.platform;
+        remote.capture_mode = hello.capture_mode;
+        remote.codec = header.codec;
+        remote.channels = @max(@as(u8, 1), header.channels);
+        remote.sample_rate_hz = header.sample_rate_hz;
+        remote.stream_id = header.stream_id;
         remote.last_seen_ns = std.time.nanoTimestamp();
     } else {
         service.remote_sources.append(service.allocator, .{
             .id = service.allocator.dupe(u8, source_id) catch return,
+            .stream_id = header.stream_id,
             .client_id = service.allocator.dupe(u8, client_id) catch return,
-            .client_name = service.allocator.dupe(u8, if (client_name.len == 0) "WireDeck Client" else client_name) catch return,
-            .stream_name = service.allocator.dupe(u8, if (stream_name.len == 0) "Remote Stream" else stream_name) catch return,
+            .client_name = service.allocator.dupe(u8, fallbackClientName(client_name)) catch return,
+            .stream_name = service.allocator.dupe(u8, fallbackStreamName(stream_name)) catch return,
             .address_text = service.allocator.dupe(u8, address_text) catch return,
             .platform = hello.platform,
             .capture_mode = hello.capture_mode,
@@ -402,6 +421,7 @@ fn handleAudioPacket(
 
         service.remote_sources.append(service.allocator, .{
             .id = service.allocator.dupe(u8, source_id) catch break :blk null,
+            .stream_id = header.stream_id,
             .client_id = service.allocator.dupe(u8, "") catch break :blk null,
             .client_name = service.allocator.dupe(u8, "WireDeck Client") catch break :blk null,
             .stream_name = service.allocator.dupe(u8, "Remote Stream") catch break :blk null,
@@ -424,6 +444,7 @@ fn handleAudioPacket(
     remote.codec = header.codec;
     remote.sample_rate_hz = header.sample_rate_hz;
     remote.channels = channels;
+    remote.stream_id = header.stream_id;
     remote.level_left = levels.level_left;
     remote.level_right = levels.level_right;
     remote.level = levels.level;
@@ -527,7 +548,7 @@ fn remoteLevelFallback(remote: *NetworkAudioService.RemoteSource) sources_mod.So
 
 fn buildRemoteSourceId(allocator: std.mem.Allocator, client_id: []const u8, stream_id: u32) ![]u8 {
     if (client_id.len > 0) {
-        return std.fmt.allocPrint(allocator, "wdnet-{s}-{d}", .{ sanitizeId(client_id), stream_id });
+        return std.fmt.allocPrint(allocator, "wdnet-{s}", .{sanitizeId(client_id)});
     }
     return std.fmt.allocPrint(allocator, "wdnet-stream-{d}", .{stream_id});
 }
@@ -541,20 +562,38 @@ fn findRemoteSource(items: []NetworkAudioService.RemoteSource, id: []const u8) ?
 
 fn findRemoteSourceByStreamId(items: []NetworkAudioService.RemoteSource, stream_id: u32) ?*NetworkAudioService.RemoteSource {
     for (items) |*item| {
-        if (parseStreamId(item.id) == stream_id) return item;
+        if (item.stream_id == stream_id) return item;
     }
     return null;
 }
 
-fn parseStreamId(id: []const u8) u32 {
-    if (std.mem.lastIndexOfScalar(u8, id, '-')) |index| {
-        return std.fmt.parseInt(u32, id[index + 1 ..], 10) catch 0;
-    }
-    return 0;
+fn sanitizeId(input: []const u8) []const u8 {
+    return std.mem.trim(u8, input, &std.ascii.whitespace);
 }
 
-fn sanitizeId(input: []const u8) []const u8 {
-    return input;
+fn remoteProcessBinary(remote: NetworkAudioService.RemoteSource) []const u8 {
+    if (containsIgnoreCase(remote.client_id, "wirenode")) return "wirenode";
+    if (containsIgnoreCase(remote.client_name, "wirenode")) return "wirenode";
+    if (containsIgnoreCase(remote.stream_name, "wirenode")) return "wirenode";
+    return "wiredeck-client";
+}
+
+fn fallbackClientName(value: []const u8) []const u8 {
+    return if (value.len == 0) "WireDeck Client" else value;
+}
+
+fn fallbackStreamName(value: []const u8) []const u8 {
+    return if (value.len == 0) "Remote Stream" else value;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) : (start += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[start .. start + needle.len], needle)) return true;
+    }
+    return false;
 }
 
 fn formatSourceAddress(allocator: std.mem.Allocator, source_addr: std.posix.sockaddr) ![]u8 {
