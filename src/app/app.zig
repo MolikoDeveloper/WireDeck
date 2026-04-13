@@ -1825,6 +1825,7 @@ pub const App = struct {
         try appendRegistryHardwareSourcesToList(allocator, &sources, &pipewire.registry_state);
         try appendGroupedAppSourcesToList(allocator, &sources, owners);
         try self.network_audio.appendSnapshotSources(allocator, &sources);
+        try appendPreservedChannelSourcesToList(allocator, self.state_store.channels.items, &sources);
 
         var destinations = std.ArrayList(destinations_mod.Destination).empty;
         defer destinations.deinit(allocator);
@@ -3558,6 +3559,7 @@ fn ownerMatchesAppSource(
     source: sources_mod.Source,
 ) !bool {
     if (source.kind != .app) return false;
+    if (isFrozenStoredSourceId(source.id)) return false;
     if (shouldSkipGroupedAppOwner(owner)) return false;
     if (try ownerMatchesGroupedSourceId(allocator, owner, source.id)) return true;
 
@@ -3753,6 +3755,18 @@ fn findSourceIndex(items: []const sources_mod.Source, id: []const u8) ?usize {
     return null;
 }
 
+fn appendPreservedChannelSourcesToList(
+    allocator: std.mem.Allocator,
+    channels: []const channels_mod.Channel,
+    out: *std.ArrayList(sources_mod.Source),
+) !void {
+    for (channels) |channel| {
+        const bound_source_id = channel.bound_source_id orelse continue;
+        if (findSourceIndex(out.items, bound_source_id) != null) continue;
+        try out.append(allocator, syntheticSourceForChannelBinding(channel, bound_source_id));
+    }
+}
+
 fn findMappedStateSourceIndex(
     allocator: std.mem.Allocator,
     items: []const sources_mod.Source,
@@ -3768,6 +3782,7 @@ fn findMappedStateSourceIndex(
         if (item.kind != discovered_source.kind) continue;
 
         if (item.kind == .app) {
+            if (isFrozenStoredSourceId(item.id)) continue;
             if (sameText(item.icon_name, discovered_source.icon_name) and item.icon_name.len > 0) return index;
             if (sameText(item.process_binary, discovered_source.process_binary) and item.process_binary.len > 0) return index;
             if (sameText(item.label, discovered_source.label) and item.label.len > 0) return index;
@@ -3905,6 +3920,10 @@ fn replaceOwnedOptionalString(allocator: std.mem.Allocator, field: *?[]const u8,
 
 fn sanitizeId(value: []const u8) []const u8 {
     return value;
+}
+
+fn isFrozenStoredSourceId(source_id: []const u8) bool {
+    return std.mem.startsWith(u8, source_id, "stored-source-ref-");
 }
 
 fn isWiredeckManagedSinkName(sink_name: []const u8) bool {

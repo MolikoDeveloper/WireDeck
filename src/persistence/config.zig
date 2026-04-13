@@ -399,8 +399,16 @@ fn applyLoadedConfig(state_store: *StateStore, config: StoredConfig) !void {
 
     var loaded_channel_index: usize = 0;
     for (config.channels) |channel| {
-        const resolved_source_id = resolveStoredChannelSource(state_store, channel);
-        if (hasEquivalentStoredChannel(state_store, channel, resolved_source_id)) continue;
+        var resolved_source_id = resolveStoredChannelSource(state_store, channel);
+        if (storedChannelSourceKind(channel) == .app and resolved_source_id != null and hasChannelBoundSource(state_store, resolved_source_id.?)) {
+            const frozen_source_id = try storedReferenceSourceId(state_store.allocator, channel);
+            defer state_store.allocator.free(frozen_source_id);
+            if (findSource(state_store, frozen_source_id)) |source| {
+                resolved_source_id = source.id;
+            } else {
+                resolved_source_id = null;
+            }
+        }
         loaded_channel_index += 1;
         const channel_id = try std.fmt.allocPrint(state_store.allocator, "source-strip-{d}", .{loaded_channel_index});
         defer state_store.allocator.free(channel_id);
@@ -679,6 +687,11 @@ fn resolveStoredChannelSource(state_store: *const StateStore, channel: StoredCha
     if (channel.source_ref_id) |source_ref_id| {
         if (findSource(state_store, source_ref_id)) |source| return source.id;
     }
+    const stored_reference_id = storedReferenceSourceId(state_store.allocator, channel) catch null;
+    defer if (stored_reference_id) |value| state_store.allocator.free(value);
+    if (stored_reference_id) |source_id| {
+        if (findSource(state_store, source_id)) |source| return source.id;
+    }
     if (channel.source_ref_id == null and channel.bound_source_id == null) {
         const synthetic_ref_id = storedReferenceSourceId(state_store.allocator, channel) catch null orelse return null;
         defer state_store.allocator.free(synthetic_ref_id);
@@ -800,6 +813,9 @@ fn fallbackStoredChannelProcessBinaryLoaded(channel: StoredChannel) ?[]const u8 
 }
 
 fn storedReferenceSourceId(allocator: std.mem.Allocator, channel: StoredChannel) ![]u8 {
+    if (storedChannelSourceKind(channel) == .app) {
+        return std.fmt.allocPrint(allocator, "stored-source-ref-{s}", .{channel.id});
+    }
     if (channel.source_ref_id) |value| return allocator.dupe(u8, value);
     if (channel.bound_source_id) |value| return allocator.dupe(u8, value);
     return std.fmt.allocPrint(allocator, "stored-source-ref-{s}", .{channel.id});

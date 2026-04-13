@@ -1278,6 +1278,9 @@ fn findChannelByBoundSourceConst(state_store: *const StateStore, source_id: []co
 
 fn channelRepresentsEquivalentSource(channel: channels_mod.Channel, source: sources_mod.Source) bool {
     if (channel.source_kind != @intFromEnum(source.kind)) return false;
+    if (channel.bound_source_id) |bound_source_id| {
+        if (isFrozenStoredSourceId(bound_source_id)) return false;
+    }
 
     if (source.kind == .app) {
         const source_has_generic_identity = appSourceUsesGenericWrapperIdentity(source);
@@ -1342,6 +1345,10 @@ fn iconLooksWrapper(icon_name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(icon_name, "steam") or
         std.ascii.eqlIgnoreCase(icon_name, "wine") or
         std.ascii.eqlIgnoreCase(icon_name, "application-x-executable");
+}
+
+fn isFrozenStoredSourceId(source_id: []const u8) bool {
+    return std.mem.startsWith(u8, source_id, "stored-source-ref-");
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
