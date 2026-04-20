@@ -425,14 +425,25 @@ pub const App = struct {
         try self.ensureParkingSinkAvailable(pulsectx);
         const previous_default_sink_name = try pulsectx.defaultSinkName(self.allocator) orelse return;
         defer self.allocator.free(previous_default_sink_name);
+        var requested_parking_default = false;
         if (!std.mem.eql(u8, previous_default_sink_name, parking_sink_name)) {
             try pulsectx.setDefaultSinkName(parking_sink_name);
-            std.log.info("startup normalization parking default sink: {s}", .{parking_sink_name});
+            requested_parking_default = true;
         }
         const active_default_sink_name = try pulsectx.defaultSinkName(self.allocator) orelse return;
         defer self.allocator.free(active_default_sink_name);
         std.log.info("startup normalization default sink: {s}", .{active_default_sink_name});
-        std.log.info("startup normalization keeps parking as the default sink before routing so app playback is captured without duplicate output", .{});
+        if (std.mem.eql(u8, active_default_sink_name, parking_sink_name)) {
+            if (requested_parking_default) {
+                std.log.info("startup normalization parking default sink: {s}", .{parking_sink_name});
+            }
+            std.log.info("startup normalization keeps parking as the default sink before routing so app playback is captured without duplicate output", .{});
+        } else if (requested_parking_default) {
+            std.log.warn(
+                "startup normalization requested parking default sink but active default remained {s}",
+                .{active_default_sink_name},
+            );
+        }
     }
 
     pub fn pumpLiveAudio(self: *App) !void {
@@ -527,14 +538,14 @@ pub const App = struct {
             (self.last_live_audio_apply_warn_ns == 0 or started_ns - self.last_live_audio_apply_warn_ns >= live_audio_warn_log_interval_ns))
         {
             self.last_live_audio_apply_warn_ns = started_ns;
-            std.log.warn(
-                "live audio apply slow: duration_ns={d} had_pending_discovery={any} live_generation={d}",
-                .{
-                    duration_ns,
-                    had_pending_discovery,
-                    self.last_live_generation,
-                },
-            );
+            //std.log.warn(
+            //    "live audio apply slow: duration_ns={d} had_pending_discovery={any} live_generation={d}",
+            //    .{
+            //        duration_ns,
+            //        had_pending_discovery,
+            //        self.last_live_generation,
+            //    },
+            //);
         }
     }
 
@@ -3071,6 +3082,7 @@ fn resolveFxInputBinding(
                 .target_node_id = target.node_id,
                 .port_kind = .output,
             };
+            errdefer if (binding.target_name) |target_name| self.allocator.free(target_name);
             try self.rememberRecentAppFxBinding(channel.id, source.id, binding);
             if (enable_routing_info_logs) {
                 std.log.info("routing fx input: channel={s} source={s} mode=direct_output target={s} node_id={d}", .{
@@ -3105,6 +3117,7 @@ fn resolveFxInputBinding(
                 .target_name = target_name,
                 .port_kind = .monitor,
             };
+            errdefer if (binding.target_name) |owned_target_name| self.allocator.free(owned_target_name);
             try self.rememberRecentAppFxBinding(channel.id, source.id, binding);
             if (enable_routing_info_logs) {
                 std.log.info("routing fx input: channel={s} source={s} mode=fallback_monitor reason=sticky_app_virtual_capture", .{
@@ -3763,7 +3776,20 @@ fn appendPreservedChannelSourcesToList(
     for (channels) |channel| {
         const bound_source_id = channel.bound_source_id orelse continue;
         if (findSourceIndex(out.items, bound_source_id) != null) continue;
-        try out.append(allocator, syntheticSourceForChannelBinding(channel, bound_source_id));
+        const source = syntheticSourceForChannelBinding(channel, bound_source_id);
+        try out.append(allocator, .{
+            .id = try allocator.dupe(u8, source.id),
+            .label = try allocator.dupe(u8, source.label),
+            .subtitle = try allocator.dupe(u8, source.subtitle),
+            .kind = source.kind,
+            .process_binary = try allocator.dupe(u8, source.process_binary),
+            .icon_name = try allocator.dupe(u8, source.icon_name),
+            .icon_path = try allocator.dupe(u8, source.icon_path),
+            .level_left = source.level_left,
+            .level_right = source.level_right,
+            .level = source.level,
+            .muted = source.muted,
+        });
     }
 }
 

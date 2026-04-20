@@ -230,16 +230,33 @@ pub const NetworkAudioService = struct {
         const stale_before_ns = std.time.nanoTimestamp() - 5 * std.time.ns_per_s;
         for (self.remote_sources.items) |source| {
             if (source.last_seen_ns < stale_before_ns) continue;
+            const label = resolvedRemoteStreamName(source.client_name, source.stream_name);
+            const resolved_client_name = resolvedRemoteClientName(source.client_id, source.client_name);
             const subtitle = try std.fmt.allocPrint(allocator, "{s} / {s} / {s}", .{
                 @tagName(source.platform),
-                source.client_name,
+                resolved_client_name,
                 source.address_text,
             });
             errdefer allocator.free(subtitle);
 
+            if (source.client_name.len == 0 or source.stream_name.len == 0 or
+                !std.unicode.utf8ValidateSlice(source.client_name) or
+                !std.unicode.utf8ValidateSlice(source.stream_name))
+            {
+                std.log.warn("network snapshot suspicious: source={s} label=\"{s}\" subtitle=\"{s}\" raw_client=\"{s}\" raw_stream=\"{s}\" raw_client_len={} raw_stream_len={}", .{
+                    source.id,
+                    label,
+                    subtitle,
+                    source.client_name,
+                    source.stream_name,
+                    source.client_name.len,
+                    source.stream_name.len,
+                });
+            }
+
             try out.append(allocator, .{
                 .id = try allocator.dupe(u8, source.id),
-                .label = try allocator.dupe(u8, source.stream_name),
+                .label = try allocator.dupe(u8, label),
                 .subtitle = subtitle,
                 .kind = .virtual,
                 .process_binary = try allocator.dupe(u8, "wiredeck-client"),
@@ -341,12 +358,39 @@ fn handleHelloPacket(
     defer service.mutex.unlock();
 
     const client_id = network_mod.readStringField(hello.client_id);
-    const stream_name = network_mod.readStringField(hello.stream_name);
-    const client_name = network_mod.readStringField(hello.client_name);
+    const raw_client_name = network_mod.readStringField(hello.client_name);
+    const raw_stream_name = network_mod.readStringField(hello.stream_name);
+    const client_name = resolvedRemoteClientName(client_id, raw_client_name);
+    const stream_name = resolvedRemoteStreamName(client_name, raw_stream_name);
     const source_id = buildRemoteSourceId(service.allocator, client_id, header.stream_id) catch return;
     defer service.allocator.free(source_id);
     const address_text = formatSourceAddress(service.allocator, source_addr) catch return;
     defer service.allocator.free(address_text);
+
+    std.log.info("network hello udp: stream_id={} source={s} addr={s} client_id=\"{s}\" client_name=\"{s}\" stream_name=\"{s}\" client_name_utf8={} stream_name_utf8={}", .{
+        header.stream_id,
+        source_id,
+        address_text,
+        client_id,
+        raw_client_name,
+        raw_stream_name,
+        std.unicode.utf8ValidateSlice(raw_client_name),
+        std.unicode.utf8ValidateSlice(raw_stream_name),
+    });
+    if (raw_client_name.len == 0 or raw_stream_name.len == 0 or
+        !std.unicode.utf8ValidateSlice(raw_client_name) or
+        !std.unicode.utf8ValidateSlice(raw_stream_name))
+    {
+        std.log.warn("network hello suspicious: stream_id={} client_id=\"{s}\" client_name=\"{s}\" stream_name=\"{s}\" client_id_len={} client_name_len={} stream_name_len={}", .{
+            header.stream_id,
+            client_id,
+            raw_client_name,
+            raw_stream_name,
+            client_id.len,
+            raw_client_name.len,
+            raw_stream_name.len,
+        });
+    }
 
     if (findRemoteSourceByStreamId(service.remote_sources.items, header.stream_id)) |remote| {
         if (remote.client_id.len == 0 and client_id.len > 0) {
@@ -375,8 +419,8 @@ fn handleHelloPacket(
         service.remote_sources.append(service.allocator, .{
             .id = service.allocator.dupe(u8, source_id) catch return,
             .client_id = service.allocator.dupe(u8, client_id) catch return,
-            .client_name = service.allocator.dupe(u8, if (client_name.len == 0) "WireDeck Client" else client_name) catch return,
-            .stream_name = service.allocator.dupe(u8, if (stream_name.len == 0) "Remote Stream" else stream_name) catch return,
+            .client_name = service.allocator.dupe(u8, client_name) catch return,
+            .stream_name = service.allocator.dupe(u8, stream_name) catch return,
             .address_text = service.allocator.dupe(u8, address_text) catch return,
             .platform = hello.platform,
             .capture_mode = hello.capture_mode,
@@ -386,6 +430,15 @@ fn handleHelloPacket(
             .last_seen_ns = std.time.nanoTimestamp(),
         }) catch return;
     }
+
+    std.log.info("network hello resolved: stream_id={} source={s} label=\"{s}\" client=\"{s}\" platform={s} capture={s}", .{
+        header.stream_id,
+        source_id,
+        stream_name,
+        client_name,
+        @tagName(hello.platform),
+        @tagName(hello.capture_mode),
+    });
 
     markMatchingSessionActive(service.sessions.items, client_name, stream_name);
 }
@@ -416,7 +469,7 @@ fn handleAudioPacket(
         service.remote_sources.append(service.allocator, .{
             .id = service.allocator.dupe(u8, source_id) catch break :blk null,
             .client_id = service.allocator.dupe(u8, "") catch break :blk null,
-            .client_name = service.allocator.dupe(u8, "WireDeck Client") catch break :blk null,
+            .client_name = service.allocator.dupe(u8, "WireNode") catch break :blk null,
             .stream_name = service.allocator.dupe(u8, "Remote Stream") catch break :blk null,
             .address_text = service.allocator.dupe(u8, address_text) catch break :blk null,
             .platform = .linux,
@@ -426,6 +479,13 @@ fn handleAudioPacket(
             .channels = channels,
             .last_seen_ns = std.time.nanoTimestamp(),
         }) catch break :blk null;
+        std.log.info("network audio created placeholder: stream_id={} source={s} addr={s} channels={} rate={}", .{
+            header.stream_id,
+            source_id,
+            address_text,
+            channels,
+            header.sample_rate_hz,
+        });
         break :blk &service.remote_sources.items[service.remote_sources.items.len - 1];
     } orelse return;
 
@@ -536,6 +596,18 @@ fn remoteLevelFallback(remote: *NetworkAudioService.RemoteSource) sources_mod.So
         .level_right = remote.level_right,
         .level = remote.level,
     };
+}
+
+fn resolvedRemoteClientName(client_id: []const u8, client_name: []const u8) []const u8 {
+    if (client_name.len > 0) return client_name;
+    if (client_id.len > 0) return client_id;
+    return "WireNode";
+}
+
+fn resolvedRemoteStreamName(client_name: []const u8, stream_name: []const u8) []const u8 {
+    if (stream_name.len > 0) return stream_name;
+    if (client_name.len > 0) return client_name;
+    return "Remote Stream";
 }
 
 fn buildRemoteSourceId(allocator: std.mem.Allocator, client_id: []const u8, stream_id: u32) ![]u8 {

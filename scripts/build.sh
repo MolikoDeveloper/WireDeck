@@ -167,6 +167,52 @@ case "$command_name" in
         zig build $zig_args "$@"
         install_wiredeck_lv2_bundle
         ;;
+    activate)
+        build_args=""
+        app_args=""
+        pass_to_app=0
+        for arg in "$@"; do
+            if [ "$pass_to_app" -eq 0 ] && [ "$arg" = "--" ]; then
+                pass_to_app=1
+                continue
+            fi
+
+            if [ "$pass_to_app" -eq 0 ]; then
+                build_args="$build_args \"$arg\""
+            else
+                app_args="$app_args \"$arg\""
+            fi
+        done
+
+        if [ -n "$build_args" ]; then
+            # shellcheck disable=SC2086
+            eval "zig build $zig_args $build_args"
+        else
+            zig build $zig_args
+        fi
+        install_wiredeck_lv2_bundle
+
+        if pgrep -x wiredeck >/dev/null 2>&1; then
+            echo "[wiredeck] stopping running wiredeck instance"
+            pkill -INT -x wiredeck || true
+            wait_count=0
+            while pgrep -x wiredeck >/dev/null 2>&1; do
+                wait_count=$((wait_count + 1))
+                if [ "$wait_count" -ge 50 ]; then
+                    echo "[wiredeck] waiting for wiredeck to exit..." >&2
+                    break
+                fi
+                sleep 0.2
+            done
+        fi
+
+        if [ -n "$app_args" ]; then
+            # shellcheck disable=SC2086
+            eval "exec \"$ROOT_DIR/zig-out/bin/wiredeck\" $app_args"
+        else
+            exec "$ROOT_DIR/zig-out/bin/wiredeck"
+        fi
+        ;;
     run)
         build_args=""
         app_args=""
