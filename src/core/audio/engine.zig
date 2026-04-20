@@ -95,6 +95,8 @@ const SendState = struct {
 const render_sample_rate_hz: u32 = 48_000;
 const render_quantum_frames: usize = 128;
 const render_quantum_ns: u64 = @intCast((@as(u128, render_quantum_frames) * std.time.ns_per_s) / render_sample_rate_hz);
+const max_channel_render_buffer_frames: usize = render_quantum_frames * 8;
+const max_bus_tap_buffer_frames: usize = render_quantum_frames * 16;
 const max_remote_buffer_frames: usize = 4096;
 const jitter_target_blocks: usize = 2;
 const jitter_rebuffer_divisor: usize = 2;
@@ -887,6 +889,7 @@ fn appendChannelRenderAudioLocked(
             channel.render_buffer.items[base] = left_sample;
             channel.render_buffer.items[base + 1] = right_sample;
         }
+        trimChannelRenderBufferLocked(channel);
         return;
     }
 
@@ -906,6 +909,7 @@ fn appendChannelRenderAudioLocked(
         channel.render_buffer.items[base] = std.math.lerp(left[source_index], left[next_source_index], fraction);
         channel.render_buffer.items[base + 1] = std.math.lerp(right[source_index], right[next_source_index], fraction);
     }
+    trimChannelRenderBufferLocked(channel);
 }
 
 fn renderBusQuantumLocked(self: *AudioEngine, frame_count: usize) void {
@@ -959,6 +963,7 @@ fn renderBusQuantumLocked(self: *AudioEngine, frame_count: usize) void {
             continue;
         }
         bus.tap_stream_buffer.appendSlice(self.allocator, bus.tap_mix_buffer.items) catch {};
+        trimBusTapStreamLocked(bus);
         compactBusTapStreamLocked(self.allocator, bus);
     }
 
@@ -999,6 +1004,23 @@ fn compactChannelRenderBufferLocked(channel: *ChannelState) void {
     );
     channel.render_buffer.items.len = remaining;
     channel.render_read_sample_index = 0;
+}
+
+fn trimChannelRenderBufferLocked(channel: *ChannelState) void {
+    const max_samples = max_channel_render_buffer_frames * 2;
+    if (channel.render_buffer.items.len <= max_samples) return;
+
+    const retain_start = channel.render_buffer.items.len - max_samples;
+    std.mem.copyForwards(
+        f32,
+        channel.render_buffer.items[0..max_samples],
+        channel.render_buffer.items[retain_start..][0..max_samples],
+    );
+    channel.render_buffer.items.len = max_samples;
+    channel.render_read_sample_index = if (channel.render_read_sample_index > retain_start)
+        channel.render_read_sample_index - retain_start
+    else
+        0;
 }
 
 fn ensureBusTapConsumerLocked(
@@ -1059,6 +1081,25 @@ fn compactBusTapStreamLocked(allocator: std.mem.Allocator, bus: *BusState) void 
         bus.tap_stream_buffer.clearRetainingCapacity();
     } else {
         _ = allocator;
+    }
+}
+
+fn trimBusTapStreamLocked(bus: *BusState) void {
+    const max_samples = max_bus_tap_buffer_frames * 2;
+    if (bus.tap_stream_buffer.items.len <= max_samples) return;
+
+    const retain_start = bus.tap_stream_buffer.items.len - max_samples;
+    std.mem.copyForwards(
+        f32,
+        bus.tap_stream_buffer.items[0..max_samples],
+        bus.tap_stream_buffer.items[retain_start..][0..max_samples],
+    );
+    bus.tap_stream_buffer.items.len = max_samples;
+    for (bus.tap_consumers.items) |*consumer| {
+        consumer.read_sample_index = if (consumer.read_sample_index > retain_start)
+            consumer.read_sample_index - retain_start
+        else
+            0;
     }
 }
 
@@ -1190,4 +1231,92 @@ test "muted channel is excluded from bus mix even for pre-fader sends" {
     const read = engine.readBusPcmS16ForConsumer("bus-1", "consumer-1", &mixed);
     try std.testing.expectEqual(@as(usize, 4), read.frames);
     for (mixed) |sample| try std.testing.expectEqual(@as(i16, 0), sample);
+}
+
+test "channel render buffer keeps newest live audio when producer outruns render" {
+    const allocator = std.testing.allocator;
+
+    var engine = AudioEngine.init(allocator);
+    defer engine.deinit();
+
+    var runtime = FxRuntime.init(allocator);
+    defer runtime.deinit();
+
+    const channels = [_]channels_mod.Channel{
+        .{ .id = "channel-1", .label = "Channel 1", .subtitle = "test" },
+    };
+    try engine.syncGraph(&channels, &.{}, &.{});
+
+    var left: [render_quantum_frames]f32 = undefined;
+    var right: [render_quantum_frames]f32 = undefined;
+    @memset(&left, 0.25);
+    @memset(&right, 0.25);
+
+    for (0..64) |index| {
+        try std.testing.expect(engine.processChannel(
+            &runtime,
+            "channel-1",
+            &left,
+            &right,
+            render_sample_rate_hz,
+            @intCast(index * render_quantum_frames),
+        ));
+    }
+
+    engine.audio_mutex.lock();
+    defer engine.audio_mutex.unlock();
+    const channel = findChannelStatePtr(engine.channels.items, "channel-1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, max_channel_render_buffer_frames * 2), channel.render_buffer.items.len);
+    try std.testing.expectEqual(@as(usize, 0), channel.render_read_sample_index);
+}
+
+test "bus tap stream keeps newest live audio when consumer falls behind" {
+    const allocator = std.testing.allocator;
+
+    var engine = AudioEngine.init(allocator);
+    defer engine.deinit();
+
+    var runtime = FxRuntime.init(allocator);
+    defer runtime.deinit();
+
+    const channels = [_]channels_mod.Channel{
+        .{ .id = "channel-1", .label = "Channel 1", .subtitle = "test" },
+    };
+    const buses = [_]buses_mod.Bus{
+        .{ .id = "bus-1", .label = "Bus 1" },
+    };
+    const sends = [_]sends_mod.Send{
+        .{ .channel_id = "channel-1", .bus_id = "bus-1" },
+    };
+    try engine.syncGraph(&channels, &buses, &sends);
+
+    engine.audio_mutex.lock();
+    {
+        const bus = findBusStatePtr(engine.buses.items, "bus-1") orelse return error.TestUnexpectedResult;
+        _ = try ensureBusTapConsumerLocked(allocator, bus, "consumer-1");
+    }
+    engine.audio_mutex.unlock();
+
+    var left: [render_quantum_frames]f32 = undefined;
+    var right: [render_quantum_frames]f32 = undefined;
+    @memset(&left, 0.25);
+    @memset(&right, 0.25);
+
+    for (0..64) |index| {
+        try std.testing.expect(engine.processChannel(
+            &runtime,
+            "channel-1",
+            &left,
+            &right,
+            render_sample_rate_hz,
+            @intCast(index * render_quantum_frames),
+        ));
+        engine.renderQuantum(render_quantum_frames);
+    }
+
+    engine.audio_mutex.lock();
+    defer engine.audio_mutex.unlock();
+    const bus = findBusStatePtr(engine.buses.items, "bus-1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, max_bus_tap_buffer_frames * 2), bus.tap_stream_buffer.items.len);
+    try std.testing.expectEqual(@as(usize, 0), bus.tap_consumers.items[0].read_sample_index);
 }
