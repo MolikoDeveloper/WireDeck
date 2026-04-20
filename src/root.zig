@@ -1,5 +1,8 @@
+pub const std_options = @import("logging.zig").std_options;
+
 pub const App = @import("app/app.zig").App;
 pub const StateStore = @import("app/state_store.zig").StateStore;
+pub const Logging = @import("logging.zig");
 
 pub const AudioCore = @import("core/audio/routing.zig").AudioCore;
 pub const AudioEngine = @import("core/audio/engine.zig").AudioEngine;

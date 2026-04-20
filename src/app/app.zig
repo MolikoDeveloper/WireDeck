@@ -2209,7 +2209,7 @@ fn liveAudioWorkerMain(app: *App) void {
             (app.last_live_audio_worker_warn_ns == 0 or started_ns - app.last_live_audio_worker_warn_ns >= live_audio_warn_log_interval_ns))
         {
             app.last_live_audio_worker_warn_ns = started_ns;
-            std.log.warn(
+            std.log.debug(
                 "live audio worker slow: duration_ns={d} live_generation={d}",
                 .{
                     duration_ns,

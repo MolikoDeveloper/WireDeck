@@ -293,7 +293,7 @@ fn streamWriteCb(stream: ?*c.pa_stream, nbytes: usize, userdata: ?*anyopaque) ca
             const now_ns = std.time.nanoTimestamp();
             if (self.last_underrun_log_ns == 0 or now_ns - self.last_underrun_log_ns >= underrun_warn_log_interval_ns) {
                 self.last_underrun_log_ns = now_ns;
-                std.log.warn(
+                std.log.debug(
                     "pulse bus playback underrun: bus={s} sink={s} requested_frames={d} drained_frames={d} available_before_fill={d} available_before_drain={d} underruns={d}",
                     .{
                         self.bus_id,

@@ -246,7 +246,7 @@ pub const UiShell = struct {
                 (last_ui_warn_ns == 0 or loop_started_ns - last_ui_warn_ns >= ui_warn_log_interval_ns))
             {
                 last_ui_warn_ns = loop_started_ns;
-                std.log.warn(
+                std.log.debug(
                     "ui frame slow: duration_ns={d} state={d} snapshot_due={any} lv2_ui_changed={any} pump_events_ns={d} snapshot_ns={d} render_ns={d} ui_changes_ns={d}",
                     .{
                         loop_duration_ns,

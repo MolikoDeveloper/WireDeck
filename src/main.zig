@@ -6,6 +6,8 @@ const c = @cImport({
     @cInclude("unistd.h");
 });
 
+pub const std_options = wiredeck.std_options;
+
 const CliOptions = struct {
     headless: bool = false,
     frames: ?u32 = null,
@@ -19,6 +21,7 @@ const CliOptions = struct {
 };
 
 pub fn main() !void {
+    wiredeck.Logging.initFromEnv();
     const options = try parseArgs(std.heap.page_allocator);
     wiredeck.RuntimeShutdown.installSignalHandlers();
 

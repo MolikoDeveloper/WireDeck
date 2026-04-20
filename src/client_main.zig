@@ -1,6 +1,9 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const network_mod = @import("core/audio/network.zig");
+const logging = @import("logging.zig");
+
+pub const std_options = logging.std_options;
 
 const CliOptions = struct {
     server_host: []const u8 = "127.0.0.1",
@@ -17,6 +20,7 @@ const CliOptions = struct {
 };
 
 pub fn main() !void {
+    logging.initFromEnv();
     var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
     defer {
         const leaked = gpa_state.deinit();
